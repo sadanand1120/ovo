@@ -11,7 +11,7 @@ import threading
 import time
 import os
 
-from ..utils import vis_utils
+from . import vis_utils
 
 class Visualizer:
     def __init__(self, semantic_module = None, scene_name: str = "", name: str ="", save_path: str | None = None):

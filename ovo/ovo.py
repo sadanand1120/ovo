@@ -4,12 +4,44 @@ import numpy as np
 import pprint
 import torch
 import time
+import open3d as o3d
 
-from ..utils import geometry_utils, instance_utils
+from . import geometry_utils
 from .clip_generator import CLIPGenerator
 from .mask_generator import MaskGenerator
 from .instance3d import Instance3D
 from .logger import Logger
+
+
+def same_instance(instance1, instance2, points_centroid1, points_centroid2, th_centroid, th_cossim, th_points):
+    points1, centroid1 = points_centroid1
+    points2, centroid2 = points_centroid2
+    distance = ((centroid1 - centroid2) ** 2).sum().sqrt()
+    if distance > th_centroid:
+        return False
+
+    cos_sim = torch.nn.functional.cosine_similarity(instance1.clip_feature[0], instance2.clip_feature[0], dim=0)
+    if cos_sim < th_cossim:
+        return False
+
+    pcd1 = o3d.geometry.PointCloud()
+    pcd1.points = o3d.utility.Vector3dVector(points1.cpu().numpy())
+    pcd2 = o3d.geometry.PointCloud()
+    pcd2.points = o3d.utility.Vector3dVector(points2.cpu().numpy())
+    dists = np.asarray(pcd1.compute_point_cloud_distance(pcd2))
+    p_dist = (dists < th_points).astype(float).mean()
+    return p_dist > 0.5 or (cos_sim > 0.9 and p_dist > 0.2)
+
+
+def fuse_instances(instance1, instance2, map_data):
+    _, _, points_ins_ids = map_data
+    instance1.add_points_ids(instance2.points_ids)
+    for kf in instance2.kfs_ids:
+        instance1.add_keyframes(kf)
+    for area, kf_id in instance2.top_kf:
+        instance1.add_top_kf(kf_id, area)
+    points_ins_ids[points_ins_ids == instance2.id] = instance1.id
+    return instance1, points_ins_ids
 
 class OVO:
     """ Initialize CLIP and SAM backbones, with a given configuration, and logger.
@@ -403,8 +435,8 @@ class OVO:
             for instance2 in objects_list[i+1:]:
                 if instance2.id in fused_objects:
                     continue
-                elif instance_utils.same_instance(instance1, instance2, obj_pcds[instance1.id], obj_pcds[instance2.id], self.th_centroid, self.th_cossim, self.th_points):
-                    instance1, points_ins_ids = instance_utils.fuse_instances(instance1, instance2, map_data)
+                elif same_instance(instance1, instance2, obj_pcds[instance1.id], obj_pcds[instance2.id], self.th_centroid, self.th_cossim, self.th_points):
+                    instance1, points_ins_ids = fuse_instances(instance1, instance2, map_data)
                     fused_objects[instance2.id] = instance1.id
             objects[instance1.id] = instance1
         print(f"Semantic Map update: removed {len(objects_to_del)}, fused {len(fused_objects)} instances")

@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import heapq
 from functools import partial
-from ..utils import clip_utils
+from . import clip_utils
 
 def l1_medoid(cls, clips):
     l1_distances = torch.abs(clips-clips.permute(1,0,2)).sum((1,2))

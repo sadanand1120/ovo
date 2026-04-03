@@ -14,7 +14,7 @@ This repo is now intentionally trimmed to the validated reproduction path:
 - `Replica` and `ScanNet` dataset support only
 - `vanilla` backend for the paper-style GT-pose row
 - `orbslam` backend via ORB-SLAM3
-- paper-style semantic defaults in [data/working/configs/ovo.yaml](/home/dynamo/AMRL_Research/repos/ovo/data/working/configs/ovo.yaml)
+- paper-style semantic defaults in [configs/ovo.yaml](/home/dynamo/AMRL_Research/repos/ovo/configs/ovo.yaml)
 
 Gaussian-SLAM and the newer TextRegion / Perception Encoder path have been removed.
 
@@ -96,7 +96,7 @@ Download the manual checkpoints:
 This places:
 
 - `data/input/sam_ckpts/sam2.1_hiera_large.pt`
-- `data/input/weights_predictor/base/model.pt`
+- `data/input/weights_predictor/model.pt`
 
 `hparams.yaml` for the weights predictor is already tracked. Hugging Face assets used by `open_clip` download into the default global Hugging Face cache on first use.
 
@@ -251,7 +251,7 @@ export CUDA_LAUNCH_BLOCKING=1
 OVO expects the NICE-SLAM processed Replica trajectories plus semantic GT:
 
 ```text
-/<ovo_path>/data/input/Datasets/Replica/
+/<ovo_path>/data/input/Replica/
   semantic_gt/
   office0/
     results/
@@ -263,12 +263,10 @@ OVO expects the NICE-SLAM processed Replica trajectories plus semantic GT:
 Download and link:
 
 ```bash
-cd /<ovo_path>/data/input/Datasets
+cd /<ovo_path>/data/input
 wget https://cvg-data.inf.ethz.ch/nice-slam/data/Replica.zip
 unzip Replica.zip
 rm Replica.zip
-cd Replica
-ln -s /<ovo_abs_path>/data/input/replica_semantic_gt semantic_gt
 ```
 
 ### ScanNet
@@ -276,7 +274,7 @@ ln -s /<ovo_abs_path>/data/input/replica_semantic_gt semantic_gt
 OVO does not run directly from `.sens`. It expects decoded per-frame folders:
 
 ```text
-/<ovo_path>/data/input/Datasets/ScanNet/
+/<ovo_path>/data/input/ScanNet/
   semantic_gt/
   scene0011_00/
     color/
@@ -300,16 +298,10 @@ Decode, generate `semantic_gt`, and link meshes with one command:
 ```bash
 cd /<ovo_path>
 conda activate ovo
-python scripts/scannet_decode_sens.py \
+python scannet_decode_sens.py \
   --scans_root /<ScanNet_data_path>/scans \
-  --output_root /<ScanNet_data_path>/data/val \
+  --output_root /<ovo_path>/data/input/ScanNet \
   --write_semantic_gt --link_pcds
-```
-
-Then link the decoded validation split:
-
-```bash
-ln -s /<ScanNet_data_path>/data/val /<ovo_path>/data/input/Datasets/ScanNet
 ```
 
 ### Repo-local ScanNet decode helper
@@ -317,24 +309,17 @@ ln -s /<ScanNet_data_path>/data/val /<ovo_path>/data/input/Datasets/ScanNet
 If you want to decode raw `.sens` scenes into this repo without touching the source dataset:
 
 ```bash
-python scripts/scannet_decode_sens.py \
+python scannet_decode_sens.py \
   --scans_root /home/dynamo/AMRL_Research/dataset/scannet_v2/scans \
-  --output_root /home/dynamo/AMRL_Research/repos/ovo/data/input/scannet_v2_ovo/data/val \
+  --output_root /home/dynamo/AMRL_Research/repos/ovo/data/input/ScanNet \
   --scenes scene0000_00 scene0002_00 \
   --write_semantic_gt --link_pcds \
   --min_free_gb 100
 ```
 
-Then expose the decoded split to OVO:
-
-```bash
-ln -sfn /home/dynamo/AMRL_Research/repos/ovo/data/input/scannet_v2_ovo/data/val \
-  /home/dynamo/AMRL_Research/repos/ovo/data/input/Datasets/ScanNet
-```
-
 ## Defaults and reproduction
 
-The repo defaults now match the validated reproduction path. The important semantic settings are already the defaults in [data/working/configs/ovo.yaml](/home/dynamo/AMRL_Research/repos/ovo/data/working/configs/ovo.yaml):
+The repo defaults now match the validated reproduction path. The important semantic settings are already the defaults in [configs/ovo.yaml](/home/dynamo/AMRL_Research/repos/ovo/configs/ovo.yaml):
 
 - `slam_module: vanilla`
 - `embed_type: learned`
@@ -358,7 +343,7 @@ The paper HVS subset is:
 - `scene0378_00`
 - `scene0518_00`
 
-Those scenes are already listed in [data/working/configs/ScanNet/eval_info.yaml](/home/dynamo/AMRL_Research/repos/ovo/data/working/configs/ScanNet/eval_info.yaml).
+Those scenes are already listed in [configs/scannet_eval.yaml](/home/dynamo/AMRL_Research/repos/ovo/configs/scannet_eval.yaml).
 
 ## Run OVO
 
@@ -371,11 +356,11 @@ Key flags:
 - `--run`: run mapping
 - `--segment`: project labels onto the GT point cloud
 - `--eval`: compute final metrics
-- `--dataset_info_file`: defaults to `eval_info.yaml`
+- `--dataset_info_file`: defaults to `eval.yaml`
 - `--scenes`: explicit scene list
 - `--scenes_list`: text file containing one scene per line
 - `--slam_module`: override backend, e.g. `vanilla` or `orbslam`
-- `--config_path`: override the base config, defaults to `data/working/configs/ovo.yaml`
+- `--config_path`: override the base config, defaults to `configs/ovo.yaml`
 
 Examples:
 

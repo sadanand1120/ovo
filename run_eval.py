@@ -13,9 +13,28 @@ import os
 import shutil
 import random
 
-from ovo.utils import io_utils, eval_utils
-from ovo.entities.ovomapping import OVOSemMap
-from ovo.entities.ovo import OVO
+from ovo import io_utils, eval_utils
+from ovo.ovomapping import OVOSemMap
+from ovo.ovo import OVO
+
+
+DATASET_DIRS = {
+    "replica": "Replica",
+    "scannet": "ScanNet",
+}
+CONFIG_DIR = Path("configs")
+INPUT_DIR = Path("data/input")
+OUTPUT_DIR = Path("data/output")
+
+
+def canonical_dataset_name(dataset_name: str) -> str:
+    return DATASET_DIRS[dataset_name.lower()]
+
+
+def load_dataset_info(dataset_name: str, dataset_info_file: str) -> tuple[str, Dict]:
+    dataset_dir = canonical_dataset_name(dataset_name)
+    with open(CONFIG_DIR / f"{dataset_name.lower()}_{dataset_info_file}", "r") as f:
+        return dataset_dir, yaml.full_load(f)
 
 def load_representation(scene_path: Path, eval: bool=False, debug_info: bool=False) -> OVO:
     config = io_utils.load_config(scene_path / "config.yaml", inherit=False)
@@ -74,26 +93,23 @@ def build_scene_config(scene: str, dataset: str, config_path: str, slam_module: 
     if slam_module is not None:
         config["slam"]["slam_module"] = slam_module
 
-    config_dataset = io_utils.load_config(f"data/working/configs/{dataset}/{dataset.lower()}.yaml")
+    dataset_dir = canonical_dataset_name(dataset)
+    config_dataset = io_utils.load_config(CONFIG_DIR / f"{dataset.lower()}.yaml")
     io_utils.update_recursive(config, config_dataset)
-
-    scene_config_path = Path(f"data/working/configs/{dataset}/{scene}.yaml")
-    if scene_config_path.exists():
-        io_utils.update_recursive(config, io_utils.load_config(scene_config_path))
 
     config.setdefault("data", {})
     config["data"]["scene_name"] = scene
-    config["data"]["input_path"] = f"data/input/Datasets/{dataset}/{scene}"
+    config["data"]["input_path"] = str(INPUT_DIR / dataset_dir / scene)
     if frame_limit is not None:
         config["data"]["frame_limit"] = frame_limit
     return config
 
 
-def run_scene(scene: str, dataset: str, experiment_name: str, tmp_run: bool = False, slam_module: str = None, frame_limit: int = None, config_path: str = "data/working/configs/ovo.yaml") -> None:
+def run_scene(scene: str, dataset: str, experiment_name: str, tmp_run: bool = False, slam_module: str = None, frame_limit: int = None, config_path: str = "configs/ovo.yaml") -> None:
 
     config = build_scene_config(scene, dataset, config_path, slam_module=slam_module, frame_limit=frame_limit)
 
-    output_path = Path(f"data/output/{dataset}/")
+    output_path = OUTPUT_DIR / canonical_dataset_name(dataset)
 
     if tmp_run:
         output_path = output_path / "tmp"
@@ -106,7 +122,7 @@ def run_scene(scene: str, dataset: str, experiment_name: str, tmp_run: bool = Fa
         wandb.init(
             project=config["project_name"],
             config=config,
-            dir="data/working/output/wandb",
+            dir="data/output/wandb",
             group=config["data"]["scene_name"]
             if experiment_name != ""
             else experiment_name,
@@ -118,7 +134,7 @@ def run_scene(scene: str, dataset: str, experiment_name: str, tmp_run: bool = Fa
     gslam.run()
 
     if tmp_run:
-        final_path = Path(f"data/output/{dataset}/") / experiment_name / scene
+        final_path = OUTPUT_DIR / canonical_dataset_name(dataset) / experiment_name / scene
         shutil.move(output_path, final_path)
 
     if config["use_wandb"]:
@@ -134,7 +150,8 @@ def main(args):
         experiment_name = args.experiment_name
         tmp_run = False
 
-    experiment_path = Path("data/output") / args.dataset_name / experiment_name
+    dataset_dir = canonical_dataset_name(args.dataset_name)
+    experiment_path = OUTPUT_DIR / dataset_dir / experiment_name
 
     if args.scenes_list is not None:
         with open(args.scenes_list, "r") as f:
@@ -143,15 +160,13 @@ def main(args):
         scenes = args.scenes
 
     if len(scenes) == 0 or args.segment or args.eval:
-        path = Path("data/working/configs/") / args.dataset_name / args.dataset_info_file
-        with open(path, 'r') as f:
-            dataset_info = yaml.full_load(f)
+        _, dataset_info = load_dataset_info(args.dataset_name, args.dataset_info_file)
 
         if len(scenes) == 0:
             scenes = dataset_info["scenes"]
 
     for scene in scenes:        
-        input_path = f"./data/input/Datasets/{args.dataset_name}/{scene}"
+        input_path = INPUT_DIR / dataset_dir / scene
         if args.run:
             t0 = time.time()
             run_scene(scene, args.dataset_name, experiment_name, tmp_run=tmp_run, slam_module=args.slam_module, frame_limit=args.frame_limit, config_path=args.config_path)
@@ -160,13 +175,13 @@ def main(args):
         gc.collect()
  
     if args.segment: 
-        data_path ="data/input/Datasets/"
+        data_path = str(INPUT_DIR)
         for scene in scenes:    
             scene_path = experiment_path / scene
             compute_scene_labels(scene_path, args.dataset_name, scene, data_path, dataset_info)
 
     if args.eval:
-        gt_path = Path(input_path).parent / "semantic_gt"
+        gt_path = input_path.parent / "semantic_gt"
         eval_utils.eval_semantics(experiment_path / dataset_info["dataset"], gt_path, scenes, dataset_info, ignore_background=args.ignore_background)
         
 
@@ -175,8 +190,8 @@ if __name__ == "__main__":
         description='Arguments to run and evaluate over a dataset')
     parser.add_argument('--dataset_name', help="Dataset used. Choose either `Replica`, `ScanNet`")
     parser.add_argument('--scenes', nargs="+", type=str, default=[], help=" List of scenes from given dataset to run.  If `--scenes_list` is set, this flag will be ignored.")
-    parser.add_argument('--scenes_list',type=str, default=None, help="Path to a txt containing a scene name on each line. If set, `--scenes` is ignored. If neither `--scenes` nor `--scenes_list` are set, the scene list will be loaded from `data/working/config/<dataset_name>/<dataset_info_file>`")
-    parser.add_argument('--dataset_info_file',type=str, default="eval_info.yaml")
+    parser.add_argument('--scenes_list',type=str, default=None, help="Path to a txt containing a scene name on each line. If set, `--scenes` is ignored. If neither `--scenes` nor `--scenes_list` are set, the scene list will be loaded from `configs/<dataset>_<dataset_info_file>`")
+    parser.add_argument('--dataset_info_file',type=str, default="eval.yaml")
     parser.add_argument('--experiment_name', default=None, type=str)
     parser.add_argument('--run', action='store_true', help="If set, compute the final metrics, after running OVO and segmenting.")
     parser.add_argument('--segment', action='store_true', help="If set, use the reconstructed scene to segment the gt point-cloud, after running OVO.")
@@ -184,6 +199,6 @@ if __name__ == "__main__":
     parser.add_argument('--ignore_background', action='store_true',help="If set, does not use background ids from eval_info to compute metrics.")
     parser.add_argument('--slam_module', type=str, default=None, help="Override slam backend, e.g. vanilla or orbslam.")
     parser.add_argument('--frame_limit', type=int, default=None, help="Override number of input frames to process.")
-    parser.add_argument('--config_path', type=str, default="data/working/configs/ovo.yaml", help="Base OVO config file to load.")
+    parser.add_argument('--config_path', type=str, default="configs/ovo.yaml", help="Base OVO config file to load.")
     args = parser.parse_args()
     main(args)

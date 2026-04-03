@@ -110,7 +110,7 @@ class WrapperORBSLAM(VanillaMapper):
         self.world_ref = world_ref.to(self.device)
         self.kfs = {}
 
-        repo_root = Path(__file__).resolve().parents[2]
+        repo_root = Path(__file__).resolve().parents[1]
         vocab_path = repo_root / "thirdParty" / "ORB_SLAM3" / "Vocabulary" / "ORBvoc.txt"
         assert (vocab_path).exists(), f"ORB vocabulary not found, review path {vocab_path}"
         self.temp_dir = tempfile.TemporaryDirectory(prefix="ovo_orbslam_")
@@ -201,5 +201,7 @@ class WrapperORBSLAM(VanillaMapper):
     
 
     def __del__(self) -> None:
-        self.orbslam.shutdown()
-        self.temp_dir.cleanup()
+        if hasattr(self, "orbslam"):
+            self.orbslam.shutdown()
+        if hasattr(self, "temp_dir"):
+            self.temp_dir.cleanup()

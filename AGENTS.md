@@ -1,17 +1,16 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `run_eval.py` is the main entry point for mapping and metrics. `visualize_scene.py` inspects outputs. `scripts/scannet_decode_sens.py` prepares ScanNet RGB-D folders plus semantic labels.
+- `run_eval.py` is the main entry point for mapping and metrics. `visualize_scene.py` inspects outputs. `scannet_decode_sens.py` prepares ScanNet RGB-D folders plus semantic labels.
 - The trimmed repo targets `Replica` and `ScanNet` only.
-- `ovo/entities/` contains the semantic pipeline: `ovomapping.py` orchestrates runs, `ovo.py` manages 3D instances and text queries, and `clip_generator.py` / `mask_generator.py` wrap descriptor and mask extraction.
-- `ovo/slam/` selects the geometry backend: `vanilla_mapper.py` uses GT poses, and `orbslam.py` wraps ORB-SLAM3.
-- `ovo/utils/` contains config, geometry, segmentation, evaluation, and visualization helpers. `data/working/configs/` contains the base config plus dataset metadata.
+- `ovo/` is flat on purpose: `ovomapping.py` orchestrates runs, `ovo.py` manages 3D instances and text queries, `clip_generator.py` / `mask_generator.py` wrap descriptor and mask extraction, `vanilla_mapper.py` and `orbslam.py` provide the geometry backends, and the remaining modules are focused helpers.
+- `configs/` contains the base config plus dataset metadata.
 - Inputs and checkpoints live in `data/input/`; generated runs belong in `data/output/`. `thirdParty/` is for external dependencies.
 
 ## Build, Test, and Development Commands
 - `git submodule update --init --recursive` fetches required third-party code.
 - Follow `README.md` to create the `ovo` Conda environment and install editable dependencies. ORB-SLAM3 is expected under `thirdParty/ORB_SLAM3` when used.
-- `python scripts/scannet_decode_sens.py --scans_root /path/to/ScanNet/scans --output_root /path/to/ScanNet/data/val --write_semantic_gt --link_pcds` prepares ScanNet labels and links meshes.
+- `python scannet_decode_sens.py --scans_root /path/to/ScanNet/scans --output_root data/input/ScanNet --write_semantic_gt --link_pcds` prepares ScanNet labels and links meshes.
 - `python run_eval.py --dataset_name Replica --experiment_name dev_run --run --segment --eval --scenes office0` runs the full local pipeline on one scene.
 - `python visualize_scene.py data/output/Replica/dev_run/office0 --visualize_obj` inspects saved outputs.
 - Set `DISABLE_WANDB=true` to disable WandB during local debugging.

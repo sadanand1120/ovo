@@ -12,13 +12,13 @@ from .logger import Logger
 from .ovo import OVO
 from .datasets import get_dataset
 from .visualizer import stream_pcd
-from ..slam.vanilla_mapper import VanillaMapper
-from ..utils import io_utils
+from .vanilla_mapper import VanillaMapper
+from . import io_utils
 
 def get_slam_backbone(config: Dict[str, Any], dataset, cam_intrinsics: torch.Tensor):
     backbone = config["slam"].get("slam_module","vanilla")
     if backbone.startswith("orbslam"):
-        from ..slam.orbslam import WrapperORBSLAM
+        from .orbslam import WrapperORBSLAM
         return WrapperORBSLAM(config, cam_intrinsics, world_ref=torch.from_numpy(dataset[0][3]))
     if backbone == "vanilla":
         return VanillaMapper(config, cam_intrinsics)
@@ -40,8 +40,6 @@ class OVOSemMap():
         self.config = config
         self.device = config.get("device", "cuda")
         self.dataset_name = config["dataset_name"]
-        self.stream = self.config["vis"]["stream"]
-        self.show_stream = self.config["vis"]["show_stream"]
         self.map_every = config["mapping"].get("map_every", 10)
         self.segment_every = config["semantic"].get("segment_every", 10)
         if config.get("tracking", None) is None:

@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from typing import Any, Dict, List, Tuple
 
-from ..utils import geometry_utils
+from . import geometry_utils
 
 class VanillaMapper():
     """This class uses GT camera posses to generate a vanilla point-cloud reconstruction by unprojecting depths"""

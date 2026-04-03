@@ -35,13 +35,13 @@ semantic:
     sam_ckpt_path: "data/input/sam_ckpts/"
     sam_version: "2.1"
     sam_encoder: "hiera_l"
-    masks_base_path: "data/working/masks/replica_384_sam2.1"
+    masks_base_path: "data/masks/replica_384_sam2.1"
   clip:
     use_half: True
     embed_type: learned
     model_card: SigLIP-384
     mask_res: 384
-    weights_predictor_path: data/input/weights_predictor/base
+    weights_predictor_path: data/input/weights_predictor
     k_top_views: 10
     fusion: l1_medoid
     mv_fuser: False

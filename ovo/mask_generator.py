@@ -4,7 +4,7 @@ import torch
 import tqdm
 import os
 
-from ..utils import segment_utils
+from . import segment_utils
 
 class MaskGenerator:
     """ Initialize SAM backbone, with a given configuration.

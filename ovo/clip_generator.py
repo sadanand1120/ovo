@@ -1,12 +1,57 @@
 from typing import Dict, List
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 import os
 
-from ..utils import clip_utils
-from ..utils import segment_utils
+from . import clip_utils
+from . import segment_utils
 
-from .clips_merging import WeightsPredictorMerger
+
+ACTIVATION_DICT = {
+    "leaky_relu": nn.LeakyReLU,
+    "relu": nn.ReLU,
+    "silu": nn.SiLU,
+    "sigmoid": nn.Sigmoid,
+}
+
+
+def block_mlp(i_dim, h_dim, o_dim, n_layers, act_key="leaky_relu"):
+    activation = ACTIVATION_DICT[act_key]
+    layers = [nn.Linear(i_dim, h_dim), activation()]
+    for _ in range(n_layers):
+        layers.append(nn.Linear(h_dim, h_dim))
+        layers.append(activation())
+    layers.append(nn.Linear(h_dim, o_dim))
+    return nn.Sequential(*layers)
+
+
+class WeightsPredictorMerger(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        encoder_layer = nn.TransformerEncoderLayer(
+            batch_first=True,
+            d_model=config["transformer"]["d_model"],
+            nhead=config["transformer"].get("nhead", 8),
+            dim_feedforward=config["transformer"]["dim_feedforward"],
+            dropout=0.1,
+            activation="relu",
+        )
+        self.att_encoder = nn.TransformerEncoder(encoder_layer, num_layers=config["transformer"]["n_layers"])
+        self.mlp = block_mlp(**config["mlp"])
+
+    def forward(self, input_clips: torch.Tensor) -> torch.Tensor:
+        batch, n_clips, clips_dim = input_clips.shape
+        x = self.att_encoder(input_clips)
+        weights = self.mlp(x.flatten(-2, -1))
+        if weights.shape[-1] != 3:
+            weights = weights.reshape(batch, n_clips, clips_dim)
+            weights = F.softmax(weights, dim=-2)
+        else:
+            weights = F.softmax(weights, dim=-1).unsqueeze(-1)
+        clips = (input_clips * weights).sum(-2)
+        return F.normalize(clips, dim=-1)
 
 class CLIPGenerator:
     def __init__(self, config: Dict, device: str = "cuda"):

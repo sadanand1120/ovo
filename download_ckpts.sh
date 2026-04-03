@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INPUT_DIR="$ROOT_DIR/data/input"
 SAM_DIR="$INPUT_DIR/sam_ckpts"
-PRED_DIR="$INPUT_DIR/weights_predictor/base"
+PRED_DIR="$INPUT_DIR/weights_predictor"
 
 mkdir -p "$SAM_DIR" "$PRED_DIR"
 

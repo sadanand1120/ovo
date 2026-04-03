@@ -10,7 +10,7 @@ Scenes:
 - `scene0518_00`
 
 Config used for reproduction:
-- [data/working/configs/ovo.yaml](/home/dynamo/AMRL_Research/repos/ovo/data/working/configs/ovo.yaml)
+- [configs/ovo.yaml](/home/dynamo/AMRL_Research/repos/ovo/configs/ovo.yaml)
 
 ## Vanilla
 
