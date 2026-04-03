@@ -8,11 +8,21 @@ from ovo.entities.visualizer import visualize_3d_points_obj_id_and_obb, visualiz
 from ovo.utils.io_utils import load_config, load_scene_data, load_scannet_mesh, read_labels
 from run_eval import load_representation
 
-def capitalize_first(text):
-  return text[0].upper() + text[1:]
+DATASET_NAME_MAP = {
+    "replica": "Replica",
+    "scannet": "ScanNet",
+}
+
+
+def load_dataset_info(working_dir: Path, dataset_name: str, dataset_info_file: str):
+    canonical_name = DATASET_NAME_MAP[dataset_name.lower()]
+    path = working_dir / "data/working/configs" / canonical_name / dataset_info_file
+    with open(path, "r") as f:
+        return canonical_name, yaml.full_load(f)
 
 def main(args):
-    run_path = Path(args.working_dir) / args.run_path
+    working_dir = Path(args.working_dir)
+    run_path = working_dir / args.run_path
     config = load_config(run_path/"config.yaml")
 
     semantic_module, params = load_representation(run_path, eval=True)
@@ -34,13 +44,8 @@ def main(args):
             vis = Visualizer(semantic_module, scene_name=config["data"]["scene_name"], save_path=run_path.parent)
             vis.visualize_and_query(pcd_pred, params["obj_ids"].squeeze().numpy(), pcd_colors)
         if args.visualize_gt_vs_pre:
-            dataset_name = capitalize_first(config["dataset_name"])
-            if dataset_name == "Scannet":
-                dataset_name = "ScanNet"
-            path = Path(args.working_dir) / "data/working/configs/" / dataset_name  / args.dataset_info_file
-            data_path = Path(args.working_dir) / "data/input/Datasets/"
-            with open(path, 'r') as f:
-                dataset_info = yaml.full_load(f)
+            dataset_name, dataset_info = load_dataset_info(working_dir, config["dataset_name"], args.dataset_info_file)
+            data_path = working_dir / "data/input/Datasets/"
 
             classes = dataset_info["class_names_reduced"] if dataset_info.get("map_to_reduced", None)  else dataset_info["class_names"] 
             pcd_labels_gt, pcd_gt = load_scene_data(config["dataset_name"], config["data"]["scene_name"], data_path, dataset_info)
@@ -61,13 +66,8 @@ def main(args):
             mask = pcd_labels_gt>=0
             visualize_gt_vs_pred(pcd_gt[mask], pcd_labels_gt[mask], pcd_labels_pred[mask].astype(np.int64), np.array(classes), scene_labels_idxs)
         if args.visualize_semantic_pred:
-            dataset_name = capitalize_first(config["dataset_name"])
-            if dataset_name == "Scannet":
-                dataset_name = "ScanNet"
-            path = Path(args.working_dir) / "data/working/configs/" / dataset_name / args.dataset_info_file
-            data_path = Path(args.working_dir) / "data/input/Datasets/"
-            with open(path, 'r') as f:
-                dataset_info = yaml.full_load(f)
+            dataset_name, dataset_info = load_dataset_info(working_dir, config["dataset_name"], args.dataset_info_file)
+            data_path = working_dir / "data/input/Datasets/"
 
             pred_labels = read_labels(run_path.parent / dataset_info["dataset"] / (config["data"]["scene_name"] + ".txt"))
             hide_labels = set(dataset_info.get("ignore", []))
@@ -88,7 +88,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='Arguments to train and evaluate over a dataset')
     parser.add_argument('run_path', type=str)
-    parser.add_argument('--working_dir', default="/home/tberriel/Workspaces/semsplat_ws/OVO/", type=str)
+    parser.add_argument('--working_dir', default=".", type=str)
     parser.add_argument('--visualize_obj', action='store_true')
     parser.add_argument('--visualize_interactive_query', action='store_true')
     parser.add_argument('--visualize_gt_vs_pre', action='store_true')

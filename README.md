@@ -11,6 +11,7 @@
 
 This repo is now intentionally trimmed to the validated reproduction path:
 
+- `Replica` and `ScanNet` dataset support only
 - `vanilla` backend for the paper-style GT-pose row
 - `orbslam` backend via ORB-SLAM3
 - paper-style semantic defaults in [data/working/configs/ovo.yaml](/home/dynamo/AMRL_Research/repos/ovo/data/working/configs/ovo.yaml)
@@ -275,7 +276,6 @@ OVO does not run directly from `.sens`. It expects decoded per-frame folders:
 ```text
 /<ovo_path>/data/input/Datasets/ScanNet/
   semantic_gt/
-  scannet200_gt/
   scene0011_00/
     color/
     depth/
@@ -305,12 +305,6 @@ Then link the decoded validation split:
 
 ```bash
 ln -s /<ScanNet_data_path>/data/val /<ovo_path>/data/input/Datasets/ScanNet
-```
-
-Optional ScanNet200 extraction is still supported through the official ScanNet benchmark scripts, then:
-
-```bash
-python scripts/scannet_preprocess.py --data_path /<ScanNet_data_path> --scannet200
 ```
 
 ### Repo-local ScanNet decode helper

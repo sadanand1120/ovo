@@ -233,28 +233,3 @@ def eval_semantics(output_path: str, gt_path: str, scenes: List[str], dataset_in
     if return_metrics:
         return metrics, confusion
     return np.mean(iou_values[iou_valid_mask]), confusion
-     
-
-def eval_scannetpp_semantic(cfg: Dict[str, Any], top_k: List[int] = [1], verbose: bool =True):
-    # Import ScanNet++ path
-    sys.path.append("/home/tberriel/Workspaces/semsplat_ws/sem3d/ovoslam/submodules/scannetpp")
-    from ovoslam.submodules.scannetpp.semantic.eval.eval_semantic import eval_semantic
-
-    scene_ids = cfg["scene_ids"]
-
-    with open(cfg["classes_file"], "r") as f:
-        semantic_classes = f.read().splitlines() 
-    num_classes = len(semantic_classes)
-
-    confmats = eval_semantic(scene_ids, cfg["preds_dir"], cfg["gt_dir"], cfg["data_root"],
-                            num_classes, -100, top_k, eval_against_gt=False)
-    if verbose:
-        for k, confmat in confmats.items():
-            print(f'Top {k} mIOU: {confmat.miou}')
-            
-        for class_name, class_iou in zip(semantic_classes, confmat.ious):
-            print(f'{class_name: <25}: {class_iou}')
-
-        print('----------------------------------------------------')
-    return confmats[1].miou
-

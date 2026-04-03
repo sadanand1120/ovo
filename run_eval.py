@@ -161,10 +161,7 @@ def main(args):
             compute_scene_labels(scene_path, args.dataset_name, scene, data_path, dataset_info)
 
     if args.eval:
-        if dataset_info["dataset"] == "scannet200":
-            gt_path = Path(input_path).parent / "scannet200_gt"
-        else:
-            gt_path = Path(input_path).parent / "semantic_gt"
+        gt_path = Path(input_path).parent / "semantic_gt"
         eval_utils.eval_semantics(experiment_path / dataset_info["dataset"], gt_path, scenes, dataset_info, ignore_background=args.ignore_background)
         
 

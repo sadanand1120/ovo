@@ -2,16 +2,7 @@ import os
 from pathlib import Path
 import argparse
 import numpy as np
-
-try:
-    from tqdm import tqdm
-except ImportError:
-    def tqdm(iterable):
-        total = len(iterable)
-        for index, item in enumerate(iterable, start=1):
-            if index == 1 or index == total or index % 25 == 0:
-                print(f"{index}/{total}")
-            yield item
+from tqdm import tqdm
 
 
 def write_labels(output_file: str, pcd_labels: np.ndarray) -> None:
@@ -77,30 +68,20 @@ def read_ply_vertex_labels(mesh_path: Path) -> np.ndarray:
 def main(args):
     scannet_data_path = Path(args.data_path)
     scans_path = scannet_data_path / "scans"
-
     decoded_path = scannet_data_path / "data"/ "val"
-    scannet200_path = scannet_data_path / "scannet200" / "val"
-
     scenes = os.listdir(decoded_path)
     scenes = [scene for scene in scenes if scene[:5] == "scene"]
-
-    if args.scannet200:
-        out_path = decoded_path / "scannet200_gt"
-    else:
-        out_path = decoded_path / "semantic_gt"
+    out_path = decoded_path / "semantic_gt"
 
     os.makedirs(out_path, exist_ok=True)
 
     for scene in tqdm(scenes):
-        if args.scannet200:
-            mesh_path = scannet200_path / f"{scene}.ply"
-        else:
-            mesh_path = scans_path / scene  / f"{scene}_vh_clean_2.labels.ply"
-            if args.link_pcds:
-                link_path = decoded_path / scene / f"{scene}_vh_clean_2.labels.ply"
-                if link_path.exists() or link_path.is_symlink():
-                    link_path.unlink()
-                os.symlink(mesh_path.resolve(), link_path)
+        mesh_path = scans_path / scene  / f"{scene}_vh_clean_2.labels.ply"
+        if args.link_pcds:
+            link_path = decoded_path / scene / f"{scene}_vh_clean_2.labels.ply"
+            if link_path.exists() or link_path.is_symlink():
+                link_path.unlink()
+            os.symlink(mesh_path.resolve(), link_path)
 
         gt_labels = read_ply_vertex_labels(mesh_path)
         write_labels(out_path / f"{scene}.txt", gt_labels)
@@ -109,7 +90,6 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_path', required=True, help='Path to directory containing scans and data folder')
-    parser.add_argument('--link_pcds', action='store_true' , help='If set, creates a symbolic link to gt pointclouds in data/val/scene*/. If --scannet200 is set, this is ignored.')
-    parser.add_argument('--scannet200', action='store_true' , help='If set, only saves ScanNet200 labels.')
+    parser.add_argument('--link_pcds', action='store_true', help='If set, creates a symbolic link to gt pointclouds in data/val/scene*/.')
     args = parser.parse_args()
     main(args)

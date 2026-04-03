@@ -1,13 +1,13 @@
 from typing import Dict, Any, Tuple, Union
 from pathlib import Path
+import json
+import math
+import os
 import open3d as o3d
 import numpy as np
 import plyfile
 import torch
-import math
-import json
 import yaml
-import os
 
 
 def load_config(path: str, default_path: str = None, inherit: bool = True) -> Dict[str, Any]:
@@ -62,39 +62,15 @@ def update_recursive(dict1: Dict[str,Any], dict2: Dict[str,Any]) -> None:
 
 
 def load_scene_data(dataset_name: str, scene_name: str, data_path: str, dataset_info: Dict[str, Any], ignore_background: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
-    if dataset_name == "ScanNetpp" or dataset_name.lower() == "scannetpp":
-        return load_scannetpp_scene(scene_name, data_path)
-    elif dataset_name == "Replica" or dataset_name.lower() == "replica":
+    dataset_name = dataset_name.lower()
+    if dataset_name == "replica":
         return load_replica_scene(scene_name, data_path, dataset_info, ignore_background)
-    elif dataset_name == "ScanNet" or dataset_name.lower() == "scannet":
-        return load_scannet_scene(scene_name, data_path, dataset_info.get("dataset", "scannet"))
-    else:
-        assert False, f"{dataset_name} dataset not implemented"
+    if dataset_name == "scannet":
+        return load_scannet_scene(scene_name, data_path)
+    raise AssertionError(f"{dataset_name} dataset not implemented")
 
-def load_scannetpp_scene(scene_name: str, data_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
-    data_folder = Path(data_path) / "ScanNetpp/" 
-    mesh_path = data_folder / "semantic/eval_meshes" / (scene_name+".pth")
-    gt_labels_path = data_folder / "semantic/eval_labels" / (scene_name+".txt")
-
-    with open(gt_labels_path, "r") as f:
-        gt_labels = f.read().splitlines() 
-    gt_labels = torch.tensor([int(i) for i in gt_labels])
-
-    mesh = torch.load(mesh_path) 
-    vtx_coords = mesh["vtx_coords"]
-
-    # Move mesh coordinates rotating z axis -90 degrees
-    P = torch.tensor([[0, 1, 0, 0], [-1, 0, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=torch.float32)
-    vtx_coords = torch.einsum("mn,bn->bm",P,torch.cat([vtx_coords, torch.ones(vtx_coords.shape[0],1)],dim=-1))
-    vtx_coords = vtx_coords[:,:3]/vtx_coords[:,3:]
-
-    return gt_labels, vtx_coords
-
-def load_scannet_scene(scene_name: str, data_path: str, version: str) -> Tuple[torch.Tensor, torch.Tensor]:
-    if version == "scannet200":
-        gt_labels = np.array(read_labels( Path(data_path) / "ScanNet"/ "scannet200_gt" / f"{scene_name}.txt"))
-    else:
-        gt_labels = np.array(read_labels( Path(data_path) / "ScanNet"/ "semantic_gt" / f"{scene_name}.txt"))
+def load_scannet_scene(scene_name: str, data_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    gt_labels = np.array(read_labels(Path(data_path) / "ScanNet" / "semantic_gt" / f"{scene_name}.txt"))
 
     mesh_path = Path(data_path) / "ScanNet"/ scene_name /  f"{scene_name}_vh_clean_2.labels.ply"
     plydata = plyfile.PlyData.read(mesh_path)

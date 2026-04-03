@@ -2,6 +2,7 @@
 
 ## Project Structure & Module Organization
 - `run_eval.py` is the main entry point for mapping and metrics. `visualize_scene.py` inspects outputs. `scripts/scannet_preprocess.py` prepares labels.
+- The trimmed repo targets `Replica` and `ScanNet` only.
 - `ovo/entities/` contains the semantic pipeline: `ovomapping.py` orchestrates runs, `ovo.py` manages 3D instances and text queries, and `clip_generator.py` / `mask_generator.py` wrap descriptor and mask extraction.
 - `ovo/slam/` selects the geometry backend: `vanilla_mapper.py` uses GT poses, and `orbslam.py` wraps ORB-SLAM3.
 - `ovo/utils/` contains config, geometry, segmentation, evaluation, and visualization helpers. `data/working/configs/` is layered by dataset and backend.

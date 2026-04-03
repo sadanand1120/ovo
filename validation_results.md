@@ -10,7 +10,7 @@ Scenes:
 - `scene0518_00`
 
 Config used for reproduction:
-- [data/working/configs/ovo_paper_scan.yaml](/home/dynamo/AMRL_Research/repos/ovo/data/working/configs/ovo_paper_scan.yaml)
+- [data/working/configs/ovo.yaml](/home/dynamo/AMRL_Research/repos/ovo/data/working/configs/ovo.yaml)
 
 ## Vanilla
 
@@ -76,5 +76,5 @@ Delta vs paper:
 
 - The `orbslam` reproduction here uses ORB-SLAM3, while the paper reports ORB-SLAM2.
 - The reproduced runs are in:
-  - [scannet_hvs_siglip_vanilla](/home/dynamo/AMRL_Research/repos/ovo/data/output/ScanNet/scannet_hvs_siglip_vanilla)
-  - [scannet_hvs_siglip_orbslam](/home/dynamo/AMRL_Research/repos/ovo/data/output/ScanNet/scannet_hvs_siglip_orbslam)
+  - [scannet_hvs_siglip_vanilla.preserved](/home/dynamo/AMRL_Research/repos/ovo/data/output/ScanNet/scannet_hvs_siglip_vanilla.preserved)
+  - [scannet_hvs_siglip_orbslam.preserved](/home/dynamo/AMRL_Research/repos/ovo/data/output/ScanNet/scannet_hvs_siglip_orbslam.preserved)
