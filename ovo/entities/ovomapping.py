@@ -146,7 +146,7 @@ class OVOSemMap():
                     if estimated_c2w is None or missing_depth :
                         continue
                     t_lc = 0
-                    if frame_id % self.map_every == 0 or self.config["slam"]["slam_module"] == "orbslam2":
+                    if frame_id % self.map_every == 0 or self.config["slam"]["slam_module"].startswith("orbslam"):
                         self.slam_backbone.map(frame_data, estimated_c2w)
                         if self.slam_backbone.map_updated:
                             torch.cuda.synchronize()

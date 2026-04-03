@@ -61,9 +61,11 @@ def compute_scene_labels(scene_path: Path, dataset_name: str, scene_name: str, d
     del ovo
 
 
-def run_scene(scene: str, dataset: str, experiment_name: str, tmp_run: bool = False, depth_filter: bool = None) -> None:
+def run_scene(scene: str, dataset: str, experiment_name: str, tmp_run: bool = False, depth_filter: bool = None, slam_module: str = None, frame_limit: int = None, config_path: str = "data/working/configs/ovo.yaml") -> None:
 
-    config = io_utils.load_config("data/working/configs/ovo.yaml")
+    config = io_utils.load_config(config_path)
+    if slam_module is not None:
+        config["slam"]["slam_module"] = slam_module
     map_module = config["slam"]["slam_module"]
     if map_module.startswith("orbslam"):
         map_module = "vanilla"
@@ -82,6 +84,8 @@ def run_scene(scene: str, dataset: str, experiment_name: str, tmp_run: bool = Fa
         config["data"] = {}
     config["data"]["scene_name"] = scene
     config["data"]["input_path"] = f"data/input/Datasets/{dataset}/{scene}"
+    if frame_limit is not None:
+        config["data"]["frame_limit"] = frame_limit
 
     output_path = Path(f"data/output/{dataset}/")
 
@@ -147,7 +151,7 @@ def main(args):
         input_path = f"./data/input/Datasets/{args.dataset_name}/{scene}"
         if args.run:
             t0 = time.time()
-            run_scene(scene, args.dataset_name, experiment_name, tmp_run = tmp_run)
+            run_scene(scene, args.dataset_name, experiment_name, tmp_run=tmp_run, slam_module=args.slam_module, frame_limit=args.frame_limit, config_path=args.config_path)
             t1 = time.time()
             print(f"Scene {scene} took: {t1-t0:.2f}")
         gc.collect()
@@ -178,5 +182,8 @@ if __name__ == "__main__":
     parser.add_argument('--segment', action='store_true', help="If set, use the reconstructed scene to segment the gt point-cloud, after running OVO.")
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--ignore_background', action='store_true',help="If set, does not use background ids from eval_info to compute metrics.")
+    parser.add_argument('--slam_module', type=str, default=None, help="Override slam backend, e.g. vanilla or orbslam.")
+    parser.add_argument('--frame_limit', type=int, default=None, help="Override number of input frames to process.")
+    parser.add_argument('--config_path', type=str, default="data/working/configs/ovo.yaml", help="Base OVO config file to load.")
     args = parser.parse_args()
     main(args)

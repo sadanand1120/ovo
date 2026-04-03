@@ -1,13 +1,24 @@
 # Data
 ## Pretrained models
-* SAM2.1 : create the folder and download your desired checkpoint from the official repo. e.g.:
+Run the setup helper from the repo root:
+
 ```
-cd /<ovo_abs_path>/data/input/
-mkdir sam_ckpts && cd sam_ckpts
-wget https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
+./download_ckpts.sh
 ```
 
-* CLIPs merging weights predictor: dowload its weights from <a href="https://drive.google.com/file/d/186wZ2mLES_QjUjW8l2DmVmlWDpNl2fSY/view">this link</a>, and save it in `/<ovo_abs_path>/data/input/weights_predictor/base/`.
+It downloads the manual checkpoints into the expected locations:
+
+* SAM2.1 checkpoint:
+```
+/<ovo_abs_path>/data/input/sam_ckpts/sam2.1_hiera_large.pt
+```
+
+* CLIP merging weights predictor:
+```
+/<ovo_abs_path>/data/input/weights_predictor/base/model.pt
+```
+
+The `hparams.yaml` for the predictor is already tracked in the repo. Hugging Face models used by `open_clip` / Perception Encoder are not downloaded by this script and will use the default global Hugging Face cache location on first use.
 
 ## Datasets
 ### Replica

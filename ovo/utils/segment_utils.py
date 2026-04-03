@@ -290,6 +290,11 @@ def load_sam(config: Dict[str, Any], device: str = "cuda") -> SamAutomaticMaskGe
         torch.backends.cudnn.allow_tf32 = True
         from sam2.build_sam import build_sam2
         from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator as SamAutomaticMaskGenerator
+        from sam2.modeling.sam import transformer as sam_transformer
+
+        # Flash attention is unstable on this stack; force the math kernel path.
+        sam_transformer.USE_FLASH_ATTN = False
+        sam_transformer.MATH_KERNEL_ON = True
 
         model_cfg = os.path.join("configs",f"sam{sam_version}",f"sam{sam_version}_{sam_encoder}.yaml")
         sam = build_sam2(model_cfg, checkpoint_path, device=device, mode="eval", apply_postprocessing=False)

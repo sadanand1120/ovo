@@ -446,6 +446,43 @@ def visualize_gt_vs_pred(points, gt, pred, labels, labels_idx):
     o3d.visualization.draw_geometries_with_key_callbacks(scene_elements, key_to_callback)
     return
 
+def visualize_semantic_prediction(points, pred, color_map, faces=None, hide_labels=None):
+    hide_labels = set() if hide_labels is None else set(hide_labels)
+    pred = np.asarray(pred).astype(np.int64)
+    points = np.asarray(points)
+
+    keep_mask = np.ones(pred.shape[0], dtype=bool)
+    for label in hide_labels:
+        keep_mask &= pred != label
+
+    colors = np.zeros((pred.shape[0], 3), dtype=np.float32)
+    for label, color in color_map.items():
+        colors[pred == int(label)] = np.asarray(color, dtype=np.float32) / 255.0
+
+    if faces is not None:
+        faces = np.asarray(faces, dtype=np.int32)
+        if keep_mask.sum() < keep_mask.shape[0]:
+            valid_faces = keep_mask[faces].all(axis=1)
+            faces = faces[valid_faces]
+            old_to_new = np.full(keep_mask.shape[0], -1, dtype=np.int32)
+            old_to_new[np.where(keep_mask)[0]] = np.arange(keep_mask.sum(), dtype=np.int32)
+            faces = old_to_new[faces]
+            points = points[keep_mask]
+            colors = colors[keep_mask]
+
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(points)
+        mesh.triangles = o3d.utility.Vector3iVector(faces)
+        mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
+        o3d.visualization.draw_geometries([mesh])
+        return
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points[keep_mask])
+    pcd.colors = o3d.utility.Vector3dVector(colors[keep_mask])
+    o3d.visualization.draw_geometries([pcd])
+    return
+
 def idxToRGB(seg_image, rgb_image = None, alpha=0.6,max_idx=40):
     """
     Maps each pixel in an image with idx values to RGB. Assume idxs<100 

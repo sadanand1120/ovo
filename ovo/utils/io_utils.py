@@ -101,6 +101,13 @@ def load_scannet_scene(scene_name: str, data_path: str, version: str) -> Tuple[t
     vertices = np.vstack([plydata["vertex"]["x"], plydata["vertex"]["y"], plydata["vertex"]["z"]]).T
     return gt_labels, vertices
 
+def load_scannet_mesh(scene_name: str, data_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    mesh_path = Path(data_path) / "ScanNet" / scene_name / f"{scene_name}_vh_clean_2.labels.ply"
+    plydata = plyfile.PlyData.read(mesh_path)
+    vertices = np.vstack([plydata["vertex"]["x"], plydata["vertex"]["y"], plydata["vertex"]["z"]]).T
+    faces = np.vstack(plydata["face"]["vertex_indices"])
+    return vertices, faces
+
 def load_replica_scene(scene_name: str, data_path: str, dataset_info: Dict[str, Any], ignore_background: bool) -> Tuple[torch.Tensor, torch.Tensor]:
     map_to_reduced = dataset_info.get("map_to_reduced", None)
     ignore = dataset_info.get("ignore",[])
