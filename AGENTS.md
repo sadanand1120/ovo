@@ -3,13 +3,13 @@
 ## Project Structure & Module Organization
 - `run_eval.py` is the main entry point for mapping and metrics. `visualize_scene.py` inspects outputs. `scripts/scannet_preprocess.py` prepares labels.
 - `ovo/entities/` contains the semantic pipeline: `ovomapping.py` orchestrates runs, `ovo.py` manages 3D instances and text queries, and `clip_generator.py` / `mask_generator.py` wrap descriptor and mask extraction.
-- `ovo/slam/` selects the geometry backend: `vanilla_mapper.py` uses GT poses, `orbslam.py` wraps ORB-SLAM3, and `gaussian_slam.py` uses bundled code under `ovo/submodules/gaussian_slam/`.
+- `ovo/slam/` selects the geometry backend: `vanilla_mapper.py` uses GT poses, and `orbslam.py` wraps ORB-SLAM3.
 - `ovo/utils/` contains config, geometry, segmentation, evaluation, and visualization helpers. `data/working/configs/` is layered by dataset and backend.
 - Inputs and checkpoints live in `data/input/`; generated runs belong in `data/output/`. `thirdParty/` is for external dependencies.
 
 ## Build, Test, and Development Commands
 - `git submodule update --init --recursive` fetches required third-party code.
-- Follow `ReadMe.md` to create the `ovo` Conda environment and install editable dependencies. ORB-SLAM3 is expected under `thirdParty/ORB_SLAM3` when used.
+- Follow `README.md` to create the `ovo` Conda environment and install editable dependencies. ORB-SLAM3 is expected under `thirdParty/ORB_SLAM3` when used.
 - `python scripts/scannet_preprocess.py --data_path /path/to/ScanNet --link_pcds` prepares ScanNet labels and links meshes.
 - `python run_eval.py --dataset_name Replica --experiment_name dev_run --run --segment --eval --scenes office0` runs the full local pipeline on one scene.
 - `python visualize_scene.py data/output/Replica/dev_run/office0 --visualize_obj` inspects saved outputs.

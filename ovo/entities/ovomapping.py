@@ -15,16 +15,14 @@ from .visualizer import stream_pcd
 from ..slam.vanilla_mapper import VanillaMapper
 from ..utils import io_utils
 
-def get_slam_backbone(config: Dict[str, Any], dataset, cam_intrinsics: torch.Tensor) -> VanillaMapper | WrapperGaussianSLAM:
+def get_slam_backbone(config: Dict[str, Any], dataset, cam_intrinsics: torch.Tensor):
     backbone = config["slam"].get("slam_module","vanilla")
-    if backbone == "gaussian_slam":
-        from ..slam.gaussian_slam import WrapperGaussianSLAM
-        return WrapperGaussianSLAM(config, dataset)
-    elif backbone.startswith("orbslam"):
+    if backbone.startswith("orbslam"):
         from ..slam.orbslam import WrapperORBSLAM
         return WrapperORBSLAM(config, cam_intrinsics, world_ref=torch.from_numpy(dataset[0][3]))
-    else:
+    if backbone == "vanilla":
         return VanillaMapper(config, cam_intrinsics)
+    raise ValueError(f"Unsupported SLAM backend: {backbone}")
 
 class OVOSemMap():
     """OVOSemMap is a class responsible for managing the semantic mapping process using the OVO framework. It initializes

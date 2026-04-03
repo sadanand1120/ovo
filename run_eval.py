@@ -19,9 +19,7 @@ from ovo.entities.ovo import OVO
 def load_representation(scene_path: Path, eval: bool=False, debug_info: bool=False) -> OVO:
     config = io_utils.load_config(scene_path / "config.yaml", inherit=False)
     submap_ckpt = torch.load(scene_path /"ovo_map.ckpt" )
-    map_params = submap_ckpt.get("map_params", None)
-    if map_params is None:
-        map_params = submap_ckpt["gaussian_params"]        
+    map_params = submap_ckpt["map_params"]
     config["semantic"]["verbose"] = False 
     ovo = OVO(config["semantic"],None, config["data"]["scene_name"], eval=eval, device=config.get("device", "cuda"))
     ovo.restore_dict(submap_ckpt["ovo_map_params"], debug_info=debug_info)

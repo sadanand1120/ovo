@@ -1,5 +1,4 @@
-""" Slightly modified code based on Gaussian-SLAM's datasets
-"""
+"""Dataset loaders used by the OVO pipeline."""
 import math
 import os
 from pathlib import Path

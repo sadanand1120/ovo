@@ -97,8 +97,7 @@ def depth_filter(depth: torch.Tensor, k_size: int = 7,sigma: float= 2.5, th: flo
 
 
 def compute_camera_frustum_corners(depth_map: torch.Tensor, pose: torch.Tensor, intrinsics: torch.Tensor) -> torch.Tensor:
-    """ Code from Gaussian-SLAM mapper_utils 
-     Computes the 3D coordinates of the camera frustum corners based on the depth map, pose, and intrinsics.
+    """Computes the 3D coordinates of the camera frustum corners based on the depth map, pose, and intrinsics.
     Args:
         depth_map: The depth map of the scene.
         pose: The camera pose matrix.
@@ -129,8 +128,7 @@ def compute_camera_frustum_corners(depth_map: torch.Tensor, pose: torch.Tensor, 
     return corners_3d[:, :3]
 
 def compute_camera_frustum_corners_cpu(depth_map: np.ndarray, pose: np.ndarray, intrinsics: np.ndarray) -> np.ndarray:
-    """ Code from Gaussian-SLAM mapper_utils 
-     Computes the 3D coordinates of the camera frustum corners based on the depth map, pose, and intrinsics.
+    """Computes the 3D coordinates of the camera frustum corners based on the depth map, pose, and intrinsics.
     Args:
         depth_map: The depth map of the scene.
         pose: The camera pose matrix.
@@ -161,8 +159,7 @@ def compute_camera_frustum_corners_cpu(depth_map: np.ndarray, pose: np.ndarray, 
     return corners_3d.T[:, :3]
 
 def compute_camera_frustum_planes(frustum_corners: np.ndarray) -> torch.Tensor:
-    """ Code from Gaussian-SLAM mapper_utils 
-     Computes the planes of the camera frustum from its corners.
+    """Computes the planes of the camera frustum from its corners.
     Args:
         frustum_corners: An array of 3D coordinates representing the corners of the frustum.
 
@@ -203,8 +200,7 @@ def compute_camera_frustum_planes(frustum_corners: np.ndarray) -> torch.Tensor:
 
 
 def compute_frustum_aabb(frustum_corners: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """ Code from Gaussian-SLAM mapper_utils 
-    Computes a mask indicating which points lie inside a given axis-aligned bounding box (AABB).
+    """Computes a mask indicating which points lie inside a given axis-aligned bounding box (AABB).
     Args:
         points: An array of 3D points.
         min_corner: The minimum corner of the AABB.
@@ -216,8 +212,7 @@ def compute_frustum_aabb(frustum_corners: torch.Tensor) -> Tuple[torch.Tensor, t
 
 
 def points_inside_aabb_mask(points: np.ndarray, min_corner: np.ndarray, max_corner: np.ndarray) -> np.ndarray:
-    """ Code from Gaussian-SLAM mapper_utils 
-    Computes a mask indicating which points lie inside the camera frustum.
+    """Computes a mask indicating which points lie inside the camera frustum.
     Args:
         points: A tensor of 3D points.
         frustum_planes: A tensor representing the planes of the frustum.
@@ -235,8 +230,7 @@ def points_inside_aabb_mask(points: np.ndarray, min_corner: np.ndarray, max_corn
 
 
 def points_inside_frustum_mask(points: torch.Tensor, frustum_planes: torch.Tensor) -> torch.Tensor:
-    """ Code from Gaussian-SLAM mapper_utils 
-    Computes a mask indicating which points lie inside the camera frustum.
+    """Computes a mask indicating which points lie inside the camera frustum.
     Args:
         points: A tensor of 3D points.
         frustum_planes: A tensor representing the planes of the frustum.
@@ -250,8 +244,7 @@ def points_inside_frustum_mask(points: torch.Tensor, frustum_planes: torch.Tenso
 
 
 def compute_frustum_point_ids(pts: torch.Tensor, frustum_corners: torch.Tensor, device: str = "cuda") -> torch.Tensor:
-    """ Code from Gaussian-SLAM mapper_utils 
-    Identifies points within the camera frustum, optimizing for computation on a specified device.
+    """Identifies points within the camera frustum, optimizing for computation on a specified device.
     Args:
         pts: A tensor of 3D points.
         frustum_corners: A tensor of 3D coordinates representing the corners of the frustum.

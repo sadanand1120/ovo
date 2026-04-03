@@ -3,9 +3,6 @@ from torchvision.transforms import Resize, Normalize, CenterCrop, Compose
 import open_clip
 import torch
 
-import core.vision_encoder.pe as pe
-import core.vision_encoder.transforms as transforms
-
 
 def siglip_cosine_similarity(txt_embeds:torch.Tensor, img_embed: torch.Tensor, logit_scale:torch.Tensor, logit_bias:float) -> torch.Tensor:
     p = txt_embeds.to(img_embed.dtype) 
@@ -59,7 +56,6 @@ def load_clip_model(model_card: str, use_half: bool) -> Tuple[Any, Any, Compose,
         "ViT-L-14-qg": 'hf-hub:apple/DFN2B-CLIP-ViT-L-14-39B',#224x224
         "ViT-H-14-qg": 'hf-hub:apple/DFN5B-CLIP-ViT-H-14', #224x224
         "ViT-H-14-378qg": 'hf-hub:apple/DFN5B-CLIP-ViT-H-14-378',#384x384
-        "PE-Core-L-14-336": 'hf-hub:timm/PE-Core-L-14-336', #336x336
 
     }
     clip_dim_cards = {
@@ -71,7 +67,6 @@ def load_clip_model(model_card: str, use_half: bool) -> Tuple[Any, Any, Compose,
         "ViT-L-14-qg": 768,
         "ViT-H-14-qg": 1024, 
         "ViT-H-14-378qg": 1024,
-        "PE-Core-L-14-336": 1024,
     }
     assert model_card in list(cards.keys()), f"Select one of {cards.keys()} model cards"
     model, preprocess = open_clip.create_model_from_pretrained(
@@ -84,33 +79,5 @@ def load_clip_model(model_card: str, use_half: bool) -> Tuple[Any, Any, Compose,
     preprocess = Compose(tf_to_keep)
 
     return model.eval(), tokenizer, preprocess, clip_dim_cards[model_card]
-
-
-
-def load_perception_encoder(model_card: str, ckpt_path = None) -> Tuple[Any, Any, Compose, str]:
-
-    if "Core" in model_card:
-        model = pe.CLIP.from_config(model_card, pretrained=True, checkpoint_path=str(ckpt_path / f"data/input/ckpts/pe/{model_card}.pt") if ckpt_path else None).cuda()
-    elif "Spatial" in model_card:
-        model = pe.CLIP.from_config("PE-Core-G14-448", pretrained=True, checkpoint_path=str(ckpt_path / "data/input/ckpts/pe/PE-Core-G14-448.pt") if ckpt_path else None)
-
-        visual = pe.VisionTransformer.from_config(model_card, pretrained=True, checkpoint_path=str(ckpt_path /f"data/input/ckpts/pe/{model_card}.pt")).cuda()
-        visual.ln_post = model.visual.ln_post
-        visual.proj = model.visual.proj
-        visual.pool = model.visual._pool
-        visual.pool_type = model.visual.pool_type
-        visual.attn_pool = model.visual.attn_pool
-
-        model.visual = visual
-
-    
-    preprocess = transforms.get_image_transform(model.image_size) 
-    tf_to_keep = [tf for tf in preprocess.transforms if isinstance(tf, Resize) or isinstance(tf,CenterCrop) or isinstance(tf, Normalize)]
-    preprocess = Compose(tf_to_keep)
-    tokenizer = transforms.get_text_tokenizer(model.context_length)
-
-    return model, tokenizer, preprocess
-
-
 def load_camfusion_model(ckpt_path: str):
     raise NotImplementedError("CAMFusion loading function not implemented yet.")

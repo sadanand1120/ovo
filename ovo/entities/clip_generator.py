@@ -6,7 +6,6 @@ import os
 from ..utils import clip_utils
 from ..utils import segment_utils
 
-from .textregion import PETextRegion
 from .clips_merging import WeightsPredictorMerger
 
 class CLIPGenerator:
@@ -15,6 +14,16 @@ class CLIPGenerator:
         self.device = device
         self.embed_type = config.get("embed_type", "vanilla")
         self.mask_res = config.get("mask_res", 384)
+        valid_embed_types = {
+            "learned",
+            "vanilla",
+            "fixed_weights",
+            "hovsg",
+            "adaptive_weights",
+            "concept_fusion",
+        }
+        if self.embed_type not in valid_embed_types:
+            raise ValueError(f"Unsupported embed_type: {self.embed_type}")
 
         if self.embed_type == "learned":
 
@@ -35,21 +44,10 @@ class CLIPGenerator:
             self.clips_fusion = lambda clip_g, clip_seg, clip_bbox: clip_utils.fuse_clips(clip_g, clip_seg, clip_bbox, self.embed_type, w_masked, w_global)
       
         self.model_card = config.get("model_card", "SigLIP-384")
-        if self.embed_type == "TextRegion":
-            self.model, self.tokenizer, self.preprocess = clip_utils.load_perception_encoder(self.model_card)
-            self.clip_dim=1024  
-            self.textregion = PETextRegion(
-            self.model,
-            model_card=self.model_card,
-            preprocess=self.preprocess,
-            resize_method=config.get("resize_method", 'multi_resolution'),
-            remove_global_patch=config.get("remove_global_patch", False),
-            project_and_normalize=config.get("project_and_normalize", True),
-            )
-        else:
 
-            self.model, self.tokenizer, self.preprocess, clip_dim = clip_utils.load_clip_model(self.model_card, config.get("use_half", False))
-            self.clip_dim=clip_dim  
+        self.model, self.tokenizer, self.preprocess, clip_dim = clip_utils.load_clip_model(
+            self.model_card, config.get("use_half", False))
+        self.clip_dim = clip_dim
 
         if self.model_card.startswith("SigLIP"):
             self.get_similarity = clip_utils.siglip_cosine_similarity
@@ -131,8 +129,6 @@ class CLIPGenerator:
         Return:
             - climp_embeds: list of numpy arrays with dim (N, self.clip_dim).        
         """
-        if self.embed_type == "TextRegion":
-            return self.textregion.predict(image/255., binary_maps)
         if self.embed_type != "vanilla":
             if len(image.shape) ==3:
                 image = image[None, ...]

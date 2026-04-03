@@ -3,26 +3,24 @@ checkpoint_path: null
 use_wandb: False
 device: cuda
 data:
-  frame_limit: -1 # 100 #-1 # for debugging, set to -1 to disable
+  frame_limit: -1
 seed: 0
 slam:
   config_path: data/working/configs/slam
-  slam_module: orbslam #vanilla #gaussian_slam #
-  use_viewer: False # only used with orbslam
-  close_loops: True # only used with orbslam
+  slam_module: vanilla
+  use_viewer: False
+  close_loops: True
   save_estimated_cam: True
 vis:
   stream: False
-  show_stream: False # this is going to be ignored if stream is false
+  show_stream: False
 mapping:
-  map_every: 5 # ignored if slam.slam_module == orbslam2
-debug: True
-debug_info: True
+  map_every: 5
 semantic:
   segment_every: 10
   use_gt_masks: False
   use_gt_clips: False
-  match_distance_th: 0.05 #0.01
+  match_distance_th: 0.05
   track_th: 100
   depth_filter: True
   log: True
@@ -33,21 +31,14 @@ semantic:
     sam_ckpt_path: "data/input/sam_ckpts/"
     sam_version: "2.1"
     sam_encoder: "hiera_l"
-    masks_base_path: "data/working/masks/replica_384_sam2.1_16"
-    #sam_version: "" # "" is 1, 
-    #sam_encoder: "vit_h"
-    #masks_base_path: "data/working/masks/replica_384_h"
-    #nms_iou_th: 0.88
-    #stability_score_thresh: 0.95
-    #min_mask_region_area: 100
+    masks_base_path: "data/working/masks/replica_384_sam2.1"
   clip:
-    use_half: False
-    embed_type: TextRegion # learned #fixed_weights # 
-    model_card: "PE-Core-L14-336" # SigLIP-384 #ViT-H-14 #
-    mask_res: 336 # 384
+    use_half: True
+    embed_type: learned
+    model_card: SigLIP-384
+    mask_res: 384
     weights_predictor_path: data/input/weights_predictor/base
-    k_top_views: 10000 #-1 #5 #10
-    fusion: 'avg_pooling' #'l1_medoid'
-    mv_fuser: False #True #
-    mv_fuser_ckpt: "20250725_1155" #"20250725_1200"
+    k_top_views: 10
+    fusion: l1_medoid
+    mv_fuser: False
   kf_queue_delay: 10
