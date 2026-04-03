@@ -6,7 +6,6 @@ data:
   frame_limit: -1
 seed: 0
 slam:
-  config_path: data/working/configs/slam
   slam_module: vanilla
   use_viewer: False
   close_loops: True
@@ -16,6 +15,11 @@ vis:
   show_stream: False
 mapping:
   map_every: 5
+  max_frame_points: 1e5
+  k_pooling: 3
+  downscale_res: 2
+tracking:
+  track_every: 1
 semantic:
   segment_every: 10
   use_gt_masks: False

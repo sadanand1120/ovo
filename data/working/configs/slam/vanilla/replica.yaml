@@ -1,7 +1,0 @@
-dataset_name: "replica"
-mapping:
-  max_frame_points: 1e5
-  k_pooling: 3
-  downscale_ratio: 2
-tracking:
-  track_every: 1 # 5

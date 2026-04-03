@@ -11,8 +11,9 @@ import uuid
 import gc
 import os
 import shutil
+import random
 
-from ovo.utils import io_utils, gen_utils, eval_utils
+from ovo.utils import io_utils, eval_utils
 from ovo.entities.ovomapping import OVOSemMap
 from ovo.entities.ovo import OVO
 
@@ -43,9 +44,8 @@ def compute_scene_labels(scene_path: Path, dataset_name: str, scene_name: str, d
 
     instances_info = ovo.classify_instances(classes)
 
-    mesh_semantic_labels = dict()
     print("Matching instances to ground truth mesh ...")
-    mesh_instance_labels, mesh_instances_masks, matched_instances_ids = eval_utils.match_labels_to_vtx(points_obj_ids[:,0], pcd_pred, pcd_gt)
+    mesh_instance_labels, mesh_instances_masks, _ = eval_utils.match_labels_to_vtx(points_obj_ids[:,0], pcd_pred, pcd_gt)
     
     map_id_to_idx = {id: i for i, id in enumerate(ovo.objects.keys())}
     mesh_semantic_labels = instances_info["classes"][np.vectorize(map_id_to_idx.get)(mesh_instance_labels)]
@@ -59,31 +59,39 @@ def compute_scene_labels(scene_path: Path, dataset_name: str, scene_name: str, d
     del ovo
 
 
-def run_scene(scene: str, dataset: str, experiment_name: str, tmp_run: bool = False, depth_filter: bool = None, slam_module: str = None, frame_limit: int = None, config_path: str = "data/working/configs/ovo.yaml") -> None:
+def setup_seed(seed: int) -> None:
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
+
+def build_scene_config(scene: str, dataset: str, config_path: str, slam_module: str = None, frame_limit: int = None) -> Dict:
     config = io_utils.load_config(config_path)
     if slam_module is not None:
         config["slam"]["slam_module"] = slam_module
-    map_module = config["slam"]["slam_module"]
-    if map_module.startswith("orbslam"):
-        map_module = "vanilla"
-        
-    config_slam = io_utils.load_config(os.path.join(config["slam"]["config_path"],  map_module, dataset.lower()+".yaml"))
-    io_utils.update_recursive(config, config_slam)
 
     config_dataset = io_utils.load_config(f"data/working/configs/{dataset}/{dataset.lower()}.yaml")
     io_utils.update_recursive(config, config_dataset)
-    
-    if os.path.exists(f"data/working/configs/{dataset}/{scene}.yaml"):
-        config_scene = io_utils.load_config(f"data/working/configs/{dataset}/{scene}.yaml")
-        io_utils.update_recursive(config, config_scene)
-        
-    if "data" not in config:
-        config["data"] = {}
+
+    scene_config_path = Path(f"data/working/configs/{dataset}/{scene}.yaml")
+    if scene_config_path.exists():
+        io_utils.update_recursive(config, io_utils.load_config(scene_config_path))
+
+    config.setdefault("data", {})
     config["data"]["scene_name"] = scene
     config["data"]["input_path"] = f"data/input/Datasets/{dataset}/{scene}"
     if frame_limit is not None:
         config["data"]["frame_limit"] = frame_limit
+    return config
+
+
+def run_scene(scene: str, dataset: str, experiment_name: str, tmp_run: bool = False, slam_module: str = None, frame_limit: int = None, config_path: str = "data/working/configs/ovo.yaml") -> None:
+
+    config = build_scene_config(scene, dataset, config_path, slam_module=slam_module, frame_limit=frame_limit)
 
     output_path = Path(f"data/output/{dataset}/")
 
@@ -91,9 +99,6 @@ def run_scene(scene: str, dataset: str, experiment_name: str, tmp_run: bool = Fa
         output_path = output_path / "tmp"
 
     output_path = output_path / experiment_name / scene
-
-    if depth_filter is not None:
-        config["semantic"]["depth_filter"] = depth_filter
 
     if os.getenv('DISABLE_WANDB') == 'true':
         config["use_wandb"] = False
@@ -108,7 +113,7 @@ def run_scene(scene: str, dataset: str, experiment_name: str, tmp_run: bool = Fa
             name=f'{config["data"]["scene_name"]}_{time.strftime("%Y%m%d_%H%M%S", time.localtime())}_{str(uuid.uuid4())[:5]}',
         )
 
-    gen_utils.setup_seed(config["seed"])
+    setup_seed(config["seed"])
     gslam = OVOSemMap(config, output_path=output_path)
     gslam.run()
 

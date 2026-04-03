@@ -108,6 +108,8 @@ ORB-SLAM3 is included as a submodule:
 git submodule update --init --recursive
 ```
 
+Runtime settings are generated automatically from the decoded scene intrinsics, so there are no committed per-scene ORB YAML files left in this repo.
+
 ### Build dependencies
 
 ```bash
@@ -293,12 +295,15 @@ Starting from a ScanNet root like:
   data/val/
 ```
 
-Generate labels and link meshes with:
+Decode, generate `semantic_gt`, and link meshes with one command:
 
 ```bash
 cd /<ovo_path>
 conda activate ovo
-python scripts/scannet_preprocess.py --data_path /<ScanNet_data_path> --link_pcds
+python scripts/scannet_decode_sens.py \
+  --scans_root /<ScanNet_data_path>/scans \
+  --output_root /<ScanNet_data_path>/data/val \
+  --write_semantic_gt --link_pcds
 ```
 
 Then link the decoded validation split:
@@ -316,18 +321,14 @@ python scripts/scannet_decode_sens.py \
   --scans_root /home/dynamo/AMRL_Research/dataset/scannet_v2/scans \
   --output_root /home/dynamo/AMRL_Research/repos/ovo/data/input/scannet_v2_ovo/data/val \
   --scenes scene0000_00 scene0002_00 \
+  --write_semantic_gt --link_pcds \
   --min_free_gb 100
 ```
 
-Then generate labels and link them:
+Then expose the decoded split to OVO:
 
 ```bash
-python scripts/scannet_preprocess.py \
-  --data_path /home/dynamo/AMRL_Research/repos/ovo/data/input/scannet_v2_ovo \
-  --link_pcds
-
-ln -sfn \
-  /home/dynamo/AMRL_Research/repos/ovo/data/input/scannet_v2_ovo/data/val \
+ln -sfn /home/dynamo/AMRL_Research/repos/ovo/data/input/scannet_v2_ovo/data/val \
   /home/dynamo/AMRL_Research/repos/ovo/data/input/Datasets/ScanNet
 ```
 
@@ -374,7 +375,7 @@ Key flags:
 - `--scenes`: explicit scene list
 - `--scenes_list`: text file containing one scene per line
 - `--slam_module`: override backend, e.g. `vanilla` or `orbslam`
-- `--config_path`: override base config, defaults to `data/working/configs/ovo.yaml`
+- `--config_path`: override the base config, defaults to `data/working/configs/ovo.yaml`
 
 Examples:
 

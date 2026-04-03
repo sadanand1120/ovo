@@ -2,8 +2,21 @@ from typing import Any, Dict, List
 import orbslam3 as orbslam
 import torch
 from pathlib import Path
+import tempfile
+import numpy as np
 
 from .vanilla_mapper import VanillaMapper
+
+
+SCANNET_ORBSLAM_OVERRIDES = {
+    "default": {"Stereo.b": 0.069253, "ORBextractor.nFeatures": 8000, "ORBextractor.iniThFAST": 15},
+    "scene0000_00": {"Stereo.b": 0.069000, "ORBextractor.iniThFAST": 20},
+    "scene0002_00": {"Stereo.b": 0.070000, "ORBextractor.iniThFAST": 20},
+    "scene0050_00": {"Stereo.b": 0.069220},
+    "scene0231_00": {"Stereo.b": 0.069220},
+    "scene0378_00": {"Stereo.b": 0.069621, "ORBextractor.nFeatures": 4000, "ORBextractor.iniThFAST": 20},
+    "scene0518_00": {"Stereo.b": 0.069220, "ORBextractor.nFeatures": 4000, "ORBextractor.iniThFAST": 20},
+}
 
 
 def convert_pose(traj, device):
@@ -12,6 +25,78 @@ def convert_pose(traj, device):
         torch.tensor([[0,0,0,1]], device = device)
     ])
     return pose
+
+
+def _load_orb_camera(config: Dict[str, Any], cam_intrinsics: torch.Tensor) -> Dict[str, float]:
+    cam_cfg = config["cam"]
+    crop_edge = int(cam_cfg.get("crop_edge", 0))
+    scene_path = Path(config["data"]["input_path"])
+    intrinsic_path = scene_path / "intrinsic" / "intrinsic_depth.txt"
+
+    if intrinsic_path.exists():
+        intrinsic = np.loadtxt(intrinsic_path, dtype=np.float32).reshape(4, 4)
+        fx = float(intrinsic[0, 0])
+        fy = float(intrinsic[1, 1])
+        cx = float(intrinsic[0, 2]) - crop_edge
+        cy = float(intrinsic[1, 2]) - crop_edge
+    else:
+        fx = float(cam_intrinsics[0, 0].detach().cpu())
+        fy = float(cam_intrinsics[1, 1].detach().cpu())
+        cx = float(cam_intrinsics[0, 2].detach().cpu())
+        cy = float(cam_intrinsics[1, 2].detach().cpu())
+
+    return {
+        "Camera1.fx": fx,
+        "Camera1.fy": fy,
+        "Camera1.cx": cx,
+        "Camera1.cy": cy,
+        "Camera.width": int(cam_cfg["W"] - 2 * crop_edge),
+        "Camera.height": int(cam_cfg["H"] - 2 * crop_edge),
+    }
+
+
+def _get_orb_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
+    if config["dataset_name"].lower() != "scannet":
+        return {"Stereo.b": 0.069253, "ORBextractor.nFeatures": 8000, "ORBextractor.iniThFAST": 15}
+    scene_name = config["data"]["scene_name"]
+    overrides = dict(SCANNET_ORBSLAM_OVERRIDES["default"])
+    overrides.update(SCANNET_ORBSLAM_OVERRIDES.get(scene_name, {}))
+    return overrides
+
+
+def _build_orbslam_settings(config: Dict[str, Any], cam_intrinsics: torch.Tensor) -> str:
+    settings = {
+        "File.version": '"1.0"',
+        "Camera.type": '"PinHole"',
+        **_load_orb_camera(config, cam_intrinsics),
+        "Camera1.k1": 0.0,
+        "Camera1.k2": 0.0,
+        "Camera1.p1": 0.0,
+        "Camera1.p2": 0.0,
+        "Camera1.k3": 0.0,
+        "Camera.fps": 30,
+        "Camera.RGB": 1,
+        "Stereo.ThDepth": 40.0,
+        "RGBD.DepthMapFactor": 1.0,
+        "ORBextractor.scaleFactor": 1.2,
+        "ORBextractor.nLevels": 12,
+        "ORBextractor.minThFAST": 7,
+        "Viewer.KeyFrameSize": 0.05,
+        "Viewer.KeyFrameLineWidth": 1.0,
+        "Viewer.GraphLineWidth": 0.9,
+        "Viewer.PointSize": 2.0,
+        "Viewer.CameraSize": 0.08,
+        "Viewer.CameraLineWidth": 3.0,
+        "Viewer.ViewpointX": 0.0,
+        "Viewer.ViewpointY": -0.7,
+        "Viewer.ViewpointZ": -1.8,
+        "Viewer.ViewpointF": 500.0,
+    }
+    settings.update(_get_orb_overrides(config))
+
+    lines = ["%YAML:1.0", ""]
+    lines.extend(f"{key}: {value}" for key, value in settings.items())
+    return "\n".join(lines) + "\n"
 
 
 class WrapperORBSLAM(VanillaMapper):
@@ -25,13 +110,12 @@ class WrapperORBSLAM(VanillaMapper):
         self.world_ref = world_ref.to(self.device)
         self.kfs = {}
 
-        configs_path = Path(config["slam"]["config_path"]) / "orbslam3"
-        vocab_path = configs_path  / "vocabulary" / "ORBvoc.txt"
+        repo_root = Path(__file__).resolve().parents[2]
+        vocab_path = repo_root / "thirdParty" / "ORB_SLAM3" / "Vocabulary" / "ORBvoc.txt"
         assert (vocab_path).exists(), f"ORB vocabulary not found, review path {vocab_path}"
-        if (configs_path/ config["dataset_name"].lower()/ f"{config['data']['scene_name']}.yaml").exists():
-            orbslam_config_path = configs_path / config["dataset_name"].lower()/ f"{config['data']['scene_name']}.yaml"
-        else:
-            orbslam_config_path = configs_path / f"{config['dataset_name']}.yaml"
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="ovo_orbslam_")
+        orbslam_config_path = Path(self.temp_dir.name) / f"{config['data']['scene_name']}.yaml"
+        orbslam_config_path.write_text(_build_orbslam_settings(config, cam_intrinsics))
 
         self.orbslam = orbslam.System(str(vocab_path), str(orbslam_config_path), orbslam.Sensor.RGBD, config["slam"].get("use_viewer",False), not self.close_loops)
         self.orbslam.initialize()
@@ -118,3 +202,4 @@ class WrapperORBSLAM(VanillaMapper):
 
     def __del__(self) -> None:
         self.orbslam.shutdown()
+        self.temp_dir.cleanup()

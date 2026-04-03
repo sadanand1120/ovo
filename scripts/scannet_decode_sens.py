@@ -1,4 +1,5 @@
 import argparse
+import os
 import shutil
 import struct
 import zlib
@@ -6,21 +7,70 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-
-try:
-    from tqdm import tqdm
-except ImportError:
-    def tqdm(iterable, total=None, desc=None):
-        total = total if total is not None else len(iterable)
-        for index, item in enumerate(iterable, start=1):
-            if index == 1 or index % 25 == 0 or index == total:
-                label = f"{desc}: " if desc else ""
-                print(f"{label}{index}/{total}")
-            yield item
+from tqdm import tqdm
 
 
 COMPRESSION_TYPE_COLOR = {-1: "unknown", 0: "raw", 1: "png", 2: "jpeg"}
 COMPRESSION_TYPE_DEPTH = {-1: "unknown", 0: "raw_ushort", 1: "zlib_ushort", 2: "occi_ushort"}
+
+
+def write_labels(output_file: Path, labels: np.ndarray) -> None:
+    with open(output_file, "w") as handle:
+        handle.write("\n".join(str(int(label)) for label in labels))
+
+
+def read_ply_vertex_labels(mesh_path: Path) -> np.ndarray:
+    scalar_types = {
+        "char": "i1",
+        "uchar": "u1",
+        "int8": "i1",
+        "uint8": "u1",
+        "short": "<i2",
+        "ushort": "<u2",
+        "int16": "<i2",
+        "uint16": "<u2",
+        "int": "<i4",
+        "uint": "<u4",
+        "int32": "<i4",
+        "uint32": "<u4",
+        "float": "<f4",
+        "float32": "<f4",
+        "double": "<f8",
+        "float64": "<f8",
+    }
+
+    with open(mesh_path, "rb") as handle:
+        if handle.readline().decode("ascii").strip() != "ply":
+            raise ValueError(f"Invalid PLY file: {mesh_path}")
+
+        vertex_count = None
+        vertex_dtype = []
+        in_vertex = False
+
+        while True:
+            line = handle.readline().decode("ascii").strip()
+            if line.startswith("format ") and "binary_little_endian" not in line:
+                raise ValueError(f"Unsupported PLY format in {mesh_path}: {line}")
+            if line.startswith("element vertex "):
+                vertex_count = int(line.split()[-1])
+                in_vertex = True
+            elif line.startswith("element ") and not line.startswith("element vertex "):
+                in_vertex = False
+            elif in_vertex and line.startswith("property "):
+                parts = line.split()
+                if parts[1] == "list":
+                    raise ValueError(f"Unsupported list property in vertex block: {line}")
+                vertex_dtype.append((parts[2], scalar_types[parts[1]]))
+            elif line == "end_header":
+                break
+
+        if vertex_count is None:
+            raise ValueError(f"Missing vertex block in {mesh_path}")
+
+        vertices = np.fromfile(handle, dtype=np.dtype(vertex_dtype), count=vertex_count)
+    if "label" not in vertices.dtype.names:
+        raise ValueError(f"PLY does not contain vertex labels: {mesh_path}")
+    return np.asarray(vertices["label"])
 
 
 class RGBDFrame:
@@ -153,12 +203,30 @@ def decode_scene(scene_dir: Path, output_scene_dir: Path, frame_skip: int, min_f
     ensure_free_space(output_scene_dir, min_free_gb)
 
 
+def write_semantic_gt(scans_root: Path, output_root: Path, scene_name: str, link_pcds: bool) -> None:
+    mesh_path = scans_root / scene_name / f"{scene_name}_vh_clean_2.labels.ply"
+    if not mesh_path.exists():
+        raise FileNotFoundError(f"Missing labeled mesh: {mesh_path}")
+
+    semantic_gt_dir = output_root / "semantic_gt"
+    semantic_gt_dir.mkdir(parents=True, exist_ok=True)
+    write_labels(semantic_gt_dir / f"{scene_name}.txt", read_ply_vertex_labels(mesh_path))
+
+    if link_pcds:
+        link_path = output_root / scene_name / f"{scene_name}_vh_clean_2.labels.ply"
+        if link_path.exists() or link_path.is_symlink():
+            link_path.unlink()
+        os.symlink(mesh_path.resolve(), link_path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Decode ScanNet .sens files into OVO-ready RGB-D folders.")
     parser.add_argument("--scans_root", required=True, type=Path, help="Directory containing ScanNet scene folders.")
     parser.add_argument("--output_root", required=True, type=Path, help="Directory to write decoded scene folders into.")
     parser.add_argument("--scenes", nargs="*", default=None, help="Optional scene names to decode. Defaults to all scenes under scans_root.")
     parser.add_argument("--frame_skip", type=int, default=1, help="Export every Nth frame.")
+    parser.add_argument("--link_pcds", action="store_true", help="Link each ground-truth mesh into the decoded scene folder.")
+    parser.add_argument("--write_semantic_gt", action="store_true", help="Write semantic_gt/<scene>.txt from each labeled ScanNet mesh.")
     parser.add_argument(
         "--min_free_gb",
         type=float,
@@ -179,6 +247,8 @@ def main() -> None:
         if not scene_dir.exists():
             raise FileNotFoundError(f"Scene directory not found: {scene_dir}")
         decode_scene(scene_dir, args.output_root / scene_dir.name, args.frame_skip, args.min_free_gb)
+        if args.write_semantic_gt or args.link_pcds:
+            write_semantic_gt(args.scans_root, args.output_root, scene_dir.name, args.link_pcds)
 
 
 if __name__ == "__main__":
