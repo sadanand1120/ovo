@@ -5,31 +5,34 @@
 <a href="https://scholar.google.com/citations?user=j_sMzokAAAAJ&hl=en">Javier Civera</a>
 
 <div align="left">
-    <a href='https://arxiv.org/abs/2411.15043'><img src='https://img.shields.io/badge/arXiv-2404.06836-b31b1b.svg'></a> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-    <a href='https://tberriel.github.io/ovo/'><img src='https://img.shields.io/badge/Web-Page-green'></a> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://arxiv.org/abs/2411.15043"><img src="https://img.shields.io/badge/arXiv-2404.06836-b31b1b.svg"></a>
+  <a href="https://tberriel.github.io/ovo/"><img src="https://img.shields.io/badge/Web-Page-green"></a>
 </div>
 
-This repo is now intentionally trimmed to the validated reproduction path:
+This fork is trimmed to the validated reproduction path:
 
-- `Replica` and `ScanNet` dataset support only
-- `vanilla` backend for the paper-style GT-pose row
-- `orbslam` backend via ORB-SLAM3
-- paper-style semantic defaults in [configs/ovo.yaml](/home/dynamo/AMRL_Research/repos/ovo/configs/ovo.yaml)
+- datasets: `Replica`, `ScanNet`
+- backends: `vanilla`, `orbslam` (ORB-SLAM3)
+- semantic stack: paper-style `SAM2.1 + SigLIP + learned fusion`
 
-Gaussian-SLAM and the newer TextRegion / Perception Encoder path have been removed.
+Gaussian-SLAM and the newer TextRegion / Perception Encoder path are intentionally removed.
 
-## Install
+## Layout
 
-These are the exact environment steps that worked on this machine.
+- [ovo](/home/dynamo/AMRL_Research/repos/ovo/ovo): flat first-party package
+- [configs](/home/dynamo/AMRL_Research/repos/ovo/configs): base config plus dataset metadata
+- [data/input](/home/dynamo/AMRL_Research/repos/ovo/data/input): datasets and checkpoints
+- [data/output](/home/dynamo/AMRL_Research/repos/ovo/data/output): run outputs
+- [thirdParty](/home/dynamo/AMRL_Research/repos/ovo/thirdParty): external dependencies
 
-Clone with submodules:
+Main entry points:
 
-```bash
-git clone git@github.com:tberriel/OVO.git --recursive
-cd OVO
-```
+- [run_eval.py](/home/dynamo/AMRL_Research/repos/ovo/run_eval.py)
+- [visualize_scene.py](/home/dynamo/AMRL_Research/repos/ovo/visualize_scene.py)
+- [scannet_decode_sens.py](/home/dynamo/AMRL_Research/repos/ovo/scannet_decode_sens.py)
+- [download_ckpts.sh](/home/dynamo/AMRL_Research/repos/ovo/download_ckpts.sh)
 
-Create the environment:
+## Environment
 
 ```bash
 source /home/dynamo/anaconda3/etc/profile.d/conda.sh
@@ -70,7 +73,7 @@ Expected:
 - `torch.version.cuda == 12.8`
 - `torch.cuda.is_available() == True`
 
-If `torch.cuda.is_available()` is `False`, check the driver before touching repo code:
+If CUDA is down, check the driver before touching repo code:
 
 ```bash
 python - <<'PY'
@@ -83,34 +86,34 @@ print(cuInit(0))
 PY
 ```
 
-Expected output is `0`. If it returns `999` and `dmesg` shows `Xid 31` followed by `Node Reboot Required`, the driver is in a bad state and the machine must be rebooted before any CUDA-backed smoke run will work.
+If that returns `999`, reboot the machine.
 
 ## Checkpoints
-
-Download the manual checkpoints:
 
 ```bash
 ./download_ckpts.sh
 ```
 
-This places:
+This downloads:
 
 - `data/input/sam_ckpts/sam2.1_hiera_large.pt`
 - `data/input/weights_predictor/model.pt`
 
-`hparams.yaml` for the weights predictor is already tracked. Hugging Face assets used by `open_clip` download into the default global Hugging Face cache on first use.
+Tracked in git:
+
+- `data/input/weights_predictor/hparams.yaml`
+
+`open_clip` uses the default global Hugging Face cache on first use.
 
 ## ORB-SLAM3
 
-ORB-SLAM3 is included as a submodule:
+Initialize submodules:
 
 ```bash
 git submodule update --init --recursive
 ```
 
-Runtime settings are generated automatically from the decoded scene intrinsics, so there are no committed per-scene ORB YAML files left in this repo.
-
-### Build dependencies
+Install build deps:
 
 ```bash
 source /home/dynamo/anaconda3/etc/profile.d/conda.sh
@@ -122,17 +125,12 @@ conda install libegl libegl-devel libgl libgl-devel libgles libgles-devel \
 conda install glew eigen=3.4 pangolin-opengl=0.9.2 libopencv=4.11 numpy=2.4 boost -c conda-forge
 ```
 
-### Boost.Python 3.11
-
-The missing piece on this machine was `boost_python311`. Building Boost locally into the env fixed it:
+On this machine, ORB-SLAM3 also needed local Boost Python 3.11:
 
 ```bash
 cd thirdParty
 wget -c https://archives.boost.io/release/1.86.0/source/boost_1_86_0.tar.gz
 tar -xf boost_1_86_0.tar.gz
-
-source /home/dynamo/anaconda3/etc/profile.d/conda.sh
-conda activate ovo
 
 cd boost_1_86_0
 ./bootstrap.sh \
@@ -146,20 +144,7 @@ cd boost_1_86_0
 cd ../..
 ```
 
-On this machine, `b2` may end with a `boost_numpy311` failure even though the two libraries ORB-SLAM3 actually needs were installed correctly. If both files below exist, continue:
-
-```bash
-ls /home/dynamo/anaconda3/envs/ovo/lib/libboost_python311.so.1.86.0
-ls /home/dynamo/anaconda3/envs/ovo/lib/libboost_serialization.so.1.86.0
-```
-
-### Build ORB-SLAM3
-
-This machine used an existing Pangolin build at:
-
-- `/home/dynamo/AMRL_Research/competitions/RSS2023_SafeAutonomy/repos/Pangolin/build`
-
-Build command:
+Build ORB-SLAM3:
 
 ```bash
 source /home/dynamo/anaconda3/etc/profile.d/conda.sh
@@ -178,11 +163,9 @@ bash build.sh
 cd ../..
 ```
 
-### Pangolin linker hook
+This env also needed two local fixes.
 
-`orbslam3` did not import cleanly until Pangolin was added to `LD_LIBRARY_PATH` on env activation.
-
-Create the hooks:
+Pangolin activation hook:
 
 ```bash
 mkdir -p /home/dynamo/anaconda3/envs/ovo/etc/conda/activate.d
@@ -208,9 +191,7 @@ if [ -n "${OVO_ORBSLAM_PANGOLIN_DIR:-}" ]; then
 fi
 ```
 
-### `libffi` fix
-
-After fixing Pangolin, `orbslam3` still failed on this machine until `libffi.so.7` inside the env was pointed at the system copy:
+`libffi` fix:
 
 ```bash
 cd /home/dynamo/anaconda3/envs/ovo/lib
@@ -218,20 +199,16 @@ mv -f libffi.so.7 libffi.so.7.conda-backup
 ln -sfn /lib/x86_64-linux-gnu/libffi.so.7.1.0 libffi.so.7
 ```
 
-Import sanity check:
+Import check:
 
 ```bash
-source /home/dynamo/anaconda3/etc/profile.d/conda.sh
-conda activate ovo
 python - <<'PY'
 import orbslam3
 print(orbslam3.__file__)
 PY
 ```
 
-## Stable runtime environment
-
-These env vars were the stable runtime setup used here:
+## Runtime env
 
 ```bash
 source /home/dynamo/anaconda3/etc/profile.d/conda.sh
@@ -242,16 +219,16 @@ export DISABLE_WANDB=true
 export CUDA_LAUNCH_BLOCKING=1
 ```
 
-`CUDA_LAUNCH_BLOCKING=1` mattered on this machine. Without it, SAM2 occasionally hit CUDA illegal-instruction / accelerator errors.
+`CUDA_LAUNCH_BLOCKING=1` mattered on this machine.
 
 ## Data
 
 ### Replica
 
-OVO expects the NICE-SLAM processed Replica trajectories plus semantic GT:
+Expected layout:
 
 ```text
-/<ovo_path>/data/input/Replica/
+data/input/Replica/
   semantic_gt/
   office0/
     results/
@@ -260,10 +237,10 @@ OVO expects the NICE-SLAM processed Replica trajectories plus semantic GT:
   ...
 ```
 
-Download and link:
+Minimal setup:
 
 ```bash
-cd /<ovo_path>/data/input
+cd data/input
 wget https://cvg-data.inf.ethz.ch/nice-slam/data/Replica.zip
 unzip Replica.zip
 rm Replica.zip
@@ -271,10 +248,10 @@ rm Replica.zip
 
 ### ScanNet
 
-OVO does not run directly from `.sens`. It expects decoded per-frame folders:
+OVO does not read `.sens` directly. Decode to:
 
 ```text
-/<ovo_path>/data/input/ScanNet/
+data/input/ScanNet/
   semantic_gt/
   scene0011_00/
     color/
@@ -282,44 +259,31 @@ OVO does not run directly from `.sens`. It expects decoded per-frame folders:
     pose/
     intrinsic/
     scene0011_00_vh_clean_2.labels.ply
-  ...
 ```
 
-Starting from a ScanNet root like:
-
-```text
-/<ScanNet_data_path>/
-  scans/
-  data/val/
-```
-
-Decode, generate `semantic_gt`, and link meshes with one command:
+Decode from raw ScanNet:
 
 ```bash
-cd /<ovo_path>
-conda activate ovo
 python scannet_decode_sens.py \
-  --scans_root /<ScanNet_data_path>/scans \
-  --output_root /<ovo_path>/data/input/ScanNet \
+  --scans_root /path/to/scannet/scans \
+  --output_root data/input/ScanNet \
   --write_semantic_gt --link_pcds
 ```
 
-### Repo-local ScanNet decode helper
-
-If you want to decode raw `.sens` scenes into this repo without touching the source dataset:
+For selected scenes only:
 
 ```bash
 python scannet_decode_sens.py \
-  --scans_root /home/dynamo/AMRL_Research/dataset/scannet_v2/scans \
-  --output_root /home/dynamo/AMRL_Research/repos/ovo/data/input/ScanNet \
-  --scenes scene0000_00 scene0002_00 \
+  --scans_root /path/to/scannet/scans \
+  --output_root data/input/ScanNet \
+  --scenes scene0011_00 scene0518_00 \
   --write_semantic_gt --link_pcds \
-  --min_free_gb 100
+  --min_free_gb 60
 ```
 
-## Defaults and reproduction
+## Defaults
 
-The repo defaults now match the validated reproduction path. The important semantic settings are already the defaults in [configs/ovo.yaml](/home/dynamo/AMRL_Research/repos/ovo/configs/ovo.yaml):
+The validated defaults are already in [configs/ovo.yaml](/home/dynamo/AMRL_Research/repos/ovo/configs/ovo.yaml):
 
 - `slam_module: vanilla`
 - `embed_type: learned`
@@ -330,51 +294,65 @@ The repo defaults now match the validated reproduction path. The important seman
 - `sam_version: 2.1`
 - `sam_encoder: hiera_l`
 
-Backend notes:
+Dataset metadata:
 
-- `vanilla` is the correct backend for the paper’s GT-pose `OVO-mapping` row.
-- `orbslam` here uses ORB-SLAM3 and reaches the same ballpark as the paper’s ORB-SLAM2 row.
+- [configs/replica.yaml](/home/dynamo/AMRL_Research/repos/ovo/configs/replica.yaml)
+- [configs/scannet.yaml](/home/dynamo/AMRL_Research/repos/ovo/configs/scannet.yaml)
+- [configs/replica_eval.yaml](/home/dynamo/AMRL_Research/repos/ovo/configs/replica_eval.yaml)
+- [configs/scannet_eval.yaml](/home/dynamo/AMRL_Research/repos/ovo/configs/scannet_eval.yaml)
 
-The paper HVS subset is:
+## Run
+
+Single-scene examples:
+
+```bash
+python run_eval.py --dataset_name Replica --experiment_name dev_run \
+  --run --segment --eval --scenes office0
+```
+
+```bash
+python run_eval.py --dataset_name ScanNet --experiment_name dev_run \
+  --run --segment --eval --scenes scene0011_00 --slam_module vanilla
+```
+
+```bash
+python run_eval.py --dataset_name ScanNet --experiment_name dev_run \
+  --run --segment --eval --scenes scene0011_00 --slam_module orbslam
+```
+
+Useful flags:
+
+- `--dataset_info_file`: defaults to `eval.yaml`
+- `--scenes_list`: text file with one scene per line
+- `--frame_limit`: short smoke runs
+- `--config_path`: override base config
+
+## Visualize
+
+```bash
+python visualize_scene.py data/output/ScanNet/dev_run/scene0011_00 \
+  --working_dir . --visualize_obj
+```
+
+```bash
+python visualize_scene.py data/output/ScanNet/dev_run/scene0011_00 \
+  --working_dir . --visualize_semantic_pred
+```
+
+```bash
+python visualize_scene.py data/output/ScanNet/dev_run/scene0011_00 \
+  --working_dir . --visualize_interactive_query
+```
+
+## Reproduce the ScanNet HVS subset
+
+Scenes:
 
 - `scene0011_00`
 - `scene0050_00`
 - `scene0231_00`
 - `scene0378_00`
 - `scene0518_00`
-
-Those scenes are already listed in [configs/scannet_eval.yaml](/home/dynamo/AMRL_Research/repos/ovo/configs/scannet_eval.yaml).
-
-## Run OVO
-
-Use `run_eval.py` for mapping, segmentation, and evaluation.
-
-Key flags:
-
-- `--dataset_name`: `Replica` or `ScanNet`
-- `--experiment_name`: output folder name under `data/output/<dataset_name>/`
-- `--run`: run mapping
-- `--segment`: project labels onto the GT point cloud
-- `--eval`: compute final metrics
-- `--dataset_info_file`: defaults to `eval.yaml`
-- `--scenes`: explicit scene list
-- `--scenes_list`: text file containing one scene per line
-- `--slam_module`: override backend, e.g. `vanilla` or `orbslam`
-- `--config_path`: override the base config, defaults to `configs/ovo.yaml`
-
-Examples:
-
-```bash
-python run_eval.py --dataset_name Replica --experiment_name ovo_mapping \
-  --run --segment --eval --scenes office0
-```
-
-```bash
-python run_eval.py --dataset_name ScanNet --experiment_name ovo_mapping \
-  --run --segment --eval --scenes scene0011_00
-```
-
-### Reproduce the 5-scene HVS subset
 
 Vanilla:
 
@@ -398,60 +376,13 @@ python run_eval.py \
   --slam_module orbslam
 ```
 
-## Validated HVS results
+## Reference results
 
-These are the validated 5-scene ScanNet HVS numbers from this repo.
+Validated reproduction numbers are in [validation_results.md](/home/dynamo/AMRL_Research/repos/ovo/validation_results.md).
 
-### Vanilla
+Summary:
 
-Paper `OVO-mapping`:
+- `vanilla`: `35.0 / 46.9 / 56.0 / 71.1`
+- `orbslam3`: `29.8 / 40.9 / 49.5 / 64.3`
 
-| mIoU | mAcc | f-mIoU | f-mAcc |
-| --- | --- | --- | --- |
-| 38.1 | 50.5 | 57.6 | 70.5 |
-
-Reproduced `vanilla`:
-
-| mIoU | mAcc | f-mIoU | f-mAcc |
-| --- | --- | --- | --- |
-| 35.00 | 46.90 | 56.00 | 71.10 |
-
-### ORB
-
-Paper `OVO-ORB-SLAM2`:
-
-| mIoU | mAcc | f-mIoU | f-mAcc |
-| --- | --- | --- | --- |
-| 31.3 | 45.2 | 45.8 | 61.2 |
-
-Reproduced `orbslam3`:
-
-| mIoU | mAcc | f-mIoU | f-mAcc |
-| --- | --- | --- | --- |
-| 29.80 | 40.90 | 49.50 | 64.30 |
-
-## Known pitfalls
-
-These were the actual setup failures that had to be solved here:
-
-1. ORB-SLAM3 did not build out of the box because Python 3.11 Boost bindings were missing.
-2. `orbslam3` imported only after adding Pangolin to `LD_LIBRARY_PATH`.
-3. Even then, `libffi` in the conda env broke GTK / Pangolin transitively; the env’s `libffi.so.7` symlink had to be replaced with the system `libffi.so.7.1.0`.
-4. SAM2 was unstable on this stack unless flash attention stayed disabled in the repo and `CUDA_LAUNCH_BLOCKING=1` was used.
-
-## Changelog
-
-- 11 January 2026: update environment to Python 3.11 and NumPy 2.4
-- 7 October 2025: switch from ORB-SLAM2 to ORB-SLAM3
-- 10 June 2025: improve ORB-SLAM2 integration and add loop closure support
-
-## Citation
-
-```bibtex
-@article{martins2024ovo,
-  title={Open-Vocabulary Online Semantic Mapping for SLAM},
-  author={Martins, Tomas Berriel and Oswald, Martin R. and Civera, Javier},
-  journal={IEEE Robotics and Automation Letters},
-  year={2025},
-}
-```
+`vanilla` is deterministic here. `orbslam` is functional but not bit-stable run to run.

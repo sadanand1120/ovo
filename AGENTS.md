@@ -1,32 +1,30 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `run_eval.py` is the main entry point for mapping and metrics. `visualize_scene.py` inspects outputs. `scannet_decode_sens.py` prepares ScanNet RGB-D folders plus semantic labels.
-- The trimmed repo targets `Replica` and `ScanNet` only.
-- `ovo/` is flat on purpose: `ovomapping.py` orchestrates runs, `ovo.py` manages 3D instances and text queries, `clip_generator.py` / `mask_generator.py` wrap descriptor and mask extraction, `vanilla_mapper.py` and `orbslam.py` provide the geometry backends, and the remaining modules are focused helpers.
-- `configs/` contains the base config plus dataset metadata.
-- Inputs and checkpoints live in `data/input/`; generated runs belong in `data/output/`. `thirdParty/` is for external dependencies.
+- `run_eval.py` is the main entry point for mapping, projection, and metrics. `visualize_scene.py` inspects saved runs. `scannet_decode_sens.py` prepares ScanNet RGB-D folders and `semantic_gt`.
+- `ovo/` is intentionally flat. `ovomapping.py` orchestrates runs, `ovo.py` manages 3D instances, `clip_generator.py` / `mask_generator.py` wrap the semantic backbones, `vanilla_mapper.py` and `orbslam.py` provide the geometry backends, and the remaining modules are focused helpers.
+- `configs/` holds the runtime config and dataset metadata: `ovo.yaml`, `replica.yaml`, `scannet.yaml`, `replica_eval.yaml`, and `scannet_eval.yaml`.
+- `data/input/` holds datasets and checkpoints. `data/output/` holds generated runs. `thirdParty/` is reserved for external dependencies.
 
 ## Build, Test, and Development Commands
-- `git submodule update --init --recursive` fetches required third-party code.
-- Follow `README.md` to create the `ovo` Conda environment and install editable dependencies. ORB-SLAM3 is expected under `thirdParty/ORB_SLAM3` when used.
-- `python scannet_decode_sens.py --scans_root /path/to/ScanNet/scans --output_root data/input/ScanNet --write_semantic_gt --link_pcds` prepares ScanNet labels and links meshes.
-- `python run_eval.py --dataset_name Replica --experiment_name dev_run --run --segment --eval --scenes office0` runs the full local pipeline on one scene.
-- `python visualize_scene.py data/output/Replica/dev_run/office0 --visualize_obj` inspects saved outputs.
-- Set `DISABLE_WANDB=true` to disable WandB during local debugging.
+- `git submodule update --init --recursive` fetches `ORB_SLAM3` and `segment-anything-2`.
+- Follow `README.md` to create the `ovo` conda env, install Python deps, run `./download_ckpts.sh`, and build `thirdParty/ORB_SLAM3`.
+- `python scannet_decode_sens.py --scans_root /path/to/ScanNet/scans --output_root data/input/ScanNet --write_semantic_gt --link_pcds` prepares ScanNet data in the format OVO expects.
+- `python run_eval.py --dataset_name ScanNet --experiment_name dev_run --run --segment --eval --scenes scene0011_00 --slam_module vanilla` is the smallest full validation path.
+- `python visualize_scene.py data/output/ScanNet/dev_run/scene0011_00 --working_dir . --visualize_semantic_pred` is the quickest semantic viewer sanity check.
 
 ## Coding Style & Naming Conventions
-- Use 4-space indentation, type hints on public functions, and short docstrings where behavior is not obvious.
-- Follow existing Python naming: `snake_case` for functions, variables, and YAML keys; `PascalCase` for classes.
-- Keep changes focused and readable. Match nearby NumPy, Torch, YAML-merging, and path-handling patterns instead of introducing new abstractions.
-- There is no committed formatter config; do not submit broad reformatting changes.
+- Use 4-space indentation, `snake_case` for functions and config keys, and `PascalCase` for classes.
+- Keep changes local and readable. Match nearby NumPy, Torch, and path-handling patterns instead of adding new abstraction layers.
+- Avoid broad reformatting. There is no committed formatter config.
 
 ## Testing Guidelines
-- There is no first-party unit test suite or CI config at the repository root; validation is command-driven.
-- Before opening a PR, run the smallest scene or script that exercises your change. Use a single scene through `run_eval.py`; rerun `visualize_scene.py` for viewer changes.
-- If you touch config loading, dataset preparation, or output writing, confirm the expected files appear under `data/output/<Dataset>/<experiment>/` and that `config.yaml` plus `ovo_map.ckpt` are written.
+- There is no first-party unit test suite; validation is command-driven.
+- For backend or mapping changes, run at least one small `run_eval.py` scene. For viewer changes, rerun `visualize_scene.py`.
+- If you touch config loading, dataset prep, or output writing, confirm `config.yaml` and `ovo_map.ckpt` appear under `data/output/<Dataset>/<experiment>/<scene>/`.
+- `vanilla` is deterministic here and is the best regression check. `orbslam` is functional but not bit-stable run to run.
 
 ## Commit & Pull Request Guidelines
-- Recent commits use short, capitalized summaries such as `Update configs`. Keep subjects brief and action-oriented.
-- PRs should state the affected dataset or backend, list any config changes, include exact verification commands, and report metric deltas or screenshots when outputs change.
-- Keep each PR scoped to one logical change. Do not include generated data, weights, or experiment outputs in commits.
+- Recent commits use short, action-oriented subjects such as `Flatten config layout`.
+- Keep PRs scoped to one logical change. List the affected dataset/backend, exact verification commands, and any metric deltas.
+- Do not commit generated outputs, decoded ScanNet frames, checkpoints, or other large artifacts.
