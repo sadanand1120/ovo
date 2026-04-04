@@ -7,8 +7,9 @@ data:
 seed: 0
 slam:
   slam_module: vanilla
+  fps: 30.0
   use_viewer: False
-  close_loops: True
+  close_loops: False
   save_estimated_cam: True
 vis:
   stream: False

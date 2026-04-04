@@ -83,6 +83,9 @@ class VanillaMapper():
         self.pcd_obj_ids = torch.vstack((self.pcd_obj_ids, torch.ones((points.shape[0],1), device=self.device, dtype=torch.int32)*-1))
         self.pcd_colors = torch.vstack((self.pcd_colors, torch.from_numpy(image.astype(np.uint8)).to(self.device)[mask].reshape(-1,3)))
         self.max_id += points.shape[0]
+
+    def should_map_frame(self, frame_id: int, c2w: torch.Tensor) -> bool:
+        return frame_id % int(self.config["mapping"].get("map_every", 10)) == 0
             
     def get_c2w(self, frame_id: int) -> torch.Tensor:
         c2w = self.estimated_c2ws.get(frame_id, None)

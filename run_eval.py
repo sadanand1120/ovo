@@ -2,6 +2,7 @@ from typing import Dict
 from datetime import datetime
 from pathlib import Path
 import argparse
+import cv2  # Keep OpenCV loaded before torch in the container env.
 import wandb
 import torch
 import numpy as np
@@ -38,7 +39,7 @@ def load_dataset_info(dataset_name: str, dataset_info_file: str) -> tuple[str, D
 
 def load_representation(scene_path: Path, eval: bool=False, debug_info: bool=False) -> OVO:
     config = io_utils.load_config(scene_path / "config.yaml", inherit=False)
-    submap_ckpt = torch.load(scene_path /"ovo_map.ckpt" )
+    submap_ckpt = torch.load(scene_path /"ovo_map.ckpt", weights_only=False)
     map_params = submap_ckpt["map_params"]
     config["semantic"]["verbose"] = False 
     ovo = OVO(config["semantic"],None, config["data"]["scene_name"], eval=eval, device=config.get("device", "cuda"))
@@ -88,10 +89,19 @@ def setup_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def build_scene_config(scene: str, dataset: str, config_path: str, slam_module: str = None, frame_limit: int = None) -> Dict:
+def build_scene_config(
+    scene: str,
+    dataset: str,
+    config_path: str,
+    slam_module: str = None,
+    frame_limit: int = None,
+    disable_loop_closure: bool = False,
+) -> Dict:
     config = io_utils.load_config(config_path)
     if slam_module is not None:
         config["slam"]["slam_module"] = slam_module
+    if disable_loop_closure:
+        config["slam"]["close_loops"] = False
 
     dataset_dir = canonical_dataset_name(dataset)
     config_dataset = io_utils.load_config(CONFIG_DIR / f"{dataset.lower()}.yaml")
@@ -105,9 +115,25 @@ def build_scene_config(scene: str, dataset: str, config_path: str, slam_module: 
     return config
 
 
-def run_scene(scene: str, dataset: str, experiment_name: str, tmp_run: bool = False, slam_module: str = None, frame_limit: int = None, config_path: str = "configs/ovo.yaml") -> None:
+def run_scene(
+    scene: str,
+    dataset: str,
+    experiment_name: str,
+    tmp_run: bool = False,
+    slam_module: str = None,
+    frame_limit: int = None,
+    config_path: str = "configs/ovo.yaml",
+    disable_loop_closure: bool = False,
+) -> None:
 
-    config = build_scene_config(scene, dataset, config_path, slam_module=slam_module, frame_limit=frame_limit)
+    config = build_scene_config(
+        scene,
+        dataset,
+        config_path,
+        slam_module=slam_module,
+        frame_limit=frame_limit,
+        disable_loop_closure=disable_loop_closure,
+    )
 
     output_path = OUTPUT_DIR / canonical_dataset_name(dataset)
 
@@ -169,7 +195,16 @@ def main(args):
         input_path = INPUT_DIR / dataset_dir / scene
         if args.run:
             t0 = time.time()
-            run_scene(scene, args.dataset_name, experiment_name, tmp_run=tmp_run, slam_module=args.slam_module, frame_limit=args.frame_limit, config_path=args.config_path)
+            run_scene(
+                scene,
+                args.dataset_name,
+                experiment_name,
+                tmp_run=tmp_run,
+                slam_module=args.slam_module,
+                frame_limit=args.frame_limit,
+                config_path=args.config_path,
+                disable_loop_closure=args.disable_loop_closure,
+            )
             t1 = time.time()
             print(f"Scene {scene} took: {t1-t0:.2f}")
         gc.collect()
@@ -197,7 +232,8 @@ if __name__ == "__main__":
     parser.add_argument('--segment', action='store_true', help="If set, use the reconstructed scene to segment the gt point-cloud, after running OVO.")
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--ignore_background', action='store_true',help="If set, does not use background ids from eval_info to compute metrics.")
-    parser.add_argument('--slam_module', type=str, default=None, help="Override slam backend, e.g. vanilla or orbslam.")
+    parser.add_argument('--slam_module', type=str, default=None, help="Override slam backend, e.g. vanilla, orbslam, or cuvslam.")
+    parser.add_argument('--disable_loop_closure', action='store_true', help="Disable ORB-SLAM loop closure/global BA updates by forcing slam.close_loops=false.")
     parser.add_argument('--frame_limit', type=int, default=None, help="Override number of input frames to process.")
     parser.add_argument('--config_path', type=str, default="configs/ovo.yaml", help="Base OVO config file to load.")
     args = parser.parse_args()

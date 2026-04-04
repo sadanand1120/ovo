@@ -1,0 +1,228 @@
+flowchart TD
+
+    %% =========================
+    %% MAIN PER-FRAME LOOP
+    %% =========================
+    subgraph MAIN["Per-frame pipeline"]
+        M0["Start frame_id"]
+        M1{"Run this frame?<br/>track_every == 1<br/>or frame % track_every == 0<br/>or frame % map_every == 0<br/>or frame % segment_every == 0"}
+        M2["Next frame"]
+        M3["Load frame_data from dataset"]
+        M4["slam_backbone.track_camera(frame_data)"]
+        M5["estimated_c2w = slam_backbone.get_c2w(frame_id)"]
+        M6{"estimated_c2w exists<br/>and depth has valid pixels?"}
+        M7{"slam_module?"}
+        M8{"frame % segment_every == 0?"}
+        M9["Build scene_data<br/>frame_id + semantic RGB + depth + resize metadata"]
+        M10["map_data = slam_backbone.get_map()"]
+        M11["updated_points_ins_ids =<br/>OVO.detect_and_track_objects(scene_data, map_data, estimated_c2w)"]
+        M12{"updated_points_ins_ids returned?"}
+        M13["slam_backbone.update_pcd_obj_ids(updated_points_ins_ids)"]
+        M14["Skip point-id update"]
+        M15["OVO.compute_semantic_info()"]
+        M16["Logger memory stats"]
+    end
+
+    M0 --> M1
+    M1 -- No --> M2
+    M1 -- Yes --> M3
+    M3 --> M4
+    M4 --> M5
+    M5 --> M6
+    M6 -- No --> M2
+    M6 -- Yes --> M7
+
+    %% =========================
+    %% VANILLA GEOMETRY BRANCH
+    %% =========================
+    subgraph VAN["Vanilla geometry branch"]
+        V0["track_camera:<br/>store dataset GT pose in estimated_c2ws[frame_id]"]
+        V1{"frame % map_every == 0?"}
+        V2["Return to main loop"]
+        V3["Unproject depth to 3D<br/>with c2w and camera intrinsics"]
+        V4{"Existing dense map already non-empty?"}
+        V5["Project existing 3D points into current frame<br/>remove depth pixels already matched to map"]
+        V6["Keep all valid depth pixels"]
+        V7["Apply pooling mask suppression"]
+        V8["Downscale depth/image grid if configured"]
+        V9["Append new XYZ points"]
+        V10["Append point ids"]
+        V11["Append obj ids = -1"]
+        V12["Append RGB colors"]
+    end
+
+    M7 -- vanilla --> V0
+    V0 --> V1
+    V1 -- No --> V2
+    V1 -- Yes --> V3
+    V3 --> V4
+    V4 -- Yes --> V5
+    V4 -- No --> V6
+    V5 --> V7
+    V6 --> V7
+    V7 --> V8
+    V8 --> V9
+    V9 --> V10
+    V10 --> V11
+    V11 --> V12
+
+    V2 --> M8
+    V12 --> M8
+
+    %% =========================
+    %% ORB-SLAM3 GEOMETRY BRANCH
+    %% =========================
+    subgraph ORB["ORB-SLAM3 geometry + loop-closure branch"]
+        O0["track_camera:<br/>orbslam.process_image_rgbd(rgb, depth, frame_id)"]
+        O1{"TrackingState == OK?"}
+        O2["No pose for this frame"]
+        O3["Read ORB last trajectory point"]
+        O4["Convert ORB pose to c2w<br/>and store estimated_c2ws[frame_id]"]
+        O5["map() is entered every selected frame"]
+        O6{"orbslam.is_last_frame_kf()?"}
+        O7["Run vanilla depth-unprojection insert<br/>for this keyframe"]
+        O8["Record keyframe -> dense point index span"]
+        O9["Skip dense insertion"]
+        O10{"Loop closure / global BA changed map?"}
+        O11["Read updated ORB keyframe poses"]
+        O12["For each surviving keyframe:<br/>re-transform its dense point chunk"]
+        O13["Rebuild dense map tensors<br/>and keyframe table"]
+        O14["map_updated = True"]
+        O15["OVO.update_map(map_data, kfs)"]
+        O16{"OVO returned updated point instance ids?"}
+        O17["slam_backbone.update_pcd_obj_ids(...)"]
+    end
+
+    M7 -- orbslam --> O0
+    O0 --> O1
+    O1 -- No --> O2
+    O1 -- Yes --> O3
+    O3 --> O4
+    O4 --> O5
+    O5 --> O6
+    O6 -- Yes --> O7
+    O7 --> O8
+    O8 --> O10
+    O6 -- No --> O9
+    O9 --> O10
+    O10 -- No --> M8
+    O10 -- Yes --> O11
+    O11 --> O12
+    O12 --> O13
+    O13 --> O14
+    O14 --> O15
+    O15 --> O16
+    O16 -- Yes --> O17
+    O16 -- No --> M8
+    O17 --> M8
+
+    %% =========================
+    %% OVO DETECT + TRACK OBJECTS
+    %% =========================
+    subgraph DET["OVO.detect_and_track_objects"]
+        D0["Get masks:<br/>load precomputed masks or run SAM2.1 + NMS"]
+        D1{"Any masks?"}
+        D2["Return None"]
+        D3["Compute camera frustum from depth + c2w"]
+        D4["Keep only dense-map points inside frustum"]
+        D5["Project frustum points into current depth image"]
+        D6["Match 3D points to 2D pixels by depth consistency"]
+        D7["Read segmentation id at each matched pixel"]
+        D8["For each 2D mask"]
+        D9{"matched points > track_th?"}
+        D10{"enough matched points already carry instance ids?"}
+        D11["Assign mask to dominant existing 3D instance"]
+        D12["Attach previously-unassigned matched points<br/>to that instance"]
+        D13{"enough unmatched points to create object?"}
+        D14["Create new Instance3D"]
+        D15["Assign its id to matched points"]
+        D16["Collect instance -> mask matches"]
+        D17["Fuse multiple 2D masks<br/>that map to same 3D instance"]
+        D18["Write updated point->instance ids back to dense map"]
+        D19["Enqueue keyframe job:<br/>matched_ins_ids + fused binary_maps + image + kf_id"]
+        D20{"queue length > kf_queue_delay?"}
+        D21["Pop oldest queued keyframe job"]
+        D22{"Any matched instances survive<br/>top-view filter?"}
+        D23["Extract SigLIP descriptors from mask crops"]
+        D24["Fuse descriptors:<br/>global + masked crop + bbox crop"]
+        D25["Store keyframe descriptors per instance"]
+        D26["Update each matched Instance3D descriptor"]
+    end
+
+    M8 -- No --> M2
+    M8 -- Yes --> M9
+    M9 --> M10
+    M10 --> M11
+
+    M11 --> D0
+    D0 --> D1
+    D1 -- No --> D2
+    D1 -- Yes --> D3
+    D3 --> D4
+    D4 --> D5
+    D5 --> D6
+    D6 --> D7
+    D7 --> D8
+    D8 --> D9
+    D9 -- No --> D8
+    D9 -- Yes --> D10
+    D10 -- Yes --> D11
+    D11 --> D12
+    D12 --> D16
+    D10 -- No --> D13
+    D13 -- No --> D8
+    D13 -- Yes --> D14
+    D14 --> D15
+    D15 --> D16
+    D16 --> D8
+    D8 --> D17
+    D17 --> D18
+    D18 --> D19
+    D19 --> D20
+    D20 -- No --> D2
+    D20 -- Yes --> D21
+    D21 --> D22
+    D22 -- No --> D2
+    D22 -- Yes --> D23
+    D23 --> D24
+    D24 --> D25
+    D25 --> D26
+    D26 --> D2
+
+    D2 --> M12
+    M12 -- Yes --> M13
+    M12 -- No --> M14
+    M13 --> M15
+    M14 --> M15
+    M15 --> M16
+    M16 --> M2
+
+    %% =========================
+    %% OVO UPDATE_MAP AFTER LOOP CLOSURE
+    %% =========================
+    subgraph UMAP["OVO.update_map after ORB loop closure"]
+        U0["Flush pending semantic queue"]
+        U1["Read current dense points<br/>and current point instance ids"]
+        U2["Remove deleted keyframes from semantic bookkeeping"]
+        U3["Drop semantic objects no longer supported<br/>by any dense-map point"]
+        U4["For each surviving object pair"]
+        U5{"same_instance?<br/>centroid distance<br/>descriptor cosine sim<br/>point cloud overlap"}
+        U6["Fuse object ids and rewrite point instance ids"]
+        U7["Rewrite per-keyframe descriptor ownership for fused ids"]
+        U8["Recompute fused object descriptors"]
+        U9["Return updated point instance ids to SLAM backbone"]
+    end
+
+    O15 -. internal logic .-> U0
+    U0 --> U1
+    U1 --> U2
+    U2 --> U3
+    U3 --> U4
+    U4 --> U5
+    U5 -- No --> U4
+    U5 -- Yes --> U6
+    U6 --> U4
+    U4 --> U7
+    U7 --> U8
+    U8 --> U9
+    U9 -. returns to .-> O16

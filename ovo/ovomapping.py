@@ -20,6 +20,9 @@ def get_slam_backbone(config: Dict[str, Any], dataset, cam_intrinsics: torch.Ten
     if backbone.startswith("orbslam"):
         from .orbslam import WrapperORBSLAM
         return WrapperORBSLAM(config, cam_intrinsics, world_ref=torch.from_numpy(dataset[0][3]))
+    if backbone == "cuvslam":
+        from .cuvslam import WrapperCuVSLAM
+        return WrapperCuVSLAM(config, cam_intrinsics, world_ref=torch.from_numpy(dataset[0][3]))
     if backbone == "vanilla":
         return VanillaMapper(config, cam_intrinsics)
     raise ValueError(f"Unsupported SLAM backend: {backbone}")
@@ -142,7 +145,7 @@ class OVOSemMap():
                     if estimated_c2w is None or missing_depth :
                         continue
                     t_lc = 0
-                    if frame_id % self.map_every == 0 or self.config["slam"]["slam_module"].startswith("orbslam"):
+                    if self.slam_backbone.should_map_frame(frame_id, estimated_c2w):
                         self.slam_backbone.map(frame_data, estimated_c2w)
                         if self.slam_backbone.map_updated:
                             torch.cuda.synchronize()

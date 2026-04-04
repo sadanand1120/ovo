@@ -132,6 +132,9 @@ class WrapperORBSLAM(VanillaMapper):
         else:
             print(f"Tracking state: {tracking_state}!")
         return 
+
+    def should_map_frame(self, frame_id: int, c2w: torch.Tensor) -> bool:
+        return True
     
     def map(self, frame_data, c2w) -> None:
         # check if frame is a KeyFrame
