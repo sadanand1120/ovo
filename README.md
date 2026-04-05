@@ -248,18 +248,103 @@ Each successful run should produce:
 
 ## Reproduction
 
-Single-scene paper-style run:
+Single-scene end-to-end run:
 
 ```bash
 python run_eval.py --dataset_name ScanNet --experiment_name dev_run \
   --run --segment --eval --scenes scene0011_00 --slam_module vanilla
 ```
 
-Viewer:
+Run only the mapping stage:
+
+```bash
+python run_eval.py --dataset_name ScanNet --experiment_name dev_run \
+  --run --scenes scene0011_00 --slam_module vanilla
+```
+
+Segment and evaluate an existing run:
+
+```bash
+python run_eval.py --dataset_name ScanNet --experiment_name dev_run \
+  --segment --eval --scenes scene0011_00 --slam_module vanilla
+```
+
+Switch backends by changing only `--slam_module`:
+
+```bash
+python run_eval.py --dataset_name ScanNet --experiment_name dev_run_orb \
+  --run --segment --eval --scenes scene0011_00 --slam_module orbslam
+
+python run_eval.py --dataset_name ScanNet --experiment_name dev_run_cuv \
+  --run --segment --eval --scenes scene0011_00 --slam_module cuvslam
+```
+
+Full 5-scene HVS sweep:
+
+```bash
+python run_eval.py --dataset_name ScanNet --experiment_name scannet_hvs \
+  --run --segment --eval \
+  --scenes scene0011_00 scene0050_00 scene0231_00 scene0378_00 scene0518_00 \
+  --slam_module vanilla
+```
+
+## Metrics
+
+Each run writes scene outputs under:
+
+```text
+data/output/<Dataset>/<experiment>/<scene>/
+```
+
+Useful files:
+
+- `config.yaml`: resolved config used for that scene
+- `estimated_c2w.npy`: predicted trajectory
+- `ovo_map.ckpt`: saved semantic map
+- `logger/avg_fps.log`: end-to-end scene FPS
+
+Evaluation outputs are written under:
+
+```text
+data/output/<Dataset>/<experiment>/scannetv2/
+```
+
+To inspect final metrics for a run:
+
+```bash
+cat data/output/ScanNet/dev_run/scannetv2/statistics.txt
+```
+
+To inspect just the scene FPS logs:
+
+```bash
+for s in scene0011_00 scene0050_00 scene0231_00 scene0378_00 scene0518_00; do
+  echo "== $s =="
+  cat data/output/ScanNet/scannet_hvs/$s/logger/avg_fps.log
+done
+```
+
+## Visualization
+
+Semantic prediction view:
 
 ```bash
 python visualize_scene.py data/output/ScanNet/dev_run/scene0011_00 \
   --working_dir . --visualize_semantic_pred
+```
+
+Instance view:
+
+```bash
+python visualize_scene.py data/output/ScanNet/dev_run/scene0011_00 \
+  --working_dir . --visualize_obj
+```
+
+GT-vs-prediction view:
+
+```bash
+python visualize_scene.py data/output/ScanNet/dev_run/scene0011_00 \
+  --working_dir . --visualize_gt_vs_pre
 ```
 
 Validated 5-scene HVS reproduction numbers are recorded in `validation_results.md`.
