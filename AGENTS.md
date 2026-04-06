@@ -20,6 +20,7 @@
 - For backend or mapping changes, run at least one small `run_eval.py` scene using the exact command patterns in `README.md`. For viewer changes, rerun `visualize_scene.py`.
 - If you touch config loading, dataset prep, or output writing, confirm `config.yaml` and `ovo_map.ckpt` appear under `data/output/<Dataset>/<experiment>/<scene>/`.
 - `vanilla` is deterministic here and is the best regression check. `orbslam` is functional but not bit-stable run to run.
+- PS: for rapid testing, please use `CUDA_LAUNCH_BLOCKING=1` for all commands, cuz GPU on this machine is unreliable and might crash without it sometimes.
 
 ## Commit & Pull Request Guidelines
 - Recent commits use short, action-oriented subjects such as `Flatten config layout`.
