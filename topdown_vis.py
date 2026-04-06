@@ -15,7 +15,13 @@ from build_rgb_map import (
     RGBMapper,
     load_dataset,
 )
-from visualize_rgb_map import DEFAULT_CHUNK_SIZE, DEFAULT_PCA_SAMPLE_SIZE, apply_pca_colormap_chunked
+from visualize_rgb_map import (
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_PCA_SAMPLE_SIZE,
+    apply_pca_colormap_chunked,
+    colorize_instance_labels,
+    compute_instance_labels,
+)
 
 
 VIDEO_FPS = 8
@@ -239,6 +245,9 @@ def main(args: argparse.Namespace) -> None:
         k_pooling=args.k_pooling,
         max_frame_points=args.max_frame_points,
         match_distance_th=args.match_distance_th,
+        dataset_name=dataset_name.lower(),
+        scene_name=scene_name,
+        use_inst_gt=args.use_inst_gt,
     )
 
     snapshot_counts: list[int] = []
@@ -297,11 +306,15 @@ def main(args: argparse.Namespace) -> None:
         )
         * 255.0
     ).astype(np.uint8)
+    instance_colors = (colorize_instance_labels(compute_instance_labels(output_dir / "instance_edges.npz", points.shape[0], args.tau_same, args.n_min, args.min_component_size)) * 255.0).astype(np.uint8)
 
     video_dir = output_dir / VIDEO_DIR_NAME
     render_incremental_video(video_dir / "rgb.mp4", "RGB", points, rgb_colors, snapshot_counts, snapshot_frame_ids, snapshot_c2w, dataset.intrinsics.astype(np.float32), source_width, source_height, intrinsic, extrinsic, width, height, args.fps, args.dilate)
     render_incremental_video(video_dir / "normals.mp4", "Normals", points, normal_colors, snapshot_counts, snapshot_frame_ids, snapshot_c2w, dataset.intrinsics.astype(np.float32), source_width, source_height, intrinsic, extrinsic, width, height, args.fps, args.dilate)
     render_incremental_video(video_dir / "feat_pca.mp4", "Feature PCA", points, feat_colors, snapshot_counts, snapshot_frame_ids, snapshot_c2w, dataset.intrinsics.astype(np.float32), source_width, source_height, intrinsic, extrinsic, width, height, args.fps, args.dilate)
+    instance_title = "GT Instances" if args.use_inst_gt else "SAM Instances"
+    instance_name = "gt_instances.mp4" if args.use_inst_gt else "sam_instances.mp4"
+    render_incremental_video(video_dir / instance_name, instance_title, points, instance_colors, snapshot_counts, snapshot_frame_ids, snapshot_c2w, dataset.intrinsics.astype(np.float32), source_width, source_height, intrinsic, extrinsic, width, height, args.fps, args.dilate)
 
     summary = {
         "output_dir": str(output_dir),
@@ -309,6 +322,7 @@ def main(args: argparse.Namespace) -> None:
             "rgb": str(video_dir / "rgb.mp4"),
             "normals": str(video_dir / "normals.mp4"),
             "feat_pca": str(video_dir / "feat_pca.mp4"),
+            "instances": str(video_dir / instance_name),
         },
         "n_snapshots": len(snapshot_counts),
         "n_points": int(points.shape[0]),
@@ -328,6 +342,10 @@ if __name__ == "__main__":
     parser.add_argument("--match_distance_th", type=float, default=0.03)
     parser.add_argument("--fps", type=int, default=VIDEO_FPS)
     parser.add_argument("--dilate", type=int, default=POINT_DILATE)
+    parser.add_argument("--tau_same", type=float, default=0.65)
+    parser.add_argument("--n_min", type=int, default=1)
+    parser.add_argument("--min_component_size", type=int, default=75)
     parser.add_argument("--pca_sample_size", type=int, default=DEFAULT_PCA_SAMPLE_SIZE)
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
+    parser.add_argument("--use-inst-gt", action="store_true", help="Use decoded ScanNet instance-filt masks instead of SAM for instance evidence.")
     main(parser.parse_args())

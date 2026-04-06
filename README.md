@@ -25,19 +25,18 @@ Main entry points:
 
 ## Container Setup
 
-These steps assume the `humble` Docker container is already created and the repo is mounted at `/home/dynamo/AMRL_Research/repos/ovo`.
+These steps assume you already have a compatible container and the repo is mounted somewhere inside it.
 
 Start the container and open a shell:
 
 ```bash
-docker start humble
-docker exec -it humble bash
+docker start <container_name>
+docker exec -it <container_name> bash
 ```
 
 Inside the container:
 
 ```bash
-source /opt/miniconda3/etc/profile.d/conda.sh
 conda create -y -n ovo python=3.10
 conda activate ovo
 
@@ -76,7 +75,7 @@ Expected:
 ## Repo Setup
 
 ```bash
-cd /home/dynamo/AMRL_Research/repos/ovo
+cd <repo_root>
 git submodule update --init --recursive
 
 cd thirdParty/segment-anything-2
@@ -102,7 +101,6 @@ The first SigLIP run downloads weights into the container default Hugging Face c
 Install build dependencies in the same env:
 
 ```bash
-source /opt/miniconda3/etc/profile.d/conda.sh
 conda activate ovo
 
 conda install -y -c conda-forge \
@@ -115,8 +113,8 @@ conda install -y -c conda-forge \
 This container needed one env-local OpenGL fix before CMake could find the unversioned library name:
 
 ```bash
-ln -sfn /opt/miniconda3/envs/ovo/lib/libOpenGL.so.0.0.0 \
-  /opt/miniconda3/envs/ovo/lib/libOpenGL.so
+ln -sfn "$CONDA_PREFIX/lib/libOpenGL.so.0.0.0" \
+  "$CONDA_PREFIX/lib/libOpenGL.so"
 ```
 
 Use the conda `py-opencv` package, not the pip `opencv-python` wheel. In this container, the wheel mixed badly with the ORB runtime libraries.
@@ -124,13 +122,12 @@ Use the conda `py-opencv` package, not the pip `opencv-python` wheel. In this co
 Build ORB-SLAM3:
 
 ```bash
-source /opt/miniconda3/etc/profile.d/conda.sh
 conda activate ovo
 
-cd /home/dynamo/AMRL_Research/repos/ovo
+cd <repo_root>
 ./patch_orbslam_submodule.sh
 
-cd /home/dynamo/AMRL_Research/repos/ovo/thirdParty/ORB_SLAM3
+cd thirdParty/ORB_SLAM3
 rm -rf build Thirdparty/DBoW2/build Thirdparty/g2o/build
 bash build.sh
 cd ../..
@@ -157,7 +154,6 @@ PY
 Install the official wheel for Ubuntu 22.04, Python 3.10, CUDA 12:
 
 ```bash
-source /opt/miniconda3/etc/profile.d/conda.sh
 conda activate ovo
 
 pip install \
@@ -171,17 +167,6 @@ python - <<'PY'
 import cuvslam
 print(cuvslam.__version__)
 PY
-```
-
-## Runtime
-
-Inside the container:
-
-```bash
-source /opt/miniconda3/etc/profile.d/conda.sh
-conda activate ovo
-cd /home/dynamo/AMRL_Research/repos/ovo
-export DISABLE_WANDB=true
 ```
 
 ## Data
@@ -218,7 +203,7 @@ data/input/ScanNet/
 Decode with:
 
 ```bash
-python scannet_decode_sens.py \
+export CUDA_LAUNCH_BLOCKING=1 && python scannet_decode_sens.py \
   --scans_root /path/to/scannet_v2/scans \
   --output_root data/input/ScanNet \
   --write_semantic_gt \
@@ -230,13 +215,13 @@ python scannet_decode_sens.py \
 Short ScanNet smokes:
 
 ```bash
-python run_eval.py --dataset_name ScanNet --experiment_name smoke_vanilla --run \
+export CUDA_LAUNCH_BLOCKING=1 && python run_eval.py --dataset_name ScanNet --experiment_name smoke_vanilla --run \
   --scenes scene0011_00 --slam_module vanilla --frame_limit 5
 
-python run_eval.py --dataset_name ScanNet --experiment_name smoke_orbslam --run \
+export CUDA_LAUNCH_BLOCKING=1 && python run_eval.py --dataset_name ScanNet --experiment_name smoke_orbslam --run \
   --scenes scene0011_00 --slam_module orbslam --frame_limit 5
 
-python run_eval.py --dataset_name ScanNet --experiment_name smoke_cuvslam --run \
+export CUDA_LAUNCH_BLOCKING=1 && python run_eval.py --dataset_name ScanNet --experiment_name smoke_cuvslam --run \
   --scenes scene0011_00 --slam_module cuvslam --frame_limit 5
 ```
 
@@ -251,38 +236,38 @@ Each successful run should produce:
 Single-scene end-to-end run:
 
 ```bash
-python run_eval.py --dataset_name ScanNet --experiment_name dev_run \
+export CUDA_LAUNCH_BLOCKING=1 && python run_eval.py --dataset_name ScanNet --experiment_name dev_run \
   --run --segment --eval --scenes scene0011_00 --slam_module vanilla
 ```
 
 Run only the mapping stage:
 
 ```bash
-python run_eval.py --dataset_name ScanNet --experiment_name dev_run \
+export CUDA_LAUNCH_BLOCKING=1 && python run_eval.py --dataset_name ScanNet --experiment_name dev_run \
   --run --scenes scene0011_00 --slam_module vanilla
 ```
 
 Segment and evaluate an existing run:
 
 ```bash
-python run_eval.py --dataset_name ScanNet --experiment_name dev_run \
+export CUDA_LAUNCH_BLOCKING=1 && python run_eval.py --dataset_name ScanNet --experiment_name dev_run \
   --segment --eval --scenes scene0011_00 --slam_module vanilla
 ```
 
 Switch backends by changing only `--slam_module`:
 
 ```bash
-python run_eval.py --dataset_name ScanNet --experiment_name dev_run_orb \
+export CUDA_LAUNCH_BLOCKING=1 && python run_eval.py --dataset_name ScanNet --experiment_name dev_run_orb \
   --run --segment --eval --scenes scene0011_00 --slam_module orbslam
 
-python run_eval.py --dataset_name ScanNet --experiment_name dev_run_cuv \
+export CUDA_LAUNCH_BLOCKING=1 && python run_eval.py --dataset_name ScanNet --experiment_name dev_run_cuv \
   --run --segment --eval --scenes scene0011_00 --slam_module cuvslam
 ```
 
 Full 5-scene HVS sweep:
 
 ```bash
-python run_eval.py --dataset_name ScanNet --experiment_name scannet_hvs \
+export CUDA_LAUNCH_BLOCKING=1 && python run_eval.py --dataset_name ScanNet --experiment_name scannet_hvs \
   --run --segment --eval \
   --scenes scene0011_00 scene0050_00 scene0231_00 scene0378_00 scene0518_00 \
   --slam_module vanilla
@@ -329,21 +314,21 @@ done
 Semantic prediction view:
 
 ```bash
-python visualize_scene.py data/output/ScanNet/dev_run/scene0011_00 \
+export CUDA_LAUNCH_BLOCKING=1 && python visualize_scene.py data/output/ScanNet/dev_run/scene0011_00 \
   --working_dir . --visualize_semantic_pred
 ```
 
 Instance view:
 
 ```bash
-python visualize_scene.py data/output/ScanNet/dev_run/scene0011_00 \
+export CUDA_LAUNCH_BLOCKING=1 && python visualize_scene.py data/output/ScanNet/dev_run/scene0011_00 \
   --working_dir . --visualize_obj
 ```
 
 GT-vs-prediction view:
 
 ```bash
-python visualize_scene.py data/output/ScanNet/dev_run/scene0011_00 \
+export CUDA_LAUNCH_BLOCKING=1 && python visualize_scene.py data/output/ScanNet/dev_run/scene0011_00 \
   --working_dir . --visualize_gt_vs_pre
 ```
 

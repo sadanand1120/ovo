@@ -5,6 +5,8 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 import open_clip
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 import torch
 from tqdm.auto import tqdm
 
@@ -47,11 +49,16 @@ def show_point_cloud(pcd: o3d.geometry.PointCloud, point_size: float, view_path:
     vis.destroy_window()
 
 
+def load_feature_chunk(features_mm: np.memmap, start: int, end: int) -> torch.Tensor:
+    chunk = torch.from_numpy(np.array(features_mm[start:end], copy=True)).float()
+    return torch.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def fit_pca_projection(features_mm: np.memmap, sample_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     n_points = features_mm.shape[0]
     sample_size = min(sample_size, n_points)
     sample_idx = np.random.default_rng(0).choice(n_points, size=sample_size, replace=False)
-    sample = torch.from_numpy(np.array(features_mm[sample_idx], copy=True)).float()
+    sample = torch.nan_to_num(torch.from_numpy(np.array(features_mm[sample_idx], copy=True)).float(), nan=0.0, posinf=0.0, neginf=0.0)
     mean = sample.mean(dim=0, keepdim=True)
     centered = sample - mean
     _, _, v = torch.pca_lowrank(centered, niter=5)
@@ -68,7 +75,7 @@ def apply_pca_colormap_chunked(features_mm: np.memmap, sample_size: int, chunk_s
     colors = np.empty((features_mm.shape[0], 3), dtype=np.float32)
     for start in tqdm(range(0, features_mm.shape[0], chunk_size), desc="PCA color", unit="chunk"):
         end = min(start + chunk_size, features_mm.shape[0])
-        chunk = torch.from_numpy(np.array(features_mm[start:end], copy=True)).float()
+        chunk = load_feature_chunk(features_mm, start, end)
         low_rank = (chunk - mean) @ proj_v
         colors[start:end] = ((low_rank - low_rank_min) / denom).clamp_(0.0, 1.0).numpy()
     return colors
@@ -123,9 +130,58 @@ def compute_similarity_scores_chunked(
     scores = np.empty((features_mm.shape[0],), dtype=np.float32)
     for start in tqdm(range(0, features_mm.shape[0], chunk_size), desc="Similarity", unit="chunk"):
         end = min(start + chunk_size, features_mm.shape[0])
-        chunk = torch.from_numpy(np.array(features_mm[start:end], copy=True)).to(device)
+        chunk = load_feature_chunk(features_mm, start, end).to(device)
         scores[start:end] = compute_similarity_scores(chunk, pos_embed, neg_embed, softmax_temp).cpu().numpy()
     return scores
+
+
+def compute_instance_labels(edge_path: Path, n_points: int, tau_same: float, n_min: int, min_component_size: int) -> np.ndarray:
+    data = np.load(edge_path)
+    same = data["same_count"].astype(np.float32)
+    diff = data["diff_count"].astype(np.float32)
+    total = same + diff
+    p_same = (same + 1.0) / (total + 2.0)
+    keep = (total >= float(n_min)) & (p_same > float(tau_same))
+    if not keep.any():
+        return np.full((n_points,), -1, dtype=np.int32)
+
+    edge_u = data["edge_u"][keep]
+    edge_v = data["edge_v"][keep]
+    active_nodes = np.unique(np.concatenate([edge_u, edge_v]))
+    compact_u = np.searchsorted(active_nodes, edge_u)
+    compact_v = np.searchsorted(active_nodes, edge_v)
+    graph = coo_matrix(
+        (
+            np.ones(compact_u.shape[0] * 2, dtype=np.uint8),
+            (
+                np.concatenate([compact_u, compact_v]),
+                np.concatenate([compact_v, compact_u]),
+            ),
+        ),
+        shape=(active_nodes.shape[0], active_nodes.shape[0]),
+    )
+    _, compact_labels = connected_components(graph.tocsr(), directed=False)
+    counts = np.bincount(compact_labels)
+    keep_components = counts >= int(min_component_size)
+    labels = np.full((n_points,), -1, dtype=np.int32)
+    valid = keep_components[compact_labels]
+    if valid.any():
+        relabeled = np.full_like(compact_labels, -1)
+        _, relabeled_valid = np.unique(compact_labels[valid], return_inverse=True)
+        relabeled[valid] = relabeled_valid.astype(np.int32)
+        labels[active_nodes] = relabeled
+    return labels
+
+
+def colorize_instance_labels(labels: np.ndarray) -> np.ndarray:
+    colors = np.zeros((labels.shape[0], 3), dtype=np.float32)
+    valid = labels >= 0
+    if not valid.any():
+        return colors
+    unique_labels, inverse = np.unique(labels[valid], return_inverse=True)
+    palette = np.random.default_rng(0).random((unique_labels.shape[0], 3), dtype=np.float32)
+    colors[valid] = palette[inverse]
+    return colors
 
 
 @torch.inference_mode()
@@ -173,6 +229,11 @@ def main(args):
         colors = similarity_colormap(scores).numpy()
         pcd.colors = o3d.utility.Vector3dVector(colors)
         print({"positive": positives, "negative": negatives, "softmax_temp": args.softmax_temp, "score_min": float(scores.min()), "score_max": float(scores.max())})
+    elif args.mode == "instances":
+        labels = compute_instance_labels(ply_path.with_name("instance_edges.npz"), len(pcd.points), args.tau_same, args.n_min, args.min_component_size)
+        pcd.colors = o3d.utility.Vector3dVector(colorize_instance_labels(labels))
+        n_instances = int(labels.max()) + 1 if (labels >= 0).any() else 0
+        print({"tau_same": args.tau_same, "n_min": args.n_min, "min_component_size": args.min_component_size, "n_instances": n_instances})
     print(f"Loaded {ply_path} with {len(pcd.points)} points")
     stats_path = ply_path.with_name("stats.json")
     if stats_path.exists():
@@ -184,10 +245,13 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualize a saved RGB pointcloud map.")
     parser.add_argument("input_path", help="Path to rgb_map.ply or its containing directory.")
-    parser.add_argument("--mode", choices=["rgb", "normals", "feat", "feature-similarity"], default="rgb")
+    parser.add_argument("--mode", choices=["rgb", "normals", "feat", "feature-similarity", "instances"], default="rgb")
     parser.add_argument("--positive", default="")
     parser.add_argument("--negative", default="")
     parser.add_argument("--softmax_temp", type=float, default=0.1)
+    parser.add_argument("--tau_same", type=float, default=0.65)
+    parser.add_argument("--n_min", type=int, default=1)
+    parser.add_argument("--min_component_size", type=int, default=75)
     parser.add_argument("--pca_sample_size", type=int, default=DEFAULT_PCA_SAMPLE_SIZE)
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--point_size", type=float, default=DEFAULT_POINT_SIZE)

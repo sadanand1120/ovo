@@ -24,11 +24,18 @@ DEFAULT_DOWNSCALE_RES = 2
 DEFAULT_K_POOLING = 1
 DEFAULT_MAX_FRAME_POINTS = 5_000_000
 DEFAULT_MATCH_DISTANCE_TH = 0.03
+DEFAULT_INSTANCE_LOCAL_DISTANCE_TH = 0.03
+DEFAULT_INSTANCE_FLUSH_EVERY = 2_000_000
 CLIP_MODEL_NAME = "ViT-L-14-336-quickgelu"
 CLIP_PRETRAINED = "openai"
 CLIP_LOAD_SIZE = 1024
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+SAM_CHECKPOINT_PATH = INPUT_DIR / "sam_ckpts" / "sam_vit_h_4b8939.pth"
+SAM_MODEL_TYPE = "vit_h"
+SAM_SORT_MODE = "area"
+SAM_MIN_MASK_AREA_PERC = 0.01
+SAM_POINTS_PER_SIDE = 8
 
 
 def canonical_dataset_name(dataset_name: str) -> str:
@@ -118,6 +125,189 @@ def compute_normals_from_depth(x: torch.Tensor, y: torch.Tensor, depth: torch.Te
     return normals, normal_valid
 
 
+def mask_score(mask: dict, sort_mode: str) -> float:
+    predicted_iou = float(mask.get("predicted_iou", 0.0))
+    stability = float(mask.get("stability_score", 0.0))
+    area = float(mask.get("area", 0.0))
+    if sort_mode == "predicted_iou":
+        return predicted_iou
+    if sort_mode == "stability":
+        return stability
+    if sort_mode == "score":
+        return predicted_iou * stability
+    return area
+
+
+def flatten_masks(masks: list[dict], image_shape: tuple[int, int, int], sort_mode: str, min_mask_area_perc: float) -> np.ndarray:
+    height, width = image_shape[:2]
+    min_mask_area = float(min_mask_area_perc) * height * width
+    masks = [mask for mask in masks if float(mask.get("area", 0.0)) >= min_mask_area]
+    if not masks:
+        return np.full((height, width), -1, dtype=np.int32)
+    scores = np.asarray([mask_score(mask, sort_mode) for mask in masks], dtype=np.float32)
+    order = np.argsort(scores)[::-1]
+    winning_idx = np.full((height, width), -1, dtype=np.int32)
+    winning_score = np.full((height, width), -np.inf, dtype=np.float32)
+    for raw_idx in order:
+        segmentation = np.asarray(masks[raw_idx]["segmentation"], dtype=bool)
+        better = segmentation & (scores[raw_idx] > winning_score)
+        winning_idx[better] = int(raw_idx)
+        winning_score[better] = float(scores[raw_idx])
+    labels = np.full((height, width), -1, dtype=np.int32)
+    compact_id = 0
+    for raw_idx in order:
+        claimed = winning_idx == int(raw_idx)
+        if claimed.sum() < min_mask_area:
+            continue
+        if claimed.any():
+            labels[claimed] = compact_id
+            compact_id += 1
+    return labels
+
+
+class SAMMaskExtractor:
+    def __init__(self, device: str) -> None:
+        from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
+
+        self.device = device if device == "cpu" or torch.cuda.is_available() else "cpu"
+        sam = sam_model_registry[SAM_MODEL_TYPE](checkpoint=str(SAM_CHECKPOINT_PATH)).to(self.device).eval()
+        self.mask_generator = SamAutomaticMaskGenerator(sam, points_per_side=SAM_POINTS_PER_SIDE)
+
+    @torch.inference_mode()
+    def extract_labels(self, image: np.ndarray) -> np.ndarray:
+        masks = self.mask_generator.generate(image)
+        return flatten_masks(masks, image.shape, SAM_SORT_MODE, SAM_MIN_MASK_AREA_PERC)
+
+
+class GTInstanceMaskExtractor:
+    def __init__(self, dataset_name: str, scene_name: str) -> None:
+        if dataset_name.lower() != "scannet":
+            raise ValueError("GT instance masks are only available for ScanNet.")
+        self.mask_dir = INPUT_DIR / canonical_dataset_name(dataset_name) / scene_name / "instance-filt"
+        if not self.mask_dir.exists():
+            raise FileNotFoundError(f"Missing decoded GT instance masks at {self.mask_dir}. Run scannet_decode_sens.py --extract_2d_gt_filt first.")
+
+    def extract_labels(self, frame_id: int, image_shape: tuple[int, int]) -> np.ndarray:
+        path = self.mask_dir / f"{frame_id}.png"
+        labels = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if labels is None:
+            raise FileNotFoundError(f"Missing GT instance mask {path}")
+        if labels.shape[:2] != image_shape:
+            labels = cv2.resize(labels, (image_shape[1], image_shape[0]), interpolation=cv2.INTER_NEAREST)
+        labels = labels.astype(np.int32, copy=False)
+        labels[labels == 0] = -1
+        return labels
+
+
+class InstanceEvidenceGraph:
+    def __init__(self, tau_local_3d: float, flush_every: int) -> None:
+        self.tau_local_3d_sq = float(tau_local_3d) ** 2
+        self.flush_every = int(flush_every)
+        self.tmpdir = tempfile.TemporaryDirectory(prefix="rgb_map_inst_")
+        self.obs_u: list[np.ndarray] = []
+        self.obs_v: list[np.ndarray] = []
+        self.obs_same: list[np.ndarray] = []
+        self.obs_diff: list[np.ndarray] = []
+        self.obs_size = 0
+        self.shards: list[Path] = []
+
+    def _append(self, u: np.ndarray, v: np.ndarray, same: np.ndarray, diff: np.ndarray) -> None:
+        if u.size == 0:
+            return
+        self.obs_u.append(u.astype(np.int64, copy=False))
+        self.obs_v.append(v.astype(np.int64, copy=False))
+        self.obs_same.append(same.astype(np.uint8, copy=False))
+        self.obs_diff.append(diff.astype(np.uint8, copy=False))
+        self.obs_size += int(u.size)
+
+    def _accumulate_direction(
+        self,
+        id_a: torch.Tensor,
+        id_b: torch.Tensor,
+        lab_a: torch.Tensor,
+        lab_b: torch.Tensor,
+        xyz_a: torch.Tensor,
+        xyz_b: torch.Tensor,
+    ) -> None:
+        valid = (
+            (id_a >= 0)
+            & (id_b >= 0)
+            & (id_a != id_b)
+            & (lab_a >= 0)
+            & (lab_b >= 0)
+            & torch.isfinite(xyz_a).all(dim=-1)
+            & torch.isfinite(xyz_b).all(dim=-1)
+            & (((xyz_a - xyz_b) ** 2).sum(dim=-1) <= self.tau_local_3d_sq)
+        )
+        if not valid.any():
+            return
+        u = torch.minimum(id_a[valid], id_b[valid]).cpu().numpy()
+        v = torch.maximum(id_a[valid], id_b[valid]).cpu().numpy()
+        same = (lab_a[valid] == lab_b[valid]).cpu().numpy().astype(np.uint8)
+        self._append(u, v, same, 1 - same)
+
+    def add_frame_observations(self, point_ids_ds: torch.Tensor, sam_labels_ds: torch.Tensor, xyz_ds: torch.Tensor) -> None:
+        self._accumulate_direction(point_ids_ds[:, :-1], point_ids_ds[:, 1:], sam_labels_ds[:, :-1], sam_labels_ds[:, 1:], xyz_ds[:, :-1], xyz_ds[:, 1:])
+        self._accumulate_direction(point_ids_ds[:-1, :], point_ids_ds[1:, :], sam_labels_ds[:-1, :], sam_labels_ds[1:, :], xyz_ds[:-1, :], xyz_ds[1:, :])
+        if self.obs_size >= self.flush_every:
+            self.flush()
+
+    def flush(self) -> None:
+        if self.obs_size == 0:
+            return
+        shard_path = Path(self.tmpdir.name) / f"{len(self.shards):06d}.npz"
+        np.savez_compressed(
+            shard_path,
+            edge_u=np.concatenate(self.obs_u),
+            edge_v=np.concatenate(self.obs_v),
+            same=np.concatenate(self.obs_same),
+            diff=np.concatenate(self.obs_diff),
+        )
+        self.shards.append(shard_path)
+        self.obs_u.clear()
+        self.obs_v.clear()
+        self.obs_same.clear()
+        self.obs_diff.clear()
+        self.obs_size = 0
+
+    def save_reduced(self, out_path: Path) -> int:
+        self.flush()
+        if not self.shards:
+            np.savez_compressed(
+                out_path,
+                edge_u=np.empty((0,), dtype=np.int64),
+                edge_v=np.empty((0,), dtype=np.int64),
+                same_count=np.empty((0,), dtype=np.uint32),
+                diff_count=np.empty((0,), dtype=np.uint32),
+            )
+            self.tmpdir.cleanup()
+            return 0
+
+        edge_u = np.concatenate([np.load(path)["edge_u"] for path in self.shards])
+        edge_v = np.concatenate([np.load(path)["edge_v"] for path in self.shards])
+        same = np.concatenate([np.load(path)["same"] for path in self.shards]).astype(np.uint32)
+        diff = np.concatenate([np.load(path)["diff"] for path in self.shards]).astype(np.uint32)
+        keys = (edge_u.astype(np.uint64) << 32) | edge_v.astype(np.uint64)
+        order = np.argsort(keys, kind="mergesort")
+        edge_u = edge_u[order]
+        edge_v = edge_v[order]
+        same = same[order]
+        diff = diff[order]
+        keys = keys[order]
+        start = np.flatnonzero(np.r_[True, keys[1:] != keys[:-1]])
+        same_count = np.add.reduceat(same, start)
+        diff_count = np.add.reduceat(diff, start)
+        np.savez_compressed(
+            out_path,
+            edge_u=edge_u[start],
+            edge_v=edge_v[start],
+            same_count=same_count,
+            diff_count=diff_count,
+        )
+        self.tmpdir.cleanup()
+        return int(start.size)
+
+
 class DenseCLIPExtractor:
     def __init__(self, device: str) -> None:
         self.device = torch.device(device)
@@ -200,6 +390,9 @@ class RGBMapper:
         k_pooling: int,
         max_frame_points: int,
         match_distance_th: float,
+        dataset_name: str,
+        scene_name: str,
+        use_inst_gt: bool,
     ) -> None:
         self.device = device
         self.cam_intrinsics = torch.tensor(intrinsics.astype(np.float32), device=device)
@@ -207,6 +400,9 @@ class RGBMapper:
         self.max_frame_points = as_int(max_frame_points)
         self.match_distance_th = float(match_distance_th)
         self.clip_extractor = DenseCLIPExtractor(device)
+        self.use_inst_gt = bool(use_inst_gt)
+        self.mask_extractor = GTInstanceMaskExtractor(dataset_name, scene_name) if self.use_inst_gt else SAMMaskExtractor(device)
+        self.instance_graph = InstanceEvidenceGraph(DEFAULT_INSTANCE_LOCAL_DISTANCE_TH, DEFAULT_INSTANCE_FLUSH_EVERY)
         if k_pooling > 1 and k_pooling % 2 == 0:
             raise ValueError("k_pooling must be odd.")
 
@@ -216,6 +412,8 @@ class RGBMapper:
         self.feature_tmpdir = tempfile.TemporaryDirectory(prefix="rgb_map_feats_")
         self.feature_shards = []
         self.n_features = 0
+        self.last_point_ids_ds = None
+        self.last_xyz_ds = None
 
         if k_pooling > 1:
             pooling = torch.nn.MaxPool2d(kernel_size=k_pooling, stride=1, padding=k_pooling // 2)
@@ -232,30 +430,34 @@ class RGBMapper:
         self.colors = torch.vstack((self.colors, colors))
         self.normals = torch.vstack((self.normals, normals))
         shard_path = Path(self.feature_tmpdir.name) / f"{len(self.feature_shards):06d}.npy"
-        np.save(shard_path, features.cpu().numpy().astype(np.float16, copy=False))
+        np.save(shard_path, torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0).cpu().numpy().astype(np.float16, copy=False))
         self.feature_shards.append(shard_path)
         self.n_features += int(features.shape[0])
 
     def add_frame(self, frame_data) -> None:
-        frame_id, image, depth, c2w = frame_data[:4]
+        frame_id, image_np, depth_np, c2w_np = frame_data[:4]
         if not self.should_map_frame(frame_id):
             return
-        if np.isinf(c2w).any() or np.isnan(c2w).any():
+        if np.isinf(c2w_np).any() or np.isnan(c2w_np).any():
             return
 
-        c2w = torch.from_numpy(c2w).to(self.device)
-        depth = torch.from_numpy(depth.astype(np.float32)).to(self.device)
-        image = torch.from_numpy(image.astype(np.uint8)).to(self.device)
+        labels_np = self.mask_extractor.extract_labels(frame_id, image_np.shape[:2]) if self.use_inst_gt else self.mask_extractor.extract_labels(image_np)
+        instance_labels_full = torch.from_numpy(labels_np).to(self.device)
+        c2w = torch.from_numpy(c2w_np).to(self.device)
+        depth = torch.from_numpy(depth_np.astype(np.float32)).to(self.device)
+        image = torch.from_numpy(image_np.astype(np.uint8)).to(self.device)
         full_image = image
         h, w = depth.shape
         y, x = torch.meshgrid(torch.arange(h, device=self.device), torch.arange(w, device=self.device), indexing="ij")
         mask = depth > 0
+        point_ids_full = torch.full((h, w), -1, dtype=torch.int64, device=self.device)
+        xyz_full = torch.full((h, w, 3), float("nan"), dtype=torch.float32, device=self.device)
 
         if self.points.shape[0] > 0:
             frustum_corners = geometry_utils.compute_camera_frustum_corners(depth, c2w, self.cam_intrinsics)
             frustum_mask = geometry_utils.compute_frustum_point_ids(self.points, frustum_corners, device=self.device)
             if frustum_mask.numel() > 0:
-                _, matches = geometry_utils.match_3d_points_to_2d_pixels(
+                matched_ids, matches = geometry_utils.match_3d_points_to_2d_pixels(
                     depth,
                     torch.linalg.inv(c2w),
                     self.points[frustum_mask],
@@ -263,37 +465,58 @@ class RGBMapper:
                     self.match_distance_th,
                 )
                 if matches.numel() > 0:
+                    global_ids = frustum_mask[matched_ids]
+                    point_ids_full[matches[:, 1], matches[:, 0]] = global_ids
+                    xyz_full[matches[:, 1], matches[:, 0]] = self.points[global_ids]
                     mask[matches[:, 1], matches[:, 0]] = False
             mask = self.pooling(mask)
 
-        if not mask.any().item():
-            return
-
-        x, y = self.downscale(x), self.downscale(y)
-        depth, mask, image = self.downscale(depth), self.downscale(mask), self.downscale(image)
+        x = self.downscale(x)
+        y = self.downscale(y)
+        depth = self.downscale(depth)
+        mask = self.downscale(mask)
+        image = self.downscale(image)
+        point_ids_ds = self.downscale(point_ids_full)
+        xyz_ds = self.downscale(xyz_full)
+        instance_labels_ds = self.downscale(instance_labels_full)
+        self.last_point_ids_ds = point_ids_ds
+        self.last_xyz_ds = xyz_ds
+        row_ids, col_ids = torch.meshgrid(torch.arange(depth.shape[0], device=self.device), torch.arange(depth.shape[1], device=self.device), indexing="ij")
         normals_cam, normal_valid = compute_normals_from_depth(x, y, depth, self.cam_intrinsics)
         mask = mask & normal_valid
-        if not mask.any().item():
-            return
-        x = x[mask]
-        y = y[mask]
-        depth = depth[mask]
-        colors = image[mask].reshape(-1, 3)
-        normals_cam = normals_cam[mask].reshape(-1, 3)
-        if depth.shape[0] > self.max_frame_points:
-            keep = torch.linspace(0, depth.shape[0] - 1, self.max_frame_points, device=self.device).round().long()
-            x, y, depth, colors = x[keep], y[keep], depth[keep], colors[keep]
-            normals_cam = normals_cam[keep]
 
-        dense_clip = self.clip_extractor.extract_dense(full_image)
-        features = dense_clip[y, x].half()
-        x_3d = (x - self.cam_intrinsics[0, 2]) * depth / self.cam_intrinsics[0, 0]
-        y_3d = (y - self.cam_intrinsics[1, 2]) * depth / self.cam_intrinsics[1, 1]
-        points = torch.stack((x_3d, y_3d, depth, torch.ones_like(depth)), dim=1)
-        points = torch.einsum("ij,mj->mi", c2w, points)[:, :3]
-        normals = torch.einsum("ij,mj->mi", c2w[:3, :3], normals_cam)
-        normals = normals / torch.linalg.norm(normals, dim=1, keepdim=True).clamp_min(1e-8)
-        self._append_points(points, colors, normals, features)
+        if mask.any():
+            x_keep = x[mask]
+            y_keep = y[mask]
+            row_keep = row_ids[mask]
+            col_keep = col_ids[mask]
+            depth_keep = depth[mask]
+            colors = image[mask].reshape(-1, 3)
+            normals_cam = normals_cam[mask].reshape(-1, 3)
+            if depth_keep.shape[0] > self.max_frame_points:
+                keep = torch.linspace(0, depth_keep.shape[0] - 1, self.max_frame_points, device=self.device).round().long()
+                x_keep, y_keep = x_keep[keep], y_keep[keep]
+                row_keep, col_keep = row_keep[keep], col_keep[keep]
+                depth_keep, colors = depth_keep[keep], colors[keep]
+                normals_cam = normals_cam[keep]
+
+            dense_clip = self.clip_extractor.extract_dense(full_image)
+            features = dense_clip[y_keep, x_keep].half()
+            x_3d = (x_keep - self.cam_intrinsics[0, 2]) * depth_keep / self.cam_intrinsics[0, 0]
+            y_3d = (y_keep - self.cam_intrinsics[1, 2]) * depth_keep / self.cam_intrinsics[1, 1]
+            points = torch.stack((x_3d, y_3d, depth_keep, torch.ones_like(depth_keep)), dim=1)
+            points = torch.einsum("ij,mj->mi", c2w, points)[:, :3]
+            normals = torch.einsum("ij,mj->mi", c2w[:3, :3], normals_cam)
+            normals = normals / torch.linalg.norm(normals, dim=1, keepdim=True).clamp_min(1e-8)
+            old_n = int(self.points.shape[0])
+            new_ids = torch.arange(old_n, old_n + points.shape[0], device=self.device, dtype=torch.int64)
+            point_ids_ds[row_keep, col_keep] = new_ids
+            xyz_ds[row_keep, col_keep] = points
+            self.instance_graph.add_frame_observations(point_ids_ds, instance_labels_ds, xyz_ds)
+            self._append_points(points, colors, normals, features)
+            return
+
+        self.instance_graph.add_frame_observations(point_ids_ds, instance_labels_ds, xyz_ds)
 
     def save(self, output_dir: Path, stats: dict) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -315,7 +538,25 @@ class RGBMapper:
             clip_feats[offset:next_offset] = shard
             offset = next_offset
         del clip_feats
+        n_instance_edges = self.instance_graph.save_reduced(output_dir / "instance_edges.npz")
         self.feature_tmpdir.cleanup()
+        stats = {
+            **stats,
+            "instance_supervision": "gt" if self.use_inst_gt else "sam",
+            "instance_edge_path": "instance_edges.npz",
+            "instance_local_distance_th": DEFAULT_INSTANCE_LOCAL_DISTANCE_TH,
+            "n_instance_edges": n_instance_edges,
+        }
+        if not self.use_inst_gt:
+            stats.update(
+                {
+                    "sam_model_type": SAM_MODEL_TYPE,
+                    "sam_checkpoint_path": str(SAM_CHECKPOINT_PATH),
+                    "sam_points_per_side": SAM_POINTS_PER_SIDE,
+                    "sam_sort_mode": SAM_SORT_MODE,
+                    "sam_min_mask_area_perc": SAM_MIN_MASK_AREA_PERC,
+                }
+            )
         with open(output_dir / "stats.json", "w") as f:
             json.dump(stats, f, indent=2)
 
@@ -332,6 +573,9 @@ def main(args):
         k_pooling=args.k_pooling,
         max_frame_points=args.max_frame_points,
         match_distance_th=args.match_distance_th,
+        dataset_name=dataset_name,
+        scene_name=args.scene_name,
+        use_inst_gt=args.use_inst_gt,
     )
 
     progress = tqdm(range(len(dataset)), desc=args.scene_name, unit="frame")
@@ -379,4 +623,5 @@ if __name__ == "__main__":
     parser.add_argument("--k_pooling", type=int, default=DEFAULT_K_POOLING)
     parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
+    parser.add_argument("--use-inst-gt", action="store_true", help="Use decoded ScanNet instance-filt masks instead of SAM for instance evidence.")
     main(parser.parse_args())

@@ -4,6 +4,7 @@ import shutil
 import struct
 import zlib
 from pathlib import Path
+from zipfile import ZipFile
 
 import cv2
 import numpy as np
@@ -219,6 +220,25 @@ def write_semantic_gt(scans_root: Path, output_root: Path, scene_name: str, link
         os.symlink(mesh_path.resolve(), link_path)
 
 
+def extract_filtered_2d_gt(scans_root: Path, output_root: Path, scene_name: str, min_free_gb: float) -> None:
+    scene_root = scans_root / scene_name
+    output_scene_dir = output_root / scene_name
+    zip_names = [
+        f"{scene_name}_2d-label-filt.zip",
+        f"{scene_name}_2d-instance-filt.zip",
+    ]
+    for zip_name in zip_names:
+        zip_path = scene_root / zip_name
+        if not zip_path.exists():
+            raise FileNotFoundError(f"Missing filtered 2D GT zip: {zip_path}")
+        print(f"Extracting {zip_name} ...")
+        with ZipFile(zip_path) as handle:
+            members = [member for member in handle.namelist() if member.lower().endswith(".png")]
+            for member in tqdm(members, desc=zip_name, unit="file"):
+                ensure_free_space(output_scene_dir, min_free_gb)
+                handle.extract(member, path=output_scene_dir)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Decode ScanNet .sens files into OVO-ready RGB-D folders.")
     parser.add_argument("--scans_root", required=True, type=Path, help="Directory containing ScanNet scene folders.")
@@ -227,6 +247,7 @@ def main() -> None:
     parser.add_argument("--frame_skip", type=int, default=1, help="Export every Nth frame.")
     parser.add_argument("--link_pcds", action="store_true", help="Link each ground-truth mesh into the decoded scene folder.")
     parser.add_argument("--write_semantic_gt", action="store_true", help="Write semantic_gt/<scene>.txt from each labeled ScanNet mesh.")
+    parser.add_argument("--extract_2d_gt_filt", action="store_true", help="Extract *_2d-label-filt.zip and *_2d-instance-filt.zip into each decoded scene folder.")
     parser.add_argument(
         "--min_free_gb",
         type=float,
@@ -249,6 +270,8 @@ def main() -> None:
         decode_scene(scene_dir, args.output_root / scene_dir.name, args.frame_skip, args.min_free_gb)
         if args.write_semantic_gt or args.link_pcds:
             write_semantic_gt(args.scans_root, args.output_root, scene_dir.name, args.link_pcds)
+        if args.extract_2d_gt_filt:
+            extract_filtered_2d_gt(args.scans_root, args.output_root, scene_dir.name, args.min_free_gb)
 
 
 if __name__ == "__main__":
