@@ -13,6 +13,7 @@ CLIP_PRETRAINED = "openai"
 DEFAULT_PCA_SAMPLE_SIZE = 100_000
 DEFAULT_CHUNK_SIZE = 200_000
 DEFAULT_POINT_SIZE = 1.0
+VIEW_SAVE_KEY = ord("V")
 
 
 def resolve_ply_path(input_path: str) -> Path:
@@ -20,12 +21,28 @@ def resolve_ply_path(input_path: str) -> Path:
     return path if path.suffix == ".ply" else path / "rgb_map.ply"
 
 
-def show_point_cloud(pcd: o3d.geometry.PointCloud, point_size: float) -> None:
-    vis = o3d.visualization.Visualizer()
+def save_view(vis: o3d.visualization.Visualizer, view_path: Path) -> None:
+    params = vis.get_view_control().convert_to_pinhole_camera_parameters()
+    view_dict = {
+        "width": int(params.intrinsic.width),
+        "height": int(params.intrinsic.height),
+        "intrinsic_matrix": np.asarray(params.intrinsic.intrinsic_matrix).tolist(),
+        "extrinsic": np.asarray(params.extrinsic).tolist(),
+    }
+    view_path.parent.mkdir(parents=True, exist_ok=True)
+    view_path.write_text(json.dumps(view_dict, indent=2))
+    print(f"Saved view to {view_path}")
+
+
+def show_point_cloud(pcd: o3d.geometry.PointCloud, point_size: float, view_path: Path | None = None) -> None:
+    vis = o3d.visualization.VisualizerWithKeyCallback()
     vis.create_window()
     vis.add_geometry(pcd)
     render_option = vis.get_render_option()
     render_option.point_size = point_size
+    if view_path is not None:
+        print(f"Press V to save the current view to {view_path}")
+        vis.register_key_callback(VIEW_SAVE_KEY, lambda v: (save_view(v, view_path), False)[1])
     vis.run()
     vis.destroy_window()
 
@@ -161,7 +178,7 @@ def main(args):
     if stats_path.exists():
         print(json.dumps(json.loads(stats_path.read_text()), indent=2))
     if not args.no_window:
-        show_point_cloud(pcd, args.point_size)
+        show_point_cloud(pcd, args.point_size, None if not args.view_path else Path(args.view_path))
 
 
 if __name__ == "__main__":
@@ -174,5 +191,6 @@ if __name__ == "__main__":
     parser.add_argument("--pca_sample_size", type=int, default=DEFAULT_PCA_SAMPLE_SIZE)
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--point_size", type=float, default=DEFAULT_POINT_SIZE)
+    parser.add_argument("--view_path", default="", help="Press V in the viewer to save the current camera view to this JSON path.")
     parser.add_argument("--no_window", action="store_true", help="Only load and print map info.")
     main(parser.parse_args())
