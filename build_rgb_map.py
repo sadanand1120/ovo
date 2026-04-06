@@ -82,6 +82,42 @@ def interpolate_positional_embedding(positional_embedding: torch.Tensor, x: torc
     return torch.cat([class_pos_embed, patch_pos_embed], dim=0).to(x.dtype)
 
 
+def compute_normals_from_depth(x: torch.Tensor, y: torch.Tensor, depth: torch.Tensor, intrinsics: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+    vertex_map = torch.stack(
+        (
+            (x - cx) * depth / fx,
+            (y - cy) * depth / fy,
+            depth,
+        ),
+        dim=-1,
+    )
+    valid = depth > 0
+    normals = torch.zeros_like(vertex_map)
+    normal_valid = torch.zeros_like(valid)
+    dx = vertex_map[1:-1, 2:] - vertex_map[1:-1, :-2]
+    dy = vertex_map[2:, 1:-1] - vertex_map[:-2, 1:-1]
+    inner_normals = torch.linalg.cross(dy, dx, dim=-1)
+    inner_norm = torch.linalg.norm(inner_normals, dim=-1, keepdim=True)
+    inner_valid = (
+        valid[1:-1, 1:-1]
+        & valid[1:-1, :-2]
+        & valid[1:-1, 2:]
+        & valid[:-2, 1:-1]
+        & valid[2:, 1:-1]
+        & (inner_norm[..., 0] > 1e-8)
+    )
+    inner_normals = inner_normals / inner_norm.clamp_min(1e-8)
+    center = vertex_map[1:-1, 1:-1]
+    flip = (inner_normals * center).sum(dim=-1) > 0
+    inner_normals[flip] = -inner_normals[flip]
+    normals[1:-1, 1:-1] = inner_normals
+    normal_valid[1:-1, 1:-1] = inner_valid
+    normals[~normal_valid] = 0
+    return normals, normal_valid
+
+
 class DenseCLIPExtractor:
     def __init__(self, device: str) -> None:
         self.device = torch.device(device)
@@ -176,6 +212,7 @@ class RGBMapper:
 
         self.points = torch.empty((0, 3), device=device)
         self.colors = torch.empty((0, 3), device=device, dtype=torch.uint8)
+        self.normals = torch.empty((0, 3), device=device)
         self.feature_tmpdir = tempfile.TemporaryDirectory(prefix="rgb_map_feats_")
         self.feature_shards = []
         self.n_features = 0
@@ -190,9 +227,10 @@ class RGBMapper:
     def should_map_frame(self, frame_id: int) -> bool:
         return frame_id % self.map_every == 0
 
-    def _append_points(self, points: torch.Tensor, colors: torch.Tensor, features: torch.Tensor) -> None:
+    def _append_points(self, points: torch.Tensor, colors: torch.Tensor, normals: torch.Tensor, features: torch.Tensor) -> None:
         self.points = torch.vstack((self.points, points))
         self.colors = torch.vstack((self.colors, colors))
+        self.normals = torch.vstack((self.normals, normals))
         shard_path = Path(self.feature_tmpdir.name) / f"{len(self.feature_shards):06d}.npy"
         np.save(shard_path, features.cpu().numpy().astype(np.float16, copy=False))
         self.feature_shards.append(shard_path)
@@ -233,13 +271,19 @@ class RGBMapper:
 
         x, y = self.downscale(x), self.downscale(y)
         depth, mask, image = self.downscale(depth), self.downscale(mask), self.downscale(image)
+        normals_cam, normal_valid = compute_normals_from_depth(x, y, depth, self.cam_intrinsics)
+        mask = mask & normal_valid
+        if not mask.any().item():
+            return
         x = x[mask]
         y = y[mask]
         depth = depth[mask]
         colors = image[mask].reshape(-1, 3)
+        normals_cam = normals_cam[mask].reshape(-1, 3)
         if depth.shape[0] > self.max_frame_points:
             keep = torch.linspace(0, depth.shape[0] - 1, self.max_frame_points, device=self.device).round().long()
             x, y, depth, colors = x[keep], y[keep], depth[keep], colors[keep]
+            normals_cam = normals_cam[keep]
 
         dense_clip = self.clip_extractor.extract_dense(full_image)
         features = dense_clip[y, x].half()
@@ -247,13 +291,16 @@ class RGBMapper:
         y_3d = (y - self.cam_intrinsics[1, 2]) * depth / self.cam_intrinsics[1, 1]
         points = torch.stack((x_3d, y_3d, depth, torch.ones_like(depth)), dim=1)
         points = torch.einsum("ij,mj->mi", c2w, points)[:, :3]
-        self._append_points(points, colors, features)
+        normals = torch.einsum("ij,mj->mi", c2w[:3, :3], normals_cam)
+        normals = normals / torch.linalg.norm(normals, dim=1, keepdim=True).clamp_min(1e-8)
+        self._append_points(points, colors, normals, features)
 
     def save(self, output_dir: Path, stats: dict) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(self.points.cpu().numpy())
         pcd.colors = o3d.utility.Vector3dVector(self.colors.cpu().numpy().astype(np.float32) / 255.0)
+        pcd.normals = o3d.utility.Vector3dVector(self.normals.cpu().numpy())
         o3d.io.write_point_cloud(str(output_dir / "rgb_map.ply"), pcd)
         clip_feats = np.lib.format.open_memmap(
             output_dir / "clip_feats.npy",
@@ -300,6 +347,7 @@ def main(args):
             "scene_name": args.scene_name,
             "n_frames": len(dataset),
             "n_points": int(mapper.points.shape[0]),
+            "has_normals": True,
             "device": device,
             "map_every": mapper.map_every,
             "downscale_res": args.downscale_res,

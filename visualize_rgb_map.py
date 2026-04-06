@@ -131,7 +131,12 @@ def encode_text_queries(device: str, positives: list[str], negatives: list[str])
 def main(args):
     ply_path = resolve_ply_path(args.input_path)
     pcd = o3d.io.read_point_cloud(str(ply_path))
-    if args.mode == "feat":
+    if args.mode == "normals":
+        normals = np.asarray(pcd.normals)
+        if normals.size == 0:
+            raise ValueError("Point cloud has no normals.")
+        pcd.colors = o3d.utility.Vector3dVector(((normals + 1.0) * 0.5).clip(0.0, 1.0))
+    elif args.mode == "feat":
         feat_path = ply_path.with_name("clip_feats.npy")
         feats = np.load(feat_path, mmap_mode="r")
         colors = apply_pca_colormap_chunked(feats, args.pca_sample_size, args.chunk_size)
@@ -162,7 +167,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualize a saved RGB pointcloud map.")
     parser.add_argument("input_path", help="Path to rgb_map.ply or its containing directory.")
-    parser.add_argument("--mode", choices=["rgb", "feat", "feature-similarity"], default="rgb")
+    parser.add_argument("--mode", choices=["rgb", "normals", "feat", "feature-similarity"], default="rgb")
     parser.add_argument("--positive", default="")
     parser.add_argument("--negative", default="")
     parser.add_argument("--softmax_temp", type=float, default=0.1)
