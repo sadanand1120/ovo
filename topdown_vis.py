@@ -11,8 +11,8 @@ from build_rgb_map import (
     CLIP_LOAD_SIZE,
     CLIP_MODEL_NAME,
     CLIP_PRETRAINED,
-    DATASET_DIRS,
     RGBMapper,
+    canonical_dataset_name,
     load_dataset,
 )
 from visualize_rgb_map import (
@@ -30,19 +30,6 @@ VIDEO_DIR_NAME = "topdown_videos"
 FRUSTUM_DEPTH = 0.6
 FRUSTUM_COLOR = (40, 40, 220)
 FRUSTUM_THICKNESS = 2
-
-
-def resolve_output_dir(input_path: str) -> Path:
-    return Path(input_path)
-
-
-def infer_dataset_and_scene(output_dir: Path) -> tuple[str, str]:
-    if output_dir.parent.name not in DATASET_DIRS.values():
-        raise ValueError(f"Could not infer dataset from {output_dir}. Expected parent directory to be one of {sorted(DATASET_DIRS.values())}.")
-    dataset_name = output_dir.parent.name
-    scene_name = output_dir.name
-    return dataset_name, scene_name
-
 
 def load_view(view_path: Path) -> tuple[np.ndarray, np.ndarray, int, int]:
     view = json.loads(view_path.read_text())
@@ -232,9 +219,10 @@ def render_incremental_video(
 
 
 def main(args: argparse.Namespace) -> None:
-    output_dir = resolve_output_dir(args.input_path)
-    dataset_name, scene_name = infer_dataset_and_scene(output_dir)
-    dataset = load_dataset(dataset_name.lower(), scene_name, args.frame_limit)
+    dataset_name = args.dataset_name.lower()
+    scene_name = args.scene_name
+    output_dir = Path(args.output_root) / canonical_dataset_name(dataset_name) / scene_name
+    dataset = load_dataset(dataset_name, scene_name, args.frame_limit)
     intrinsic, extrinsic, width, height = load_view(Path(args.load_view))
 
     mapper = RGBMapper(
@@ -245,7 +233,7 @@ def main(args: argparse.Namespace) -> None:
         k_pooling=args.k_pooling,
         max_frame_points=args.max_frame_points,
         match_distance_th=args.match_distance_th,
-        dataset_name=dataset_name.lower(),
+        dataset_name=dataset_name,
         scene_name=scene_name,
         use_inst_gt=args.use_inst_gt,
     )
@@ -270,7 +258,7 @@ def main(args: argparse.Namespace) -> None:
     mapper.save(
         output_dir,
         {
-            "dataset_name": dataset_name,
+            "dataset_name": canonical_dataset_name(dataset_name),
             "scene_name": scene_name,
             "n_frames": len(dataset),
             "n_points": int(mapper.points.shape[0]),
@@ -332,7 +320,9 @@ def main(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build RGB+normal+CLIP maps and render incremental view videos.")
-    parser.add_argument("input_path", help="Scene output directory, e.g. data/output/rgb_maps/ScanNet/scene0011_00")
+    parser.add_argument("--dataset_name", required=True, choices=["Replica", "ScanNet", "replica", "scannet"])
+    parser.add_argument("--scene_name", required=True)
+    parser.add_argument("--output_root", default="data/output/topdown_vis")
     parser.add_argument("--load-view", required=True, help="Path to a saved view JSON dumped from visualize_rgb_map.py.")
     parser.add_argument("--frame_limit", type=int, default=None)
     parser.add_argument("--map_every", type=int, default=8)
