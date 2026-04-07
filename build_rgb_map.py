@@ -24,8 +24,9 @@ DEFAULT_DOWNSCALE_RES = 2
 DEFAULT_K_POOLING = 1
 DEFAULT_MAX_FRAME_POINTS = 5_000_000
 DEFAULT_MATCH_DISTANCE_TH = 0.03
-DEFAULT_INSTANCE_LOCAL_DISTANCE_TH = 0.03
-DEFAULT_INSTANCE_FLUSH_EVERY = 2_000_000
+DEFAULT_INSTANCE_MATCH_TH = 5
+DEFAULT_INSTANCE_NEW_TH = 150
+DEFAULT_INSTANCE_DOMINANT_FRAC_TH = 0.4
 CLIP_MODEL_NAME = "ViT-L-14-336-quickgelu"
 CLIP_PRETRAINED = "openai"
 CLIP_LOAD_SIZE = 1024
@@ -196,116 +197,53 @@ class GTInstanceMaskExtractor:
             labels = cv2.resize(labels, (image_shape[1], image_shape[0]), interpolation=cv2.INTER_NEAREST)
         labels = labels.astype(np.int32, copy=False)
         labels[labels == 0] = -1
+        valid = labels >= 0
+        if valid.any():
+            _, local = np.unique(labels[valid], return_inverse=True)
+            labels[valid] = local.astype(np.int32, copy=False)
         return labels
 
 
-class InstanceEvidenceGraph:
-    def __init__(self, tau_local_3d: float, flush_every: int) -> None:
-        self.tau_local_3d_sq = float(tau_local_3d) ** 2
-        self.flush_every = int(flush_every)
-        self.tmpdir = tempfile.TemporaryDirectory(prefix="rgb_map_inst_")
-        self.obs_u: list[np.ndarray] = []
-        self.obs_v: list[np.ndarray] = []
-        self.obs_same: list[np.ndarray] = []
-        self.obs_diff: list[np.ndarray] = []
-        self.obs_size = 0
-        self.shards: list[Path] = []
+class OnlineInstanceTracker:
+    def __init__(self, match_th: int, new_th: int, dominant_frac_th: float) -> None:
+        self.match_th = int(match_th)
+        self.new_th = int(new_th)
+        self.dominant_frac_th = float(dominant_frac_th)
+        self.point_labels = np.empty((0,), dtype=np.int32)
+        self.next_instance_id = 0
 
-    def _append(self, u: np.ndarray, v: np.ndarray, same: np.ndarray, diff: np.ndarray) -> None:
-        if u.size == 0:
-            return
-        self.obs_u.append(u.astype(np.int64, copy=False))
-        self.obs_v.append(v.astype(np.int64, copy=False))
-        self.obs_same.append(same.astype(np.uint8, copy=False))
-        self.obs_diff.append(diff.astype(np.uint8, copy=False))
-        self.obs_size += int(u.size)
+    def append_new_points(self, n_new: int) -> None:
+        if n_new > 0:
+            self.point_labels = np.concatenate((self.point_labels, np.full((int(n_new),), -1, dtype=np.int32)))
 
-    def _accumulate_direction(
-        self,
-        id_a: torch.Tensor,
-        id_b: torch.Tensor,
-        lab_a: torch.Tensor,
-        lab_b: torch.Tensor,
-        xyz_a: torch.Tensor,
-        xyz_b: torch.Tensor,
-    ) -> None:
-        valid = (
-            (id_a >= 0)
-            & (id_b >= 0)
-            & (id_a != id_b)
-            & (lab_a >= 0)
-            & (lab_b >= 0)
-            & torch.isfinite(xyz_a).all(dim=-1)
-            & torch.isfinite(xyz_b).all(dim=-1)
-            & (((xyz_a - xyz_b) ** 2).sum(dim=-1) <= self.tau_local_3d_sq)
-        )
+    def update(self, point_ids_ds: torch.Tensor, mask_labels_ds: torch.Tensor) -> None:
+        valid = (point_ids_ds >= 0) & (mask_labels_ds >= 0)
         if not valid.any():
             return
-        u = torch.minimum(id_a[valid], id_b[valid]).cpu().numpy()
-        v = torch.maximum(id_a[valid], id_b[valid]).cpu().numpy()
-        same = (lab_a[valid] == lab_b[valid]).cpu().numpy().astype(np.uint8)
-        self._append(u, v, same, 1 - same)
-
-    def add_frame_observations(self, point_ids_ds: torch.Tensor, sam_labels_ds: torch.Tensor, xyz_ds: torch.Tensor) -> None:
-        self._accumulate_direction(point_ids_ds[:, :-1], point_ids_ds[:, 1:], sam_labels_ds[:, :-1], sam_labels_ds[:, 1:], xyz_ds[:, :-1], xyz_ds[:, 1:])
-        self._accumulate_direction(point_ids_ds[:-1, :], point_ids_ds[1:, :], sam_labels_ds[:-1, :], sam_labels_ds[1:, :], xyz_ds[:-1, :], xyz_ds[1:, :])
-        if self.obs_size >= self.flush_every:
-            self.flush()
-
-    def flush(self) -> None:
-        if self.obs_size == 0:
-            return
-        shard_path = Path(self.tmpdir.name) / f"{len(self.shards):06d}.npz"
-        np.savez_compressed(
-            shard_path,
-            edge_u=np.concatenate(self.obs_u),
-            edge_v=np.concatenate(self.obs_v),
-            same=np.concatenate(self.obs_same),
-            diff=np.concatenate(self.obs_diff),
-        )
-        self.shards.append(shard_path)
-        self.obs_u.clear()
-        self.obs_v.clear()
-        self.obs_same.clear()
-        self.obs_diff.clear()
-        self.obs_size = 0
-
-    def save_reduced(self, out_path: Path) -> int:
-        self.flush()
-        if not self.shards:
-            np.savez_compressed(
-                out_path,
-                edge_u=np.empty((0,), dtype=np.int64),
-                edge_v=np.empty((0,), dtype=np.int64),
-                same_count=np.empty((0,), dtype=np.uint32),
-                diff_count=np.empty((0,), dtype=np.uint32),
-            )
-            self.tmpdir.cleanup()
-            return 0
-
-        edge_u = np.concatenate([np.load(path)["edge_u"] for path in self.shards])
-        edge_v = np.concatenate([np.load(path)["edge_v"] for path in self.shards])
-        same = np.concatenate([np.load(path)["same"] for path in self.shards]).astype(np.uint32)
-        diff = np.concatenate([np.load(path)["diff"] for path in self.shards]).astype(np.uint32)
-        keys = (edge_u.astype(np.uint64) << 32) | edge_v.astype(np.uint64)
-        order = np.argsort(keys, kind="mergesort")
-        edge_u = edge_u[order]
-        edge_v = edge_v[order]
-        same = same[order]
-        diff = diff[order]
-        keys = keys[order]
-        start = np.flatnonzero(np.r_[True, keys[1:] != keys[:-1]])
-        same_count = np.add.reduceat(same, start)
-        diff_count = np.add.reduceat(diff, start)
-        np.savez_compressed(
-            out_path,
-            edge_u=edge_u[start],
-            edge_v=edge_v[start],
-            same_count=same_count,
-            diff_count=diff_count,
-        )
-        self.tmpdir.cleanup()
-        return int(start.size)
+        point_ids = point_ids_ds[valid].cpu().numpy().astype(np.int64, copy=False)
+        mask_labels = mask_labels_ds[valid].cpu().numpy().astype(np.int32, copy=False)
+        order = np.lexsort((point_ids, mask_labels))
+        point_ids = point_ids[order]
+        mask_labels = mask_labels[order]
+        starts = np.flatnonzero(np.r_[True, mask_labels[1:] != mask_labels[:-1]])
+        ends = np.r_[starts[1:], mask_labels.shape[0]]
+        for start, end in zip(starts, ends):
+            ids = np.unique(point_ids[start:end])
+            if ids.shape[0] < self.match_th:
+                continue
+            labels = self.point_labels[ids]
+            assigned = labels >= 0
+            if assigned.sum() > 0:
+                label_vals, label_counts = np.unique(labels[assigned], return_counts=True)
+                dominant_idx = int(label_counts.argmax())
+                dominant = int(label_vals[dominant_idx])
+                dominant_frac = float(label_counts[dominant_idx]) / float(assigned.sum())
+                if assigned.sum() >= self.match_th and dominant_frac >= self.dominant_frac_th:
+                    self.point_labels[ids[~assigned]] = dominant
+                    continue
+            if (~assigned).sum() >= self.new_th:
+                self.point_labels[ids[~assigned]] = self.next_instance_id
+                self.next_instance_id += 1
 
 
 class DenseCLIPExtractor:
@@ -402,7 +340,11 @@ class RGBMapper:
         self.clip_extractor = DenseCLIPExtractor(device)
         self.use_inst_gt = bool(use_inst_gt)
         self.mask_extractor = GTInstanceMaskExtractor(dataset_name, scene_name) if self.use_inst_gt else SAMMaskExtractor(device)
-        self.instance_graph = InstanceEvidenceGraph(DEFAULT_INSTANCE_LOCAL_DISTANCE_TH, DEFAULT_INSTANCE_FLUSH_EVERY)
+        self.instance_tracker = OnlineInstanceTracker(
+            DEFAULT_INSTANCE_MATCH_TH,
+            DEFAULT_INSTANCE_NEW_TH,
+            DEFAULT_INSTANCE_DOMINANT_FRAC_TH,
+        )
         if k_pooling > 1 and k_pooling % 2 == 0:
             raise ValueError("k_pooling must be odd.")
 
@@ -412,8 +354,6 @@ class RGBMapper:
         self.feature_tmpdir = tempfile.TemporaryDirectory(prefix="rgb_map_feats_")
         self.feature_shards = []
         self.n_features = 0
-        self.last_point_ids_ds = None
-        self.last_xyz_ds = None
 
         if k_pooling > 1:
             pooling = torch.nn.MaxPool2d(kernel_size=k_pooling, stride=1, padding=k_pooling // 2)
@@ -451,7 +391,6 @@ class RGBMapper:
         y, x = torch.meshgrid(torch.arange(h, device=self.device), torch.arange(w, device=self.device), indexing="ij")
         mask = depth > 0
         point_ids_full = torch.full((h, w), -1, dtype=torch.int64, device=self.device)
-        xyz_full = torch.full((h, w, 3), float("nan"), dtype=torch.float32, device=self.device)
 
         if self.points.shape[0] > 0:
             frustum_corners = geometry_utils.compute_camera_frustum_corners(depth, c2w, self.cam_intrinsics)
@@ -467,7 +406,6 @@ class RGBMapper:
                 if matches.numel() > 0:
                     global_ids = frustum_mask[matched_ids]
                     point_ids_full[matches[:, 1], matches[:, 0]] = global_ids
-                    xyz_full[matches[:, 1], matches[:, 0]] = self.points[global_ids]
                     mask[matches[:, 1], matches[:, 0]] = False
             mask = self.pooling(mask)
 
@@ -477,10 +415,7 @@ class RGBMapper:
         mask = self.downscale(mask)
         image = self.downscale(image)
         point_ids_ds = self.downscale(point_ids_full)
-        xyz_ds = self.downscale(xyz_full)
         instance_labels_ds = self.downscale(instance_labels_full)
-        self.last_point_ids_ds = point_ids_ds
-        self.last_xyz_ds = xyz_ds
         row_ids, col_ids = torch.meshgrid(torch.arange(depth.shape[0], device=self.device), torch.arange(depth.shape[1], device=self.device), indexing="ij")
         normals_cam, normal_valid = compute_normals_from_depth(x, y, depth, self.cam_intrinsics)
         mask = mask & normal_valid
@@ -511,12 +446,12 @@ class RGBMapper:
             old_n = int(self.points.shape[0])
             new_ids = torch.arange(old_n, old_n + points.shape[0], device=self.device, dtype=torch.int64)
             point_ids_ds[row_keep, col_keep] = new_ids
-            xyz_ds[row_keep, col_keep] = points
-            self.instance_graph.add_frame_observations(point_ids_ds, instance_labels_ds, xyz_ds)
+            self.instance_tracker.append_new_points(points.shape[0])
+            self.instance_tracker.update(point_ids_ds, instance_labels_ds)
             self._append_points(points, colors, normals, features)
             return
 
-        self.instance_graph.add_frame_observations(point_ids_ds, instance_labels_ds, xyz_ds)
+        self.instance_tracker.update(point_ids_ds, instance_labels_ds)
 
     def save(self, output_dir: Path, stats: dict) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -538,14 +473,15 @@ class RGBMapper:
             clip_feats[offset:next_offset] = shard
             offset = next_offset
         del clip_feats
-        n_instance_edges = self.instance_graph.save_reduced(output_dir / "instance_edges.npz")
+        np.save(output_dir / "instance_labels.npy", self.instance_tracker.point_labels)
         self.feature_tmpdir.cleanup()
         stats = {
             **stats,
             "instance_supervision": "gt" if self.use_inst_gt else "sam",
-            "instance_edge_path": "instance_edges.npz",
-            "instance_local_distance_th": DEFAULT_INSTANCE_LOCAL_DISTANCE_TH,
-            "n_instance_edges": n_instance_edges,
+            "instance_label_path": "instance_labels.npy",
+            "instance_match_th": DEFAULT_INSTANCE_MATCH_TH,
+            "instance_new_th": DEFAULT_INSTANCE_NEW_TH,
+            "instance_dominant_frac_th": DEFAULT_INSTANCE_DOMINANT_FRAC_TH,
         }
         if not self.use_inst_gt:
             stats.update(

@@ -112,15 +112,14 @@ def load_pred_map(ply_path: Path) -> dict:
     clip_path = ply_path.with_name("clip_feats.npy")
     if not clip_path.exists():
         raise ValueError(f"Missing CLIP features: {clip_path}")
-    instance_edge_path = ply_path.with_name("instance_edges.npz")
-    if not instance_edge_path.exists():
-        raise ValueError(f"Missing instance evidence: {instance_edge_path}")
+    instance_label_path = ply_path.with_name("instance_labels.npy")
+    if not instance_label_path.exists():
+        raise ValueError(f"Missing instance labels for {ply_path.parent}")
     return {
         "points": points,
         "colors": colors,
         "normals": normals,
         "clip_path": clip_path,
-        "instance_edge_path": instance_edge_path,
     }
 
 
@@ -360,13 +359,11 @@ def main(args: argparse.Namespace) -> None:
     feature_metrics = confusion_to_metrics(feature_conf, dataset_info)
     feature_metrics = {key: feature_metrics[key] for key in ("mIoU", "mAcc")}
 
-    from visualize_rgb_map import compute_instance_labels
+    from visualize_rgb_map import resolve_instance_labels
 
-    pred_instance_labels = compute_instance_labels(
-        pred["instance_edge_path"],
+    pred_instance_labels = resolve_instance_labels(
+        ply_path.parent,
         pred["points"].shape[0],
-        args.tau_same,
-        args.n_min,
         args.min_component_size,
     )[gt_to_pred_idx]
     instance_metrics, instance_diag = compute_instance_metrics(gt["instance_labels"], pred_instance_labels)
@@ -394,8 +391,6 @@ def main(args: argparse.Namespace) -> None:
             "feature": feature_diag,
             "instance": {
                 **instance_diag,
-                "tau_same": float(args.tau_same),
-                "n_min": int(args.n_min),
                 "min_component_size": int(args.min_component_size),
             },
         },
@@ -415,9 +410,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_json", action="store_true", help="Save summary to metrics.json next to the map.")
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH, help="Distance threshold used in geometry coverage diagnostics.")
     parser.add_argument("--feature_prob_th", type=float, default=DEFAULT_FEATURE_PROB_TH, help="Minimum class softmax probability before assigning background.")
-    parser.add_argument("--tau_same", type=float, default=0.65)
-    parser.add_argument("--n_min", type=int, default=1)
-    parser.add_argument("--min_component_size", type=int, default=75)
+    parser.add_argument("--min_component_size", type=int, default=2000)
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--scannet_raw_root", default="", help="Optional ScanNet raw scans root; defaults to the repo-adjacent dataset path.")
     main(parser.parse_args())

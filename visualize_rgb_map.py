@@ -5,8 +5,6 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 import open_clip
-from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import connected_components
 import torch
 from tqdm.auto import tqdm
 
@@ -135,41 +133,23 @@ def compute_similarity_scores_chunked(
     return scores
 
 
-def compute_instance_labels(edge_path: Path, n_points: int, tau_same: float, n_min: int, min_component_size: int) -> np.ndarray:
-    data = np.load(edge_path)
-    same = data["same_count"].astype(np.float32)
-    diff = data["diff_count"].astype(np.float32)
-    total = same + diff
-    p_same = (same + 1.0) / (total + 2.0)
-    keep = (total >= float(n_min)) & (p_same > float(tau_same))
-    if not keep.any():
-        return np.full((n_points,), -1, dtype=np.int32)
-
-    edge_u = data["edge_u"][keep]
-    edge_v = data["edge_v"][keep]
-    active_nodes = np.unique(np.concatenate([edge_u, edge_v]))
-    compact_u = np.searchsorted(active_nodes, edge_u)
-    compact_v = np.searchsorted(active_nodes, edge_v)
-    graph = coo_matrix(
-        (
-            np.ones(compact_u.shape[0] * 2, dtype=np.uint8),
-            (
-                np.concatenate([compact_u, compact_v]),
-                np.concatenate([compact_v, compact_u]),
-            ),
-        ),
-        shape=(active_nodes.shape[0], active_nodes.shape[0]),
-    )
-    _, compact_labels = connected_components(graph.tocsr(), directed=False)
-    counts = np.bincount(compact_labels)
-    keep_components = counts >= int(min_component_size)
-    labels = np.full((n_points,), -1, dtype=np.int32)
-    valid = keep_components[compact_labels]
+def resolve_instance_labels(map_dir: Path, n_points: int, min_component_size: int) -> np.ndarray:
+    label_path = map_dir / "instance_labels.npy"
+    if not label_path.exists():
+        raise FileNotFoundError(f"Missing instance labels at {label_path}")
+    labels = np.load(label_path)
+    if labels.shape[0] != n_points:
+        raise ValueError(f"Instance label count mismatch: expected {n_points}, found {labels.shape[0]}")
+    valid = labels >= 0
+    if valid.any() and min_component_size > 1:
+        uniq, counts = np.unique(labels[valid], return_counts=True)
+        keep = uniq[counts >= int(min_component_size)]
+        labels = labels.copy()
+        labels[~np.isin(labels, keep)] = -1
+        valid = labels >= 0
     if valid.any():
-        relabeled = np.full_like(compact_labels, -1)
-        _, relabeled_valid = np.unique(compact_labels[valid], return_inverse=True)
-        relabeled[valid] = relabeled_valid.astype(np.int32)
-        labels[active_nodes] = relabeled
+        _, relabeled = np.unique(labels[valid], return_inverse=True)
+        labels[valid] = relabeled.astype(np.int32, copy=False)
     return labels
 
 
@@ -230,10 +210,10 @@ def main(args):
         pcd.colors = o3d.utility.Vector3dVector(colors)
         print({"positive": positives, "negative": negatives, "softmax_temp": args.softmax_temp, "score_min": float(scores.min()), "score_max": float(scores.max())})
     elif args.mode == "instances":
-        labels = compute_instance_labels(ply_path.with_name("instance_edges.npz"), len(pcd.points), args.tau_same, args.n_min, args.min_component_size)
+        labels = resolve_instance_labels(ply_path.parent, len(pcd.points), args.min_component_size)
         pcd.colors = o3d.utility.Vector3dVector(colorize_instance_labels(labels))
         n_instances = int(labels.max()) + 1 if (labels >= 0).any() else 0
-        print({"tau_same": args.tau_same, "n_min": args.n_min, "min_component_size": args.min_component_size, "n_instances": n_instances})
+        print({"min_component_size": args.min_component_size, "n_instances": n_instances})
     print(f"Loaded {ply_path} with {len(pcd.points)} points")
     stats_path = ply_path.with_name("stats.json")
     if stats_path.exists():
@@ -249,9 +229,7 @@ if __name__ == "__main__":
     parser.add_argument("--positive", default="")
     parser.add_argument("--negative", default="")
     parser.add_argument("--softmax_temp", type=float, default=0.1)
-    parser.add_argument("--tau_same", type=float, default=0.65)
-    parser.add_argument("--n_min", type=int, default=1)
-    parser.add_argument("--min_component_size", type=int, default=75)
+    parser.add_argument("--min_component_size", type=int, default=2000)
     parser.add_argument("--pca_sample_size", type=int, default=DEFAULT_PCA_SAMPLE_SIZE)
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--point_size", type=float, default=DEFAULT_POINT_SIZE)

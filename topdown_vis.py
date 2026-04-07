@@ -20,7 +20,7 @@ from visualize_rgb_map import (
     DEFAULT_PCA_SAMPLE_SIZE,
     apply_pca_colormap_chunked,
     colorize_instance_labels,
-    compute_instance_labels,
+    resolve_instance_labels,
 )
 
 
@@ -306,7 +306,7 @@ def main(args: argparse.Namespace) -> None:
         )
         * 255.0
     ).astype(np.uint8)
-    instance_colors = (colorize_instance_labels(compute_instance_labels(output_dir / "instance_edges.npz", points.shape[0], args.tau_same, args.n_min, args.min_component_size)) * 255.0).astype(np.uint8)
+    instance_colors = (colorize_instance_labels(resolve_instance_labels(output_dir, points.shape[0], args.min_component_size)) * 255.0).astype(np.uint8)
 
     video_dir = output_dir / VIDEO_DIR_NAME
     render_incremental_video(video_dir / "rgb.mp4", "RGB", points, rgb_colors, snapshot_counts, snapshot_frame_ids, snapshot_c2w, dataset.intrinsics.astype(np.float32), source_width, source_height, intrinsic, extrinsic, width, height, args.fps, args.dilate)
@@ -342,9 +342,7 @@ if __name__ == "__main__":
     parser.add_argument("--match_distance_th", type=float, default=0.03)
     parser.add_argument("--fps", type=int, default=VIDEO_FPS)
     parser.add_argument("--dilate", type=int, default=POINT_DILATE)
-    parser.add_argument("--tau_same", type=float, default=0.65)
-    parser.add_argument("--n_min", type=int, default=1)
-    parser.add_argument("--min_component_size", type=int, default=75)
+    parser.add_argument("--min_component_size", type=int, default=2000)
     parser.add_argument("--pca_sample_size", type=int, default=DEFAULT_PCA_SAMPLE_SIZE)
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--use-inst-gt", action="store_true", help="Use decoded ScanNet instance-filt masks instead of SAM for instance evidence.")

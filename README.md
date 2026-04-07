@@ -309,6 +309,29 @@ for s in scene0011_00 scene0050_00 scene0231_00 scene0378_00 scene0518_00; do
 done
 ```
 
+For the RGB+normal+CLIP+instance map path:
+
+```bash
+python get_metrics_map.py data/output/rgb_maps/ScanNet/scene0011_00 --save_json
+```
+
+`get_metrics_map.py` writes `metrics.json` with these metrics:
+
+- `geometry`
+  - `chamfer_l1_m`: mean bidirectional nearest-neighbor surface distance in meters. Range `[0, inf)`, lower is better.
+  - `fscore_3cm`: reconstruction F-score at a `3 cm` distance threshold. Range `[0, 1]`, higher is better.
+  - `coverage`: fraction of GT mesh vertices within `match_distance_th` of the predicted map. Range `[0, 1]`, higher is better.
+- `rgb`
+  - `psnr`: PSNR between predicted RGB and GT RGB after transferring colors onto GT mesh vertices. Range `[0, inf)`, higher is better.
+- `normals`
+  - `mean_angle_deg`: mean angular error between predicted and GT normals on GT mesh vertices. Range `[0, 180]`, lower is better.
+- `feature`
+  - `mIoU`: mean IoU of zero-shot semantic labels predicted from CLIP features on GT mesh vertices. Range `[0, 1]`, higher is better.
+  - `mAcc`: mean class accuracy of those zero-shot semantic labels. Range `[0, 1]`, higher is better.
+- `instance`
+  - `mwcov`: mean weighted coverage of predicted instances against GT instances. Range `[0, 1]`, higher is better.
+  - `f1_50`: instance F1 score at IoU `0.50`. Range `[0, 1]`, higher is better.
+
 ## Visualization
 
 Semantic prediction view:
