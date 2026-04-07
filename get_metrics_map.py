@@ -12,12 +12,15 @@ from scipy.spatial import cKDTree
 import torch
 from tqdm.auto import tqdm
 
+from ovo.clip_feature_store import ClipFeatureStore
 from ovo import eval_utils, io_utils
 
 
 DATASET_DIRS = {"replica": "Replica", "scannet": "ScanNet"}
 CONFIG_DIR = Path("configs")
 INPUT_DIR = Path("data/input")
+TIMING_PATH = "timing.json"
+STATS_PATH = "stats.json"
 CLIP_MODEL_NAME = "ViT-L-14-336-quickgelu"
 CLIP_PRETRAINED = "openai"
 FEATURE_TEXT_TEMPLATE = "This is a photo of a {}"
@@ -27,6 +30,27 @@ DEFAULT_FEATURE_PROB_TH = 0.0
 DEFAULT_CHUNK_SIZE = 100_000
 GEOM_THRESHOLDS = (0.01, 0.03, 0.05)
 INSTANCE_IOU_THRESHOLDS = (0.5,)
+METRIC_ROW_ORDER = (
+    ("geometry", "chamfer_l1_m"),
+    ("geometry", "fscore_3cm"),
+    ("geometry", "coverage"),
+    ("rgb", "psnr"),
+    ("normals", "mean_angle_deg"),
+    ("feature", "mIoU"),
+    ("feature", "mAcc"),
+    ("instance", "mwcov"),
+    ("instance", "f1_50"),
+)
+TIMING_ROW_ORDER = (
+    ("timing.total_sec", ("total_sec",)),
+    ("timing.dataset_load_sec", ("dataset_load_sec",)),
+    ("timing.frame_loop_sec", ("frame_loop_sec",)),
+    ("timing.save.save_total_sec", ("save", "save_total_sec")),
+    ("timing.save.write_ply_sec", ("save", "write_ply_sec")),
+    ("timing.save.store_clip_sec", ("save", "store_clip_sec")),
+    ("timing.save.instance_labels_sec", ("save", "instance_labels_sec")),
+    ("timing.save.stats_sec", ("save", "stats_sec")),
+)
 
 
 def canonical_dataset_name(dataset_name: str) -> str:
@@ -105,9 +129,6 @@ def load_pred_map(ply_path: Path) -> dict:
         raise ValueError(f"Empty point cloud: {ply_path}")
     if normals.shape[0] != points.shape[0]:
         raise ValueError(f"{ply_path} has no stored normals. Rebuild the map with the current build_rgb_map.py.")
-    clip_path = ply_path.with_name("clip_feats.npy")
-    if not clip_path.exists():
-        raise ValueError(f"Missing CLIP features: {clip_path}")
     instance_label_path = ply_path.with_name("instance_labels.npy")
     if not instance_label_path.exists():
         raise ValueError(f"Missing instance labels for {ply_path.parent}")
@@ -115,7 +136,7 @@ def load_pred_map(ply_path: Path) -> dict:
         "points": points,
         "colors": colors,
         "normals": normals,
-        "clip_path": clip_path,
+        "clip_features": ClipFeatureStore(ply_path.parent),
     }
 
 
@@ -231,29 +252,29 @@ def encode_class_texts(class_names: list[str], device: str) -> torch.Tensor:
 
 
 def classify_transferred_features(
-    clip_path: Path,
+    clip_features: ClipFeatureStore,
     gt_to_pred_idx: np.ndarray,
     class_names: list[str],
     feature_prob_th: float,
     chunk_size: int,
 ) -> tuple[np.ndarray, dict]:
-    features_mm = np.load(clip_path, mmap_mode="r")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     text_embeds = encode_class_texts(class_names, device)
     background_idx = class_names.index("background") if "background" in class_names else None
+    unique_pred_idx, inverse = np.unique(gt_to_pred_idx, return_inverse=True)
 
-    pred_labels = np.empty(gt_to_pred_idx.shape[0], dtype=np.int32)
-    max_probs = np.empty(gt_to_pred_idx.shape[0], dtype=np.float32)
+    pred_labels_unique = np.empty(unique_pred_idx.shape[0], dtype=np.int32)
+    max_probs_unique = np.empty(unique_pred_idx.shape[0], dtype=np.float32)
     for start in tqdm(
-        range(0, gt_to_pred_idx.shape[0], chunk_size),
+        range(0, unique_pred_idx.shape[0], chunk_size),
         desc="semantic",
         unit="chunk",
         leave=False,
         dynamic_ncols=True,
     ):
-        end = min(start + chunk_size, gt_to_pred_idx.shape[0])
-        chunk_idx = gt_to_pred_idx[start:end]
-        chunk = torch.from_numpy(np.array(features_mm[chunk_idx], copy=True)).float()
+        end = min(start + chunk_size, unique_pred_idx.shape[0])
+        chunk_idx = unique_pred_idx[start:end]
+        chunk = torch.from_numpy(np.array(clip_features[chunk_idx], copy=True)).float()
         chunk = torch.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
         chunk = chunk.to(device)
         chunk = chunk / chunk.norm(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -264,12 +285,16 @@ def classify_transferred_features(
         prob = prob.cpu().numpy().astype(np.float32)
         if background_idx is not None and feature_prob_th > 0:
             pred[prob < feature_prob_th] = int(background_idx)
-        pred_labels[start:end] = pred
-        max_probs[start:end] = prob
+        pred_labels_unique[start:end] = pred
+        max_probs_unique[start:end] = prob
+    pred_labels = pred_labels_unique[inverse]
+    max_probs = max_probs_unique[inverse]
     diagnostics = {
         "feature_softmax_temp": FEATURE_SOFTMAX_TEMP,
         "feature_prob_th": float(feature_prob_th),
         "feature_mean_max_prob": float(max_probs.mean()),
+        "feature_unique_pred_points": int(unique_pred_idx.shape[0]),
+        "feature_query_points": int(gt_to_pred_idx.shape[0]),
     }
     return pred_labels, diagnostics
 
@@ -328,6 +353,145 @@ def compute_instance_metrics(gt_labels: np.ndarray, pred_labels: np.ndarray) -> 
     return metrics, diagnostics
 
 
+def round_for_print(value, digits: int = 3):
+    if isinstance(value, dict):
+        return {key: round_for_print(val, digits) for key, val in value.items()}
+    if isinstance(value, list):
+        return [round_for_print(val, digits) for val in value]
+    if isinstance(value, tuple):
+        return tuple(round_for_print(val, digits) for val in value)
+    if isinstance(value, (float, np.floating)):
+        if math.isfinite(float(value)):
+            return round(float(value), digits)
+        return float(value)
+    return value
+
+
+def load_json_if_exists(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def flatten_metric_summary(summary: dict) -> dict[str, float]:
+    return {f"{section}.{key}": float(summary["metrics"][section][key]) for section, key in METRIC_ROW_ORDER}
+
+
+def flatten_timing_summary(timing: dict | None) -> dict[str, float]:
+    if timing is None:
+        return {}
+    flat = {}
+    for label, path in TIMING_ROW_ORDER:
+        value = timing
+        for key in path:
+            if not isinstance(value, dict) or key not in value:
+                value = None
+                break
+            value = value[key]
+        if value is not None:
+            flat[label] = float(value)
+    return flat
+
+
+def format_num(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if not math.isfinite(float(value)):
+        return str(float(value))
+    text = f"{float(value):.6f}".rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
+def format_delta(current: float | None, baseline: float | None) -> str:
+    if current is None or baseline is None:
+        return "-"
+    delta = float(current) - float(baseline)
+    if not math.isfinite(delta):
+        return str(delta)
+    text = f"{delta:+.6f}".rstrip("0").rstrip(".")
+    return text if text not in {"+", "-"} else f"{delta:+.1f}"
+
+
+def is_lower_better(row_name: str) -> bool:
+    return row_name in {"geometry.chamfer_l1_m", "normals.mean_angle_deg"} or row_name.startswith("timing.")
+
+
+def format_verdict(row_name: str, current: float | None, baseline: float | None) -> str:
+    if current is None or baseline is None:
+        return "-"
+    baseline = float(baseline)
+    current = float(current)
+    if not math.isfinite(current) or not math.isfinite(baseline):
+        return "-"
+    scale = abs(baseline)
+    if scale < 1e-12:
+        return "-"
+    rel_change = (baseline - current) / scale if is_lower_better(row_name) else (current - baseline) / scale
+    if abs(rel_change) < 0.01:
+        return "-"
+    strength = 3 if abs(rel_change) >= 0.2 else 2 if abs(rel_change) >= 0.1 else 1
+    return ("Y" if rel_change > 0 else "N") * strength
+
+
+def render_compare_table(title: str, row_names: list[str], current_values: dict[str, float], baseline_values: dict[str, float]) -> str:
+    if not row_names:
+        return ""
+    rows = [(name, current_values.get(name), baseline_values.get(name)) for name in row_names]
+    name_w = max(len(title), len("name"), *(len(name) for name, _, _ in rows))
+    cur_w = max(len("current"), *(len(format_num(cur)) for _, cur, _ in rows))
+    base_w = max(len("baseline"), *(len(format_num(base)) for _, _, base in rows))
+    delta_w = max(len("delta"), *(len(format_delta(cur, base)) for _, cur, base in rows))
+    verdict_w = max(len("verdict"), *(len(format_verdict(name, cur, base)) for name, cur, base in rows))
+    lines = [
+        title,
+        f"{'name'.ljust(name_w)}  {'current'.rjust(cur_w)}  {'baseline'.rjust(base_w)}  {'delta'.rjust(delta_w)}  {'verdict'.rjust(verdict_w)}",
+        f"{'-' * name_w}  {'-' * cur_w}  {'-' * base_w}  {'-' * delta_w}  {'-' * verdict_w}",
+    ]
+    for name, current, baseline in rows:
+        lines.append(
+            f"{name.ljust(name_w)}  {format_num(current).rjust(cur_w)}  {format_num(baseline).rjust(base_w)}  {format_delta(current, baseline).rjust(delta_w)}  {format_verdict(name, current, baseline).rjust(verdict_w)}"
+        )
+    return "\n".join(lines)
+
+
+def print_compare_report(current_summary: dict, current_run_dir: Path, baseline_input: str) -> None:
+    baseline_ply = resolve_ply_path(baseline_input)
+    baseline_run_dir = baseline_ply.parent
+    baseline_summary = load_json_if_exists(baseline_ply.with_name("metrics.json"))
+    if baseline_summary is None:
+        raise ValueError(f"Missing baseline metrics.json next to {baseline_ply}")
+
+    current_metrics = flatten_metric_summary(current_summary)
+    baseline_metrics = flatten_metric_summary(baseline_summary)
+    current_timing = flatten_timing_summary(load_json_if_exists(current_run_dir / TIMING_PATH))
+    baseline_timing = flatten_timing_summary(load_json_if_exists(baseline_run_dir / TIMING_PATH))
+    current_stats = load_json_if_exists(current_run_dir / STATS_PATH) or {}
+    baseline_stats = load_json_if_exists(baseline_run_dir / STATS_PATH) or {}
+
+    metric_rows = list(current_metrics)
+    timing_rows = [name for name, _ in TIMING_ROW_ORDER if name in current_timing or name in baseline_timing]
+
+    print()
+    print(f"compare: {current_run_dir}")
+    print(f"baseline: {baseline_run_dir}")
+    if current_stats or baseline_stats:
+        print(
+            "rgb_normal_point_fusion: "
+            f"current={current_stats.get('fuse_rgb_normals_points', 'unknown')} "
+            f"baseline={baseline_stats.get('fuse_rgb_normals_points', 'unknown')}"
+        )
+        print(
+            "clip_feature_fusion: "
+            f"current={current_stats.get('fuse_clip_features', 'unknown')} "
+            f"baseline={baseline_stats.get('fuse_clip_features', 'unknown')}"
+        )
+    print(render_compare_table("metrics", metric_rows, current_metrics, baseline_metrics))
+    if timing_rows:
+        print()
+        print(render_compare_table("timing", timing_rows, current_timing, baseline_timing))
+
+
 def main(args: argparse.Namespace) -> None:
     ply_path = resolve_ply_path(args.input_path)
     dataset_name, scene_name = infer_scene_info_from_path(ply_path)
@@ -360,7 +524,7 @@ def main(args: argparse.Namespace) -> None:
         gt_semantic = map_gt_labels_to_eval_ids(gt["semantic_raw"], dataset_info)
         class_names = dataset_info.get("class_names_reduced", dataset_info.get("class_names"))
         pred_feature_labels, feature_diag = classify_transferred_features(
-            pred["clip_path"],
+            pred["clip_features"],
             gt_to_pred_idx,
             class_names,
             args.feature_prob_th,
@@ -414,13 +578,15 @@ def main(args: argparse.Namespace) -> None:
             },
         },
     }
-    print(json.dumps(summary, indent=2))
+    print(json.dumps(round_for_print(summary), indent=2))
 
     if args.save_json:
         out_path = ply_path.with_name("metrics.json")
         with open(out_path, "w") as f:
             json.dump(summary, f, indent=2)
         print(out_path)
+    if args.compare:
+        print_compare_report(summary, ply_path.parent, args.compare)
 
 
 if __name__ == "__main__":
@@ -431,5 +597,6 @@ if __name__ == "__main__":
     parser.add_argument("--feature_prob_th", type=float, default=DEFAULT_FEATURE_PROB_TH, help="Minimum class softmax probability before assigning background.")
     parser.add_argument("--min_component_size", type=int, default=2000)
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
+    parser.add_argument("--compare", default="", help="Optional baseline run directory or rgb_map.ply path to compare against after computing current metrics.")
     parser.add_argument("--scannet_raw_root", required=True, help="ScanNet raw scans root containing aggregation and segs files, e.g. /path/to/scannet_v2/scans.")
     main(parser.parse_args())

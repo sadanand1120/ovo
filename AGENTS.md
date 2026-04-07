@@ -9,6 +9,7 @@
 ## Build, Test, and Development Commands
 - Use `README.md` as the source of truth for environment setup, checkpoint download, ScanNet decoding, backend build steps, `run_eval.py` commands, metrics inspection, and visualization commands.
 - `git submodule update --init --recursive` fetches `ORB_SLAM3` and `segment-anything-2`.
+- if running inside a container (mostly this is what you'll be asked to do), the conda envs are generally in /opt/miniconda3.
 
 ## Coding Style & Naming Conventions
 - Use 4-space indentation, `snake_case` for functions and config keys, and `PascalCase` for classes.
@@ -20,6 +21,8 @@
 - For backend or mapping changes, run at least one small `run_eval.py` scene using the exact command patterns in `README.md`. For viewer changes, rerun `visualize_scene.py`.
 - If you touch config loading, dataset prep, or output writing, confirm `config.yaml` and `ovo_map.ckpt` appear under `data/output/<Dataset>/<experiment>/<scene>/`.
 - `vanilla` is deterministic here and is the best regression check. `orbslam` is functional but not bit-stable run to run.
+- `--use-inst-gt` is only for isolating supervision-source issues while developing the instance pipeline; use it to separate SAM-side errors from instance-tracking bugs. This is NOT to be used to cheat in any sneaky way, or to sidestep the real intent of what the code is trying to do.
+- If a long-running validation command is interrupted or a tool session aborts, verify whether the process is still running and kill it directly by PID or `pkill` before continuing. This applies especially to `docker exec ... python ...` wrappers, which may survive a client-side abort.
 
 ## Commit & Pull Request Guidelines
 - Recent commits use short, action-oriented subjects such as `Flatten config layout`.
