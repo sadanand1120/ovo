@@ -58,10 +58,6 @@ def load_ply_vertices(ply_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarra
     return points, colors, labels
 
 
-def resolve_default_scannet_raw_root() -> Path:
-    return Path(__file__).resolve().parents[2] / "dataset" / "scannet_v2" / "scans"
-
-
 def resolve_scannet_gt_paths(scene_name: str, raw_root: str | Path) -> tuple[Path, Path, Path]:
     scene_input = INPUT_DIR / "ScanNet" / scene_name
     scan_root = Path(raw_root) / scene_name
@@ -248,7 +244,13 @@ def classify_transferred_features(
 
     pred_labels = np.empty(gt_to_pred_idx.shape[0], dtype=np.int32)
     max_probs = np.empty(gt_to_pred_idx.shape[0], dtype=np.float32)
-    for start in tqdm(range(0, gt_to_pred_idx.shape[0], chunk_size), desc="Feature semantics", unit="chunk"):
+    for start in tqdm(
+        range(0, gt_to_pred_idx.shape[0], chunk_size),
+        desc="semantic",
+        unit="chunk",
+        leave=False,
+        dynamic_ncols=True,
+    ):
         end = min(start + chunk_size, gt_to_pred_idx.shape[0])
         chunk_idx = gt_to_pred_idx[start:end]
         chunk = torch.from_numpy(np.array(features_mm[chunk_idx], copy=True)).float()
@@ -333,45 +335,61 @@ def main(args: argparse.Namespace) -> None:
     if dataset_name != "scannet":
         raise NotImplementedError("get_metrics_map.py currently supports ScanNet only.")
 
-    raw_root = Path(args.scannet_raw_root) if args.scannet_raw_root else resolve_default_scannet_raw_root()
-    dataset_info = load_dataset_info(dataset_name)
-    gt = load_scannet_gt(scene_name, raw_root)
-    pred = load_pred_map(ply_path)
+    raw_root = Path(args.scannet_raw_root)
+    progress = tqdm(total=6, desc=scene_name, unit="stage", dynamic_ncols=True)
+    try:
+        progress.set_postfix_str("load gt", refresh=True)
+        dataset_info = load_dataset_info(dataset_name)
+        gt = load_scannet_gt(scene_name, raw_root)
+        progress.update()
 
-    assoc = compute_nn_associations(gt["points"], pred["points"])
-    gt_to_pred_idx = assoc["gt_to_pred_idx"]
-    gt_to_pred_d = assoc["gt_to_pred_d"]
-    coverage = float((gt_to_pred_d <= args.match_distance_th).mean())
+        progress.set_postfix_str("load map", refresh=True)
+        pred = load_pred_map(ply_path)
+        progress.update()
 
-    transferred_rgb = pred["colors"][gt_to_pred_idx]
-    transferred_normals = pred["normals"][gt_to_pred_idx]
+        progress.set_postfix_str("nn assoc", refresh=True)
+        assoc = compute_nn_associations(gt["points"], pred["points"])
+        gt_to_pred_idx = assoc["gt_to_pred_idx"]
+        gt_to_pred_d = assoc["gt_to_pred_d"]
+        coverage = float((gt_to_pred_d <= args.match_distance_th).mean())
+        transferred_rgb = pred["colors"][gt_to_pred_idx]
+        transferred_normals = pred["normals"][gt_to_pred_idx]
+        progress.update()
 
-    gt_semantic = map_gt_labels_to_eval_ids(gt["semantic_raw"], dataset_info)
-    class_names = dataset_info.get("class_names_reduced", dataset_info.get("class_names"))
-    pred_feature_labels, feature_diag = classify_transferred_features(
-        pred["clip_path"],
-        gt_to_pred_idx,
-        class_names,
-        args.feature_prob_th,
-        args.chunk_size,
-    )
-    feature_conf = build_confusion(gt_semantic, pred_feature_labels, dataset_info["num_classes"], dataset_info.get("ignore", []))
-    feature_metrics = confusion_to_metrics(feature_conf, dataset_info)
-    feature_metrics = {key: feature_metrics[key] for key in ("mIoU", "mAcc")}
+        progress.set_postfix_str("semantic", refresh=True)
+        gt_semantic = map_gt_labels_to_eval_ids(gt["semantic_raw"], dataset_info)
+        class_names = dataset_info.get("class_names_reduced", dataset_info.get("class_names"))
+        pred_feature_labels, feature_diag = classify_transferred_features(
+            pred["clip_path"],
+            gt_to_pred_idx,
+            class_names,
+            args.feature_prob_th,
+            args.chunk_size,
+        )
+        feature_conf = build_confusion(gt_semantic, pred_feature_labels, dataset_info["num_classes"], dataset_info.get("ignore", []))
+        feature_metrics = confusion_to_metrics(feature_conf, dataset_info)
+        feature_metrics = {key: feature_metrics[key] for key in ("mIoU", "mAcc")}
+        progress.update()
 
-    from visualize_rgb_map import resolve_instance_labels
+        progress.set_postfix_str("instances", refresh=True)
+        from visualize_rgb_map import resolve_instance_labels
 
-    pred_instance_labels = resolve_instance_labels(
-        ply_path.parent,
-        pred["points"].shape[0],
-        args.min_component_size,
-    )[gt_to_pred_idx]
-    instance_metrics, instance_diag = compute_instance_metrics(gt["instance_labels"], pred_instance_labels)
+        pred_instance_labels = resolve_instance_labels(
+            ply_path.parent,
+            pred["points"].shape[0],
+            args.min_component_size,
+        )[gt_to_pred_idx]
+        instance_metrics, instance_diag = compute_instance_metrics(gt["instance_labels"], pred_instance_labels)
+        progress.update()
 
-    geometry_metrics, geometry_diag = compute_geometry_metrics(assoc)
-    rgb_metrics = compute_rgb_metrics(gt["colors"], transferred_rgb)
-    normal_metrics = compute_normal_metrics(gt["normals"], transferred_normals)
-    geometry_metrics["coverage"] = coverage
+        progress.set_postfix_str("summary", refresh=True)
+        geometry_metrics, geometry_diag = compute_geometry_metrics(assoc)
+        rgb_metrics = compute_rgb_metrics(gt["colors"], transferred_rgb)
+        normal_metrics = compute_normal_metrics(gt["normals"], transferred_normals)
+        geometry_metrics["coverage"] = coverage
+        progress.update()
+    finally:
+        progress.close()
 
     summary = {
         "metrics": {
@@ -384,6 +402,7 @@ def main(args: argparse.Namespace) -> None:
         "diagnostics": {
             "dataset_name": canonical_dataset_name(dataset_name),
             "scene_name": scene_name,
+            "scannet_raw_root": str(raw_root.resolve()),
             "n_pred_points": int(pred["points"].shape[0]),
             "n_gt_vertices": int(gt["points"].shape[0]),
             "match_distance_th_m": float(args.match_distance_th),
@@ -412,5 +431,5 @@ if __name__ == "__main__":
     parser.add_argument("--feature_prob_th", type=float, default=DEFAULT_FEATURE_PROB_TH, help="Minimum class softmax probability before assigning background.")
     parser.add_argument("--min_component_size", type=int, default=2000)
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
-    parser.add_argument("--scannet_raw_root", default="", help="Optional ScanNet raw scans root; defaults to the repo-adjacent dataset path.")
+    parser.add_argument("--scannet_raw_root", required=True, help="ScanNet raw scans root containing aggregation and segs files, e.g. /path/to/scannet_v2/scans.")
     main(parser.parse_args())

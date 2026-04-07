@@ -312,7 +312,8 @@ done
 For the RGB+normal+CLIP+instance map path:
 
 ```bash
-python get_metrics_map.py data/output/rgb_maps/ScanNet/scene0011_00 --save_json
+python get_metrics_map.py data/output/rgb_maps/ScanNet/scene0011_00 \
+  --scannet_raw_root /path/to/scannet_v2/scans --save_json
 ```
 
 `get_metrics_map.py` writes `metrics.json` with these metrics:
