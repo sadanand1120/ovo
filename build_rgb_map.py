@@ -14,7 +14,6 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from ovo import geometry_utils, io_utils
-from ovo.clip_feature_store import CLIP_FEATURE_FILE, CLIP_FEATURE_SHARD_DIR
 from ovo.datasets import get_dataset
 
 
@@ -23,6 +22,7 @@ CONFIG_DIR = Path("configs")
 INPUT_DIR = Path("data/input")
 OUTPUT_DIR = Path("data/output/rgb_maps")
 TIMING_PATH = "timing.json"
+CLIP_FEATURE_FILE = "clip_feats.npy"
 DEFAULT_MAP_EVERY = 8
 DEFAULT_DOWNSCALE_RES = 2
 DEFAULT_K_POOLING = 1
@@ -335,8 +335,6 @@ class RGBMapper:
         dataset_name: str,
         scene_name: str,
         use_inst_gt: bool,
-        fuse_rgb_normals_points: bool = False,
-        fuse_clip_features: bool = False,
     ) -> None:
         self.device = device
         self.cam_intrinsics = torch.tensor(intrinsics.astype(np.float32), device=device)
@@ -345,8 +343,6 @@ class RGBMapper:
         self.max_frame_points = as_int(max_frame_points)
         self.match_distance_th = float(match_distance_th)
         self.clip_extractor = DenseCLIPExtractor(device)
-        self.fuse_rgb_normals_points = bool(fuse_rgb_normals_points)
-        self.fuse_clip_features = bool(fuse_clip_features)
         self.use_inst_gt = bool(use_inst_gt)
         self.mask_extractor = GTInstanceMaskExtractor(dataset_name, scene_name) if self.use_inst_gt else SAMMaskExtractor(device)
         self.instance_tracker = OnlineInstanceTracker(
@@ -360,10 +356,9 @@ class RGBMapper:
         self.points = torch.empty((0, 3), device=device)
         self.colors = torch.empty((0, 3), device=device, dtype=torch.uint8)
         self.normals = torch.empty((0, 3), device=device)
-        self.point_sum = torch.empty((0, 3), device=device) if self.fuse_rgb_normals_points else None
-        self.color_sum = torch.empty((0, 3), device=device) if self.fuse_rgb_normals_points else None
-        self.normal_sum = torch.empty((0, 3), device=device) if self.fuse_rgb_normals_points else None
-        self.obs_count = torch.empty((0,), device=device) if self.fuse_rgb_normals_points else None
+        self.color_sum = torch.empty((0, 3), device=device)
+        self.normal_sum = torch.empty((0, 3), device=device)
+        self.obs_count = torch.empty((0,), device=device)
         self.feature_tmpdir = Path(tempfile.mkdtemp(prefix="rgb_map_feats_"))
         self.feature_shards = []
         self.feature_shard_starts = []
@@ -384,74 +379,26 @@ class RGBMapper:
         self.points = torch.vstack((self.points, points))
         self.colors = torch.vstack((self.colors, colors))
         self.normals = torch.vstack((self.normals, normals))
-        if self.fuse_rgb_normals_points:
-            self.point_sum = torch.vstack((self.point_sum, points))
-            self.color_sum = torch.vstack((self.color_sum, colors.float()))
-            self.normal_sum = torch.vstack((self.normal_sum, normals.float()))
-            self.obs_count = torch.cat((self.obs_count, torch.ones((points.shape[0],), device=self.device)))
+        self.color_sum = torch.vstack((self.color_sum, colors.float()))
+        self.normal_sum = torch.vstack((self.normal_sum, normals.float()))
+        self.obs_count = torch.cat((self.obs_count, torch.ones((points.shape[0],), device=self.device)))
         shard_path = self.feature_tmpdir / f"{len(self.feature_shards):06d}.npy"
         np.save(shard_path, torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0).cpu().numpy().astype(np.float16, copy=False))
         self.feature_shards.append(shard_path)
         self.n_features += int(features.shape[0])
 
-    def _update_feature_shards(
-        self,
-        point_ids: torch.Tensor,
-        frame_clip_mean: torch.Tensor,
-        counts_after: torch.Tensor,
-        frame_counts: torch.Tensor,
-    ) -> None:
+    def _update_observed_points(self, point_ids: torch.Tensor, colors: torch.Tensor, normals: torch.Tensor) -> None:
         if point_ids.numel() == 0:
-            return
-        ids_np = point_ids.detach().cpu().numpy().astype(np.int64, copy=False)
-        counts_after_np = counts_after.detach().cpu().numpy().astype(np.float32, copy=False)
-        frame_counts_np = frame_counts.detach().cpu().numpy().astype(np.float32, copy=False)
-        means_np = frame_clip_mean.detach().cpu().numpy().astype(np.float32, copy=False)
-        shard_starts = np.asarray(self.feature_shard_starts, dtype=np.int64)
-        shard_idx = np.searchsorted(shard_starts, ids_np, side="right") - 1
-        for sid in np.unique(shard_idx):
-            shard_mask = shard_idx == sid
-            shard = np.load(self.feature_shards[int(sid)], mmap_mode="r+")
-            local_ids = ids_np[shard_mask] - shard_starts[int(sid)]
-            old = np.asarray(shard[local_ids], dtype=np.float32)
-            old_counts = counts_after_np[shard_mask] - frame_counts_np[shard_mask]
-            merged = (old * old_counts[:, None] + means_np[shard_mask] * frame_counts_np[shard_mask][:, None]) / counts_after_np[shard_mask][:, None]
-            np.nan_to_num(merged, copy=False)
-            shard[local_ids] = merged.astype(np.float16, copy=False)
-
-    def _update_observed_points(
-        self,
-        point_ids: torch.Tensor,
-        points: torch.Tensor,
-        colors: torch.Tensor,
-        normals: torch.Tensor,
-        clip_features: torch.Tensor | None = None,
-    ) -> None:
-        if point_ids.numel() == 0:
-            return
-        if not self.fuse_rgb_normals_points:
-            if clip_features is not None:
-                raise ValueError("--fuse-clip-features requires --fuse-rgb-normals-points.")
             return
         point_ids = point_ids.long()
         unique_ids, inverse = torch.unique(point_ids, return_inverse=True)
-        self.point_sum.index_add_(0, point_ids, points)
         self.color_sum.index_add_(0, point_ids, colors.float())
         self.normal_sum.index_add_(0, point_ids, normals.float())
         self.obs_count.index_add_(0, point_ids, torch.ones((point_ids.shape[0],), device=self.device))
         counts = self.obs_count[unique_ids].unsqueeze(1)
-        self.points[unique_ids] = self.point_sum[unique_ids] / counts
         self.colors[unique_ids] = torch.round(self.color_sum[unique_ids] / counts).clamp_(0.0, 255.0).to(torch.uint8)
         mean_normals = self.normal_sum[unique_ids] / counts
         self.normals[unique_ids] = mean_normals / torch.linalg.norm(mean_normals, dim=1, keepdim=True).clamp_min(1e-8)
-        if clip_features is None:
-            return
-        clip_features = torch.nan_to_num(clip_features, nan=0.0, posinf=0.0, neginf=0.0)
-        frame_counts = torch.bincount(inverse, minlength=unique_ids.shape[0]).float()
-        frame_clip_sum = torch.zeros((unique_ids.shape[0], clip_features.shape[1]), device=self.device)
-        frame_clip_sum.index_add_(0, inverse, clip_features.float())
-        frame_clip_mean = frame_clip_sum / frame_counts.unsqueeze(1).clamp_min(1.0)
-        self._update_feature_shards(unique_ids, frame_clip_mean, counts.squeeze(1), frame_counts)
 
     def add_frame(self, frame_data) -> None:
         frame_id, image_np, depth_np, c2w_np = frame_data[:4]
@@ -497,27 +444,14 @@ class RGBMapper:
         instance_labels_ds = self.downscale(instance_labels_full)
         row_ids, col_ids = torch.meshgrid(torch.arange(depth.shape[0], device=self.device), torch.arange(depth.shape[1], device=self.device), indexing="ij")
         normals_cam, normal_valid = compute_normals_from_depth(x, y, depth, self.cam_intrinsics)
-        visible_existing = (point_ids_ds >= 0) & normal_valid & (self.fuse_rgb_normals_points or self.fuse_clip_features)
-        dense_clip = None
+        visible_existing = (point_ids_ds >= 0) & normal_valid
         if visible_existing.any():
             visible_ids = point_ids_ds[visible_existing]
-            visible_x = x[visible_existing]
-            visible_y = y[visible_existing]
-            visible_depth = depth[visible_existing]
             visible_colors = image[visible_existing].reshape(-1, 3)
             visible_normals = normals_cam[visible_existing].reshape(-1, 3)
-            visible_x_3d = (visible_x - self.cam_intrinsics[0, 2]) * visible_depth / self.cam_intrinsics[0, 0]
-            visible_y_3d = (visible_y - self.cam_intrinsics[1, 2]) * visible_depth / self.cam_intrinsics[1, 1]
-            visible_points = torch.stack((visible_x_3d, visible_y_3d, visible_depth, torch.ones_like(visible_depth)), dim=1)
-            visible_points = torch.einsum("ij,mj->mi", c2w, visible_points)[:, :3]
             visible_normals = torch.einsum("ij,mj->mi", c2w[:3, :3], visible_normals)
             visible_normals = visible_normals / torch.linalg.norm(visible_normals, dim=1, keepdim=True).clamp_min(1e-8)
-            if self.fuse_clip_features:
-                dense_clip = self.clip_extractor.extract_dense(full_image)
-                visible_clip = dense_clip[visible_y, visible_x].half()
-                self._update_observed_points(visible_ids, visible_points, visible_colors, visible_normals, visible_clip)
-            else:
-                self._update_observed_points(visible_ids, visible_points, visible_colors, visible_normals)
+            self._update_observed_points(visible_ids, visible_colors, visible_normals)
         mask = mask & normal_valid
 
         if mask.any():
@@ -535,8 +469,7 @@ class RGBMapper:
                 depth_keep, colors = depth_keep[keep], colors[keep]
                 normals_cam = normals_cam[keep]
 
-            if dense_clip is None:
-                dense_clip = self.clip_extractor.extract_dense(full_image)
+            dense_clip = self.clip_extractor.extract_dense(full_image)
             features = dense_clip[y_keep, x_keep].half()
             x_3d = (x_keep - self.cam_intrinsics[0, 2]) * depth_keep / self.cam_intrinsics[0, 0]
             y_3d = (y_keep - self.cam_intrinsics[1, 2]) * depth_keep / self.cam_intrinsics[1, 1]
@@ -585,7 +518,6 @@ class RGBMapper:
                 clip_feats[offset:next_offset] = shard
                 offset = next_offset
             del clip_feats
-            shutil.rmtree(output_dir / CLIP_FEATURE_SHARD_DIR, ignore_errors=True)
             timings["store_clip_sec"] = time.perf_counter() - stage_start
             progress.update()
 
@@ -603,8 +535,8 @@ class RGBMapper:
                 "instance_label_path": "instance_labels.npy",
                 "clip_feature_path": CLIP_FEATURE_FILE,
                 "clip_feature_storage": "npy",
-                "fuse_rgb_normals_points": self.fuse_rgb_normals_points,
-                "fuse_clip_features": self.fuse_clip_features,
+                "rgb_normal_point_fusion": True,
+                "clip_feature_fusion": False,
                 "instance_match_th": DEFAULT_INSTANCE_MATCH_TH,
                 "instance_new_th": DEFAULT_INSTANCE_NEW_TH,
                 "instance_dominant_frac_th": DEFAULT_INSTANCE_DOMINANT_FRAC_TH,
@@ -632,8 +564,6 @@ class RGBMapper:
 
 
 def main(args):
-    if args.fuse_clip_features and not args.fuse_rgb_normals_points:
-        raise ValueError("--fuse-clip-features requires --fuse-rgb-normals-points.")
     run_start = time.perf_counter()
     dataset_name = args.dataset_name.lower()
     output_dir = Path(args.output_root) / canonical_dataset_name(dataset_name) / args.scene_name
@@ -652,8 +582,6 @@ def main(args):
         dataset_name=dataset_name,
         scene_name=args.scene_name,
         use_inst_gt=args.use_inst_gt,
-        fuse_rgb_normals_points=args.fuse_rgb_normals_points,
-        fuse_clip_features=args.fuse_clip_features,
     )
 
     progress = tqdm(range(len(dataset)), desc=args.scene_name, unit="frame")
@@ -686,8 +614,8 @@ def main(args):
             "clip_feature_path": CLIP_FEATURE_FILE,
             "clip_feature_bytes": int(mapper.points.shape[0]) * mapper.clip_extractor.feature_dim * 2,
             "clip_feature_gib": int(mapper.points.shape[0]) * mapper.clip_extractor.feature_dim * 2 / 1024**3,
-            "fuse_rgb_normals_points": mapper.fuse_rgb_normals_points,
-            "fuse_clip_features": mapper.fuse_clip_features,
+            "rgb_normal_point_fusion": True,
+            "clip_feature_fusion": False,
         },
     )
     timing_summary = {
@@ -714,6 +642,4 @@ if __name__ == "__main__":
     parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
     parser.add_argument("--use-inst-gt", action="store_true", help="Use decoded ScanNet instance-filt masks instead of SAM for instance evidence.")
-    parser.add_argument("--fuse-rgb-normals-points", action="store_true", help="Fuse geometry, RGB, and normals into already-observed points. Disabled by default.")
-    parser.add_argument("--fuse-clip-features", action="store_true", help="Fuse CLIP features into already-observed points. Disabled by default because it slows mapping substantially.")
     main(parser.parse_args())

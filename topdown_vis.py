@@ -7,8 +7,8 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from ovo.clip_feature_store import ClipFeatureStore
 from build_rgb_map import (
+    CLIP_FEATURE_FILE,
     CLIP_LOAD_SIZE,
     CLIP_MODEL_NAME,
     CLIP_PRETRAINED,
@@ -289,7 +289,7 @@ def main(args: argparse.Namespace) -> None:
     normal_colors = np.clip((mapper.normals.cpu().numpy() + 1.0) * 127.5, 0.0, 255.0).astype(np.uint8)
     feat_colors = (
         apply_pca_colormap_chunked(
-            ClipFeatureStore(output_dir),
+            np.load(output_dir / CLIP_FEATURE_FILE, mmap_mode="r"),
             args.pca_sample_size,
             args.chunk_size,
         )

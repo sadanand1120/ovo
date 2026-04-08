@@ -12,7 +12,6 @@ from scipy.spatial import cKDTree
 import torch
 from tqdm.auto import tqdm
 
-from ovo.clip_feature_store import ClipFeatureStore
 from ovo import eval_utils, io_utils
 
 
@@ -21,6 +20,7 @@ CONFIG_DIR = Path("configs")
 INPUT_DIR = Path("data/input")
 TIMING_PATH = "timing.json"
 STATS_PATH = "stats.json"
+CLIP_FEATURE_FILE = "clip_feats.npy"
 CLIP_MODEL_NAME = "ViT-L-14-336-quickgelu"
 CLIP_PRETRAINED = "openai"
 FEATURE_TEXT_TEMPLATE = "This is a photo of a {}"
@@ -129,6 +129,9 @@ def load_pred_map(ply_path: Path) -> dict:
         raise ValueError(f"Empty point cloud: {ply_path}")
     if normals.shape[0] != points.shape[0]:
         raise ValueError(f"{ply_path} has no stored normals. Rebuild the map with the current build_rgb_map.py.")
+    clip_path = ply_path.with_name(CLIP_FEATURE_FILE)
+    if not clip_path.exists():
+        raise ValueError(f"Missing CLIP features: {clip_path}")
     instance_label_path = ply_path.with_name("instance_labels.npy")
     if not instance_label_path.exists():
         raise ValueError(f"Missing instance labels for {ply_path.parent}")
@@ -136,7 +139,7 @@ def load_pred_map(ply_path: Path) -> dict:
         "points": points,
         "colors": colors,
         "normals": normals,
-        "clip_features": ClipFeatureStore(ply_path.parent),
+        "clip_features": np.load(clip_path, mmap_mode="r"),
     }
 
 
@@ -252,7 +255,7 @@ def encode_class_texts(class_names: list[str], device: str) -> torch.Tensor:
 
 
 def classify_transferred_features(
-    clip_features: ClipFeatureStore,
+    clip_features: np.ndarray,
     gt_to_pred_idx: np.ndarray,
     class_names: list[str],
     feature_prob_th: float,
@@ -478,13 +481,13 @@ def print_compare_report(current_summary: dict, current_run_dir: Path, baseline_
     if current_stats or baseline_stats:
         print(
             "rgb_normal_point_fusion: "
-            f"current={current_stats.get('fuse_rgb_normals_points', 'unknown')} "
-            f"baseline={baseline_stats.get('fuse_rgb_normals_points', 'unknown')}"
+            f"current={current_stats.get('rgb_normal_point_fusion', 'unknown')} "
+            f"baseline={baseline_stats.get('rgb_normal_point_fusion', 'unknown')}"
         )
         print(
             "clip_feature_fusion: "
-            f"current={current_stats.get('fuse_clip_features', 'unknown')} "
-            f"baseline={baseline_stats.get('fuse_clip_features', 'unknown')}"
+            f"current={current_stats.get('clip_feature_fusion', 'unknown')} "
+            f"baseline={baseline_stats.get('clip_feature_fusion', 'unknown')}"
         )
     print(render_compare_table("metrics", metric_rows, current_metrics, baseline_metrics))
     if timing_rows:

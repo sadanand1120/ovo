@@ -8,10 +8,9 @@ import open_clip
 import torch
 from tqdm.auto import tqdm
 
-from ovo.clip_feature_store import ClipFeatureStore
-
 CLIP_MODEL_NAME = "ViT-L-14-336-quickgelu"
 CLIP_PRETRAINED = "openai"
+CLIP_FEATURE_FILE = "clip_feats.npy"
 DEFAULT_PCA_SAMPLE_SIZE = 100_000
 DEFAULT_CHUNK_SIZE = 200_000
 DEFAULT_POINT_SIZE = 1.0
@@ -49,12 +48,12 @@ def show_point_cloud(pcd: o3d.geometry.PointCloud, point_size: float, view_path:
     vis.destroy_window()
 
 
-def load_feature_chunk(features: ClipFeatureStore, start: int, end: int) -> torch.Tensor:
+def load_feature_chunk(features: np.ndarray, start: int, end: int) -> torch.Tensor:
     chunk = torch.from_numpy(np.array(features[start:end], copy=True)).float()
     return torch.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def fit_pca_projection(features: ClipFeatureStore, sample_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fit_pca_projection(features: np.ndarray, sample_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     n_points = features.shape[0]
     sample_size = min(sample_size, n_points)
     sample_idx = np.random.default_rng(0).choice(n_points, size=sample_size, replace=False)
@@ -69,7 +68,7 @@ def fit_pca_projection(features: ClipFeatureStore, sample_size: int) -> tuple[to
     return mean, proj_v, low_rank_min, low_rank_max
 
 
-def apply_pca_colormap_chunked(features: ClipFeatureStore, sample_size: int, chunk_size: int) -> np.ndarray:
+def apply_pca_colormap_chunked(features: np.ndarray, sample_size: int, chunk_size: int) -> np.ndarray:
     mean, proj_v, low_rank_min, low_rank_max = fit_pca_projection(features, sample_size)
     denom = (low_rank_max - low_rank_min).clamp_min(1e-6)
     colors = np.empty((features.shape[0], 3), dtype=np.float32)
@@ -120,7 +119,7 @@ def parse_texts(raw: str | None) -> list[str]:
 
 
 def compute_similarity_scores_chunked(
-    features: ClipFeatureStore,
+    features: np.ndarray,
     pos_embed: torch.Tensor,
     neg_embed: torch.Tensor | None,
     softmax_temp: float,
@@ -192,7 +191,7 @@ def main(args):
             raise ValueError("Point cloud has no normals.")
         pcd.colors = o3d.utility.Vector3dVector(((normals + 1.0) * 0.5).clip(0.0, 1.0))
     elif args.mode == "feat":
-        feats = ClipFeatureStore(ply_path.parent)
+        feats = np.load(ply_path.with_name(CLIP_FEATURE_FILE), mmap_mode="r")
         colors = apply_pca_colormap_chunked(feats, args.pca_sample_size, args.chunk_size)
         pcd.colors = o3d.utility.Vector3dVector(colors)
     elif args.mode == "feature-similarity":
@@ -200,7 +199,7 @@ def main(args):
         if not positives:
             raise ValueError("--positive is required for mode=feature-similarity")
         negatives = parse_texts(args.negative)
-        feats = ClipFeatureStore(ply_path.parent)
+        feats = np.load(ply_path.with_name(CLIP_FEATURE_FILE), mmap_mode="r")
         device = "cuda" if torch.cuda.is_available() else "cpu"
         pos_embed, neg_embed = encode_text_queries(device, positives, negatives)
         scores = torch.from_numpy(
