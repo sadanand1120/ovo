@@ -28,117 +28,19 @@ from get_metrics_map import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_FEATURE_PROB_TH,
     build_confusion,
+    classify_instance_features_ovo_style,
     confusion_to_metrics,
-    encode_class_texts,
     load_dataset_info,
     load_pred_map,
     load_scannet_gt,
     map_gt_labels_to_eval_ids,
     round_for_print,
+    transfer_semantic_labels_ovo_style,
 )
-from ovo import eval_utils
 from visualize_rgb_map import resolve_instance_labels
 
 
 OUTPUT_DIR = Path("data/output/ovo_style_eval")
-FEATURE_TEXT_TEMPLATE = "This is a photo of a {}"
-FEATURE_SOFTMAX_TEMP = 0.01
-
-
-def classify_instance_features_ovo_style(
-    clip_features: np.ndarray,
-    pred_instance_labels: np.ndarray,
-    class_names: list[str],
-    feature_prob_th: float,
-    chunk_size: int,
-) -> tuple[np.ndarray, dict]:
-    valid = pred_instance_labels >= 0
-    if not valid.any():
-        return np.empty((0,), dtype=np.int32), {
-            "num_instances": 0,
-            "mean_points_per_instance": 0.0,
-            "mean_max_prob": float("nan"),
-        }
-
-    instance_ids = pred_instance_labels[valid]
-    num_instances = int(instance_ids.max()) + 1
-    feat_dim = clip_features.shape[1]
-    feature_sum = np.zeros((num_instances, feat_dim), dtype=np.float32)
-    feature_count = np.zeros((num_instances,), dtype=np.int64)
-
-    for start in tqdm(
-        range(0, pred_instance_labels.shape[0], chunk_size),
-        desc="instance feature agg",
-        unit="chunk",
-        leave=False,
-        dynamic_ncols=True,
-    ):
-        end = min(start + chunk_size, pred_instance_labels.shape[0])
-        labels_chunk = pred_instance_labels[start:end]
-        valid_chunk = labels_chunk >= 0
-        if not valid_chunk.any():
-            continue
-        feats_chunk = np.array(clip_features[start:end], copy=True, dtype=np.float32)
-        np.nan_to_num(feats_chunk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-        np.add.at(feature_sum, labels_chunk[valid_chunk], feats_chunk[valid_chunk])
-        np.add.at(feature_count, labels_chunk[valid_chunk], 1)
-
-    keep = feature_count > 0
-    instance_ids_kept = np.flatnonzero(keep).astype(np.int32)
-    instance_desc = feature_sum[keep] / feature_count[keep, None].clip(min=1)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    text_embeds = encode_class_texts(class_names, device)
-    desc = torch.from_numpy(instance_desc).to(device).float()
-    desc = desc / desc.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-    logits = (desc @ text_embeds.T) / FEATURE_SOFTMAX_TEMP
-    probs = logits.softmax(dim=-1)
-    max_prob, pred_class = probs.max(dim=-1)
-    pred_class = pred_class.cpu().numpy().astype(np.int32)
-    max_prob = max_prob.cpu().numpy().astype(np.float32)
-
-    if feature_prob_th > 0 and "background" in class_names:
-        background_idx = int(class_names.index("background"))
-        pred_class[max_prob < feature_prob_th] = background_idx
-
-    full_pred_class = np.full((num_instances,), -1, dtype=np.int32)
-    full_pred_class[instance_ids_kept] = pred_class
-    diagnostics = {
-        "num_instances": int(instance_ids_kept.shape[0]),
-        "mean_points_per_instance": float(feature_count[keep].mean()),
-        "mean_max_prob": float(max_prob.mean()) if max_prob.size > 0 else float("nan"),
-    }
-    return full_pred_class, diagnostics
-
-
-def transfer_semantic_labels_ovo_style(
-    pred_points: np.ndarray,
-    pred_instance_labels: np.ndarray,
-    instance_classes: np.ndarray,
-    gt_points: np.ndarray,
-) -> tuple[np.ndarray, dict]:
-    valid = pred_instance_labels >= 0
-    if not valid.any():
-        return np.full((gt_points.shape[0],), -1, dtype=np.int32), {
-            "matched_instance_count": 0,
-            "assigned_gt_vertices": 0,
-        }
-
-    mesh_instance_labels, _, matched_instance_ids = eval_utils.match_labels_to_vtx(
-        torch.from_numpy(pred_instance_labels[valid].astype(np.int64)),
-        torch.from_numpy(pred_points[valid].astype(np.float32)),
-        torch.from_numpy(gt_points.astype(np.float32)),
-        filter_unasigned=True,
-        tree="kd",
-        verbose=False,
-    )
-    mesh_instance_labels = mesh_instance_labels.cpu().numpy().astype(np.int32, copy=False)
-    mesh_semantic_labels = instance_classes[mesh_instance_labels]
-    diagnostics = {
-        "matched_instance_count": int(matched_instance_ids.shape[0]),
-        "assigned_gt_vertices": int(mesh_semantic_labels.shape[0]),
-    }
-    return mesh_semantic_labels, diagnostics
 
 
 def build_scene(scene_name: str, args: argparse.Namespace) -> tuple[Path, dict]:
