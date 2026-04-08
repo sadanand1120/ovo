@@ -23,11 +23,12 @@ STATS_PATH = "stats.json"
 CLIP_FEATURE_FILE = "clip_feats.npy"
 CLIP_MODEL_NAME = "ViT-L-14-336-quickgelu"
 CLIP_PRETRAINED = "openai"
-FEATURE_TEXT_TEMPLATE = "This is a photo of a {}"
+FEATURE_TEXT_TEMPLATE = "{}"
 FEATURE_SOFTMAX_TEMP = 0.01
 DEFAULT_MATCH_DISTANCE_TH = 0.03
 DEFAULT_FEATURE_PROB_TH = 0.0
 DEFAULT_CHUNK_SIZE = 100_000
+OVO_FEATURE_AGG = "mean_probs"
 GEOM_THRESHOLDS = (0.01, 0.03, 0.05)
 INSTANCE_IOU_THRESHOLDS = (0.5,)
 METRIC_ROW_ORDER = (
@@ -255,19 +256,29 @@ def encode_class_texts(class_names: list[str], device: str) -> torch.Tensor:
     tokenizer = open_clip.get_tokenizer(CLIP_MODEL_NAME)
     phrases = [FEATURE_TEXT_TEMPLATE.format(name) for name in class_names]
     text = model.encode_text(tokenizer(phrases).to(device)).float()
+    text = text / text.norm(dim=-1, keepdim=True).clamp_min(1e-8)
     return text / text.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+
+def grouped_reduce(labels: np.ndarray, values: np.ndarray, sum_buffer: np.ndarray, count_buffer: np.ndarray) -> None:
+    order = np.argsort(labels, kind="stable")
+    labels_sorted = labels[order]
+    values_sorted = values[order]
+    starts = np.flatnonzero(np.r_[True, labels_sorted[1:] != labels_sorted[:-1]])
+    unique_labels = labels_sorted[starts]
+    sum_buffer[unique_labels] += np.add.reduceat(values_sorted, starts, axis=0)
+    count_buffer[unique_labels] += np.diff(np.r_[starts, labels_sorted.shape[0]])
 
 
 def classify_transferred_features(
     clip_features: np.ndarray,
     gt_to_pred_idx: np.ndarray,
-    class_names: list[str],
+    text_embeds: torch.Tensor,
+    background_idx: int | None,
     feature_prob_th: float,
     chunk_size: int,
 ) -> tuple[np.ndarray, dict]:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    text_embeds = encode_class_texts(class_names, device)
-    background_idx = class_names.index("background") if "background" in class_names else None
+    device = str(text_embeds.device)
     unique_pred_idx, inverse = np.unique(gt_to_pred_idx, return_inverse=True)
 
     pred_labels_unique = np.empty(unique_pred_idx.shape[0], dtype=np.int32)
@@ -309,7 +320,8 @@ def classify_transferred_features(
 def classify_instance_features_ovo_style(
     clip_features: np.ndarray,
     pred_instance_labels: np.ndarray,
-    class_names: list[str],
+    text_embeds: torch.Tensor,
+    background_idx: int | None,
     feature_prob_th: float,
     chunk_size: int,
 ) -> tuple[np.ndarray, dict]:
@@ -319,17 +331,18 @@ def classify_instance_features_ovo_style(
             "num_instances": 0,
             "mean_points_per_instance": 0.0,
             "mean_max_prob": float("nan"),
+            "agg_mode": OVO_FEATURE_AGG,
         }
 
     instance_ids = pred_instance_labels[valid]
     num_instances = int(instance_ids.max()) + 1
-    feat_dim = clip_features.shape[1]
-    feature_sum = np.zeros((num_instances, feat_dim), dtype=np.float32)
-    feature_count = np.zeros((num_instances,), dtype=np.int64)
-
+    device = str(text_embeds.device)
+    num_classes = int(text_embeds.shape[0])
+    score_sum = np.zeros((num_instances, num_classes), dtype=np.float32)
+    score_count = np.zeros((num_instances,), dtype=np.int64)
     for start in tqdm(
         range(0, pred_instance_labels.shape[0], chunk_size),
-        desc="instance feature agg",
+        desc="instance score agg",
         unit="chunk",
         leave=False,
         dynamic_ncols=True,
@@ -339,35 +352,32 @@ def classify_instance_features_ovo_style(
         valid_chunk = labels_chunk >= 0
         if not valid_chunk.any():
             continue
-        feats_chunk = np.array(clip_features[start:end], copy=True, dtype=np.float32)
-        np.nan_to_num(feats_chunk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-        np.add.at(feature_sum, labels_chunk[valid_chunk], feats_chunk[valid_chunk])
-        np.add.at(feature_count, labels_chunk[valid_chunk], 1)
+        chunk = torch.from_numpy(np.array(clip_features[start:end], copy=True)).float()
+        chunk = torch.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
+        chunk = chunk[valid_chunk].to(device)
+        chunk = chunk / chunk.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        scores = ((chunk @ text_embeds.T) / FEATURE_SOFTMAX_TEMP).softmax(dim=-1)
+        scores_np = scores.cpu().numpy().astype(np.float32, copy=False)
+        labels_valid = labels_chunk[valid_chunk]
+        grouped_reduce(labels_valid, scores_np, score_sum, score_count)
 
-    keep = feature_count > 0
+    keep = score_count > 0
     instance_ids_kept = np.flatnonzero(keep).astype(np.int32)
-    instance_desc = feature_sum[keep] / feature_count[keep, None].clip(min=1)
+    score_mean = score_sum[keep] / score_count[keep, None].clip(min=1)
+    pred_class = score_mean.argmax(axis=1).astype(np.int32, copy=False)
+    max_prob = score_mean.max(axis=1).astype(np.float32, copy=False)
+    mean_points_per_instance = float(score_count[keep].mean()) if keep.any() else 0.0
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    text_embeds = encode_class_texts(class_names, device)
-    desc = torch.from_numpy(instance_desc).to(device).float()
-    desc = desc / desc.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-    logits = (desc @ text_embeds.T) / FEATURE_SOFTMAX_TEMP
-    probs = logits.softmax(dim=-1)
-    max_prob, pred_class = probs.max(dim=-1)
-    pred_class = pred_class.cpu().numpy().astype(np.int32)
-    max_prob = max_prob.cpu().numpy().astype(np.float32)
-
-    if feature_prob_th > 0 and "background" in class_names:
-        background_idx = int(class_names.index("background"))
+    if feature_prob_th > 0 and background_idx is not None:
         pred_class[max_prob < feature_prob_th] = background_idx
 
     full_pred_class = np.full((num_instances,), -1, dtype=np.int32)
     full_pred_class[instance_ids_kept] = pred_class
     diagnostics = {
         "num_instances": int(instance_ids_kept.shape[0]),
-        "mean_points_per_instance": float(feature_count[keep].mean()),
+        "mean_points_per_instance": mean_points_per_instance,
         "mean_max_prob": float(max_prob.mean()) if max_prob.size > 0 else float("nan"),
+        "agg_mode": OVO_FEATURE_AGG,
     }
     return full_pred_class, diagnostics
 
@@ -633,10 +643,14 @@ def main(args: argparse.Namespace) -> None:
         progress.set_postfix_str("semantic", refresh=True)
         gt_semantic = map_gt_labels_to_eval_ids(gt["semantic_raw"], dataset_info)
         class_names = dataset_info.get("class_names_reduced", dataset_info.get("class_names"))
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        text_embeds = encode_class_texts(class_names, device)
+        background_idx = class_names.index("background") if "background" in class_names else None
         pred_feature_labels, feature_diag = classify_transferred_features(
             pred["clip_features"],
             gt_to_pred_idx,
-            class_names,
+            text_embeds,
+            background_idx,
             args.feature_prob_th,
             args.chunk_size,
         )
@@ -656,7 +670,8 @@ def main(args: argparse.Namespace) -> None:
         instance_classes, semantic_ovo_diag_1 = classify_instance_features_ovo_style(
             pred["clip_features"],
             pred_instance_labels,
-            class_names,
+            text_embeds,
+            background_idx,
             args.feature_prob_th,
             args.chunk_size,
         )
@@ -708,6 +723,7 @@ def main(args: argparse.Namespace) -> None:
                 **semantic_ovo_diag_1,
                 **semantic_ovo_diag_2,
             },
+            "feature_text_template": FEATURE_TEXT_TEMPLATE,
             "instance": {
                 **instance_diag,
                 "min_component_size": int(args.min_component_size),

@@ -28,8 +28,8 @@ DEFAULT_DOWNSCALE_RES = 2
 DEFAULT_K_POOLING = 1
 DEFAULT_MAX_FRAME_POINTS = 5_000_000
 DEFAULT_MATCH_DISTANCE_TH = 0.03
-DEFAULT_INSTANCE_MATCH_TH = 5
-DEFAULT_INSTANCE_NEW_TH = 150
+DEFAULT_INSTANCE_MATCH_TH = 3
+DEFAULT_INSTANCE_NEW_TH = 80
 DEFAULT_INSTANCE_DOMINANT_FRAC_TH = 0.4
 CLIP_MODEL_NAME = "ViT-L-14-336-quickgelu"
 CLIP_PRETRAINED = "openai"
@@ -411,6 +411,7 @@ class RGBMapper:
         self.downscale_res = max(1, int(downscale_res))
         self.max_frame_points = as_int(max_frame_points)
         self.match_distance_th = float(match_distance_th)
+        self.k_pooling = int(k_pooling)
         self.clip_extractor = DenseCLIPExtractor(device)
         self.use_inst_gt = bool(use_inst_gt)
         self.mask_extractor = GTInstanceMaskExtractor(dataset_name, scene_name) if self.use_inst_gt else SAMMaskExtractor(device)
@@ -718,7 +719,7 @@ def main(args):
             "device": device,
             "map_every": mapper.map_every,
             "downscale_res": args.downscale_res,
-            "k_pooling": args.k_pooling,
+            "k_pooling": mapper.k_pooling,
             "max_frame_points": mapper.max_frame_points,
             "match_distance_th": mapper.match_distance_th,
             "clip_model_name": CLIP_MODEL_NAME,

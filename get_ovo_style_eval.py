@@ -27,9 +27,12 @@ from build_rgb_map import (
 from get_metrics_map import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_FEATURE_PROB_TH,
+    FEATURE_TEXT_TEMPLATE,
+    OVO_FEATURE_AGG,
     build_confusion,
     classify_instance_features_ovo_style,
     confusion_to_metrics,
+    encode_class_texts,
     load_dataset_info,
     load_pred_map,
     load_scannet_gt,
@@ -121,17 +124,27 @@ def build_scene(scene_name: str, args: argparse.Namespace) -> tuple[Path, dict]:
     return output_dir, timing_summary
 
 
-def evaluate_scene_ovo_style(scene_name: str, run_dir: Path, raw_root: Path, dataset_info: dict, feature_prob_th: float, chunk_size: int, min_component_size: int) -> tuple[dict, np.ndarray, dict]:
+def evaluate_scene_ovo_style(
+    scene_name: str,
+    run_dir: Path,
+    raw_root: Path,
+    dataset_info: dict,
+    text_embeds: torch.Tensor,
+    background_idx: int | None,
+    feature_prob_th: float,
+    chunk_size: int,
+    min_component_size: int,
+) -> tuple[dict, np.ndarray, dict]:
     gt = load_scannet_gt(scene_name, raw_root)
     pred = load_pred_map(run_dir / "rgb_map.ply")
     pred_instance_labels = resolve_instance_labels(run_dir, pred["points"].shape[0], min_component_size)
     gt_semantic = map_gt_labels_to_eval_ids(gt["semantic_raw"], dataset_info)
-    class_names = dataset_info.get("class_names_reduced", dataset_info.get("class_names"))
 
     instance_classes, diag_1 = classify_instance_features_ovo_style(
         pred["clip_features"],
         pred_instance_labels,
-        class_names,
+        text_embeds,
+        background_idx,
         feature_prob_th,
         chunk_size,
     )
@@ -187,6 +200,10 @@ def main(args: argparse.Namespace) -> None:
     dataset_info = deepcopy(load_dataset_info(dataset_name))
     if args.ignore_background:
         dataset_info["ignore"] = dataset_info.get("ignore", []).copy() + dataset_info.get("background_reduced_ids", [])
+    class_names = dataset_info.get("class_names_reduced", dataset_info.get("class_names"))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    text_embeds = encode_class_texts(class_names, device)
+    background_idx = class_names.index("background") if "background" in class_names else None
     scenes = args.scenes or dataset_info["scenes"]
     raw_root = Path(args.scannet_raw_root)
 
@@ -201,6 +218,8 @@ def main(args: argparse.Namespace) -> None:
             run_dir,
             raw_root,
             dataset_info,
+            text_embeds,
+            background_idx,
             args.feature_prob_th,
             args.chunk_size,
             args.min_component_size,
@@ -230,6 +249,8 @@ def main(args: argparse.Namespace) -> None:
         "scenes": scenes,
         "use_inst_gt": bool(args.use_inst_gt),
         "feature_prob_th": float(args.feature_prob_th),
+        "feature_text_template": FEATURE_TEXT_TEMPLATE,
+        "ovo_feature_agg": OVO_FEATURE_AGG,
         "min_component_size": int(args.min_component_size),
         "metrics_per_scene": per_scene_rows,
         "metrics_all_5_hvs": total_metrics,
