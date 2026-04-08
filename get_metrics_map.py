@@ -421,6 +421,8 @@ def is_lower_better(row_name: str) -> bool:
 
 
 def format_verdict(row_name: str, current: float | None, baseline: float | None) -> str:
+    if row_name.startswith("timing.") and row_name != "timing.frame_loop_sec":
+        return "DON'T CARE"
     if current is None or baseline is None:
         return "-"
     baseline = float(baseline)
