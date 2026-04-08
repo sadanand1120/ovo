@@ -57,11 +57,9 @@ def match_3d_points_to_2d_pixels(depth: torch.Tensor, w2c: torch.Tensor, points_
     """
     h,w = depth.shape
     device = points_3d.device
-    n_points = points_3d.shape[0]
-    idx = torch.tensor(list(range(n_points)), device=device)
     # move 3d points to local reference
     if points_3d.shape[-1] == 3:
-        points_3d = torch.hstack([points_3d,torch.ones((n_points,1), device=device)])
+        points_3d = torch.cat((points_3d, torch.ones((points_3d.shape[0], 1), device=device, dtype=points_3d.dtype)), dim=1)
 
     local_points_3d = torch.einsum("mn,bn->bm", w2c, points_3d)
     
@@ -70,13 +68,13 @@ def match_3d_points_to_2d_pixels(depth: torch.Tensor, w2c: torch.Tensor, points_
     
     # Project 3d points to the camera frame
     points_2d = project_3d_points(forward_points_3d, intrinsics)
-    in_points_2d = points_2d # Points inside frustum already filtered
     # Mask 2d points out of camera frame
     in_plane_mask = torch.logical_and(points_2d[:,0]< w, points_2d[:,1]<h)*torch.logical_and(points_2d[:,0]>=0, points_2d[:,1]>=0) # Points inside frustum already filtered
-    in_points_2d = points_2d[in_plane_mask] # Points inside frustum already filtered
+    in_plane_ids = torch.where(in_plane_mask)[0]
+    in_points_2d = points_2d[in_plane_ids] # Points inside frustum already filtered
 
     # Compute depth of 3d points for points projected inside camera frame
-    forward_points_depth = forward_points_3d[in_plane_mask,2] # depth as z coordinate # Points inside frustum already filtered
+    forward_points_depth = forward_points_3d[in_plane_ids,2] # depth as z coordinate # Points inside frustum already filtered
 
     # Mask 3d points with distance between their depth and gt depth at the projected point bigger than a threshold 
     dist_mask = (forward_points_depth - depth[in_points_2d[:,1],in_points_2d[:,0]]).abs() < th_dist
@@ -85,7 +83,7 @@ def match_3d_points_to_2d_pixels(depth: torch.Tensor, w2c: torch.Tensor, points_
     matches = in_points_2d[dist_mask]        
 
     # propagate final mask to total 3d points list. 
-    mask = idx[in_plane_mask][dist_mask]
+    mask = in_plane_ids[dist_mask]
     return mask, matches
 
 
@@ -238,7 +236,7 @@ def points_inside_frustum_mask(points: torch.Tensor, frustum_planes: torch.Tenso
         A boolean tensor indicating whether each point lies inside the frustum.
     """
     num_pts = points.shape[0]
-    ones = torch.ones(num_pts, 1).to(points.device)
+    ones = torch.ones((num_pts, 1), device=points.device)
     plane_product = torch.cat([points, ones], axis=1) @ frustum_planes.T
     return torch.all(plane_product <= 0, axis=1)
 
@@ -260,11 +258,12 @@ def compute_frustum_point_ids(pts: torch.Tensor, frustum_corners: torch.Tensor, 
 
     min_corner, max_corner = compute_frustum_aabb(frustum_corners)
     inside_aabb_mask = points_inside_aabb_mask(pts, min_corner, max_corner)
+    candidate_ids = torch.where(inside_aabb_mask)[0]
+    if candidate_ids.numel() == 0:
+        return candidate_ids
 
     # Narrow phase
     frustum_planes = compute_camera_frustum_planes(frustum_corners)
     frustum_planes = frustum_planes.to(device)
-    inside_frustum_mask = points_inside_frustum_mask(pts[inside_aabb_mask], frustum_planes)
-
-    inside_aabb_mask[inside_aabb_mask == 1] = inside_frustum_mask
-    return torch.where(inside_aabb_mask)[0]
+    inside_frustum_mask = points_inside_frustum_mask(pts[candidate_ids], frustum_planes)
+    return candidate_ids[inside_frustum_mask]

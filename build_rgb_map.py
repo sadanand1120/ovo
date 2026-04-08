@@ -130,6 +130,17 @@ def compute_normals_from_depth(x: torch.Tensor, y: torch.Tensor, depth: torch.Te
     return normals, normal_valid
 
 
+def invert_rigid_transform(c2w: torch.Tensor) -> torch.Tensor:
+    rotation = c2w[:3, :3]
+    translation = c2w[:3, 3]
+    world_to_camera = torch.empty_like(c2w)
+    rotation_t = rotation.transpose(0, 1)
+    world_to_camera[:3, :3] = rotation_t
+    world_to_camera[:3, 3] = -(rotation_t @ translation)
+    world_to_camera[3] = c2w.new_tensor((0.0, 0.0, 0.0, 1.0))
+    return world_to_camera
+
+
 def mask_score(mask: dict, sort_mode: str) -> float:
     predicted_iou = float(mask.get("predicted_iou", 0.0))
     stability = float(mask.get("stability_score", 0.0))
@@ -258,10 +269,15 @@ class DenseCLIPExtractor:
             pretrained=CLIP_PRETRAINED,
             precision="fp32",
         )[0].eval().to(self.device)
-        visual = self.model.visual
-        patch_size = visual.patch_size
+        self.visual = self.model.visual
+        patch_size = self.visual.patch_size
         self.patch_size = int(patch_size if isinstance(patch_size, int) else patch_size[0])
-        self.feature_dim = int(visual.proj.shape[1] if visual.proj is not None else visual.ln_post.normalized_shape[0])
+        self.feature_dim = int(self.visual.proj.shape[1] if self.visual.proj is not None else self.visual.ln_post.normalized_shape[0])
+        self.pre_resblocks = tuple(self.visual.transformer.resblocks[:-1])
+        self.last_resblock = self.visual.transformer.resblocks[-1]
+        self.last_attn_dim = self.last_resblock.attn.embed_dim
+        self.last_v_weight = self.last_resblock.attn.in_proj_weight[-self.last_attn_dim :]
+        self.last_v_bias = self.last_resblock.attn.in_proj_bias[-self.last_attn_dim :]
 
     @torch.inference_mode()
     def extract_dense(self, image: torch.Tensor) -> torch.Tensor:
@@ -274,44 +290,37 @@ class DenseCLIPExtractor:
         image = ((image - mean) / std)[None]
         image = pad_to_multiple(image, self.patch_size)
 
-        visual = self.model.visual
         if self.device.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                x = visual.conv1(image)
+                x = self.visual.conv1(image)
                 x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)
-                cls = visual.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device)
+                cls = self.visual.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device)
                 x = torch.cat([cls, x], dim=1)
-                x = x + interpolate_positional_embedding(visual.positional_embedding, x, self.patch_size, image.shape[-2], image.shape[-1])
-                x = visual.ln_pre(x)
-                *layers, last_resblock = visual.transformer.resblocks
-                if layers:
-                    x = torch.nn.Sequential(*layers)(x)
-                v_weight = last_resblock.attn.in_proj_weight[-last_resblock.attn.embed_dim :]
-                v_bias = last_resblock.attn.in_proj_bias[-last_resblock.attn.embed_dim :]
-                v = F.linear(last_resblock.ln_1(x), v_weight, v_bias)
-                x = F.linear(v, last_resblock.attn.out_proj.weight, last_resblock.attn.out_proj.bias)
+                x = x + interpolate_positional_embedding(self.visual.positional_embedding, x, self.patch_size, image.shape[-2], image.shape[-1])
+                x = self.visual.ln_pre(x)
+                for block in self.pre_resblocks:
+                    x = block(x)
+                v = F.linear(self.last_resblock.ln_1(x), self.last_v_weight, self.last_v_bias)
+                x = F.linear(v, self.last_resblock.attn.out_proj.weight, self.last_resblock.attn.out_proj.bias)
                 x = x[:, 1:, :]
-                x = visual.ln_post(x)
-                if visual.proj is not None:
-                    x = x @ visual.proj
+                x = self.visual.ln_post(x)
+                if self.visual.proj is not None:
+                    x = x @ self.visual.proj
         else:
-            x = visual.conv1(image)
+            x = self.visual.conv1(image)
             x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)
-            cls = visual.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device)
+            cls = self.visual.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device)
             x = torch.cat([cls, x], dim=1)
-            x = x + interpolate_positional_embedding(visual.positional_embedding, x, self.patch_size, image.shape[-2], image.shape[-1])
-            x = visual.ln_pre(x)
-            *layers, last_resblock = visual.transformer.resblocks
-            if layers:
-                x = torch.nn.Sequential(*layers)(x)
-            v_weight = last_resblock.attn.in_proj_weight[-last_resblock.attn.embed_dim :]
-            v_bias = last_resblock.attn.in_proj_bias[-last_resblock.attn.embed_dim :]
-            v = F.linear(last_resblock.ln_1(x), v_weight, v_bias)
-            x = F.linear(v, last_resblock.attn.out_proj.weight, last_resblock.attn.out_proj.bias)
+            x = x + interpolate_positional_embedding(self.visual.positional_embedding, x, self.patch_size, image.shape[-2], image.shape[-1])
+            x = self.visual.ln_pre(x)
+            for block in self.pre_resblocks:
+                x = block(x)
+            v = F.linear(self.last_resblock.ln_1(x), self.last_v_weight, self.last_v_bias)
+            x = F.linear(v, self.last_resblock.attn.out_proj.weight, self.last_resblock.attn.out_proj.bias)
             x = x[:, 1:, :]
-            x = visual.ln_post(x)
-            if visual.proj is not None:
-                x = x @ visual.proj
+            x = self.visual.ln_post(x)
+            if self.visual.proj is not None:
+                x = x @ self.visual.proj
 
         grid_h = image.shape[-2] // self.patch_size
         grid_w = image.shape[-1] // self.patch_size
@@ -353,6 +362,7 @@ class RGBMapper:
         if k_pooling > 1 and k_pooling % 2 == 0:
             raise ValueError("k_pooling must be odd.")
 
+        self.n_points = 0
         self.points = torch.empty((0, 3), device=device)
         self.colors = torch.empty((0, 3), device=device, dtype=torch.uint8)
         self.normals = torch.empty((0, 3), device=device)
@@ -360,9 +370,14 @@ class RGBMapper:
         self.normal_sum = torch.empty((0, 3), device=device)
         self.obs_count = torch.empty((0,), device=device)
         self.feature_tmpdir = Path(tempfile.mkdtemp(prefix="rgb_map_feats_"))
-        self.feature_shards = []
-        self.feature_shard_starts = []
+        self.feature_tmp_path = self.feature_tmpdir / "clip_feats.bin"
+        self.feature_tmp_file = open(self.feature_tmp_path, "wb")
         self.n_features = 0
+        self.cached_depth_shape = None
+        self.cached_x = None
+        self.cached_y = None
+        self.cached_row_ids = None
+        self.cached_col_ids = None
 
         if k_pooling > 1:
             pooling = torch.nn.MaxPool2d(kernel_size=k_pooling, stride=1, padding=k_pooling // 2)
@@ -374,24 +389,62 @@ class RGBMapper:
     def should_map_frame(self, frame_id: int) -> bool:
         return frame_id % self.map_every == 0
 
+    def _ensure_capacity(self, min_capacity: int) -> None:
+        if min_capacity <= self.points.shape[0]:
+            return
+        new_capacity = max(min_capacity, max(1 << 18, self.points.shape[0] * 2))
+
+        def grow(buffer: torch.Tensor, *shape_tail: int) -> torch.Tensor:
+            expanded = torch.empty((new_capacity, *shape_tail), device=buffer.device, dtype=buffer.dtype)
+            if self.n_points > 0:
+                expanded[:self.n_points] = buffer[:self.n_points]
+            return expanded
+
+        self.points = grow(self.points, 3)
+        self.colors = grow(self.colors, 3)
+        self.normals = grow(self.normals, 3)
+        self.color_sum = grow(self.color_sum, 3)
+        self.normal_sum = grow(self.normal_sum, 3)
+        self.obs_count = grow(self.obs_count)
+
+    def _get_cached_grids(self, depth_shape: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.cached_depth_shape != depth_shape:
+            h, w = depth_shape
+            full_y, full_x = torch.meshgrid(torch.arange(h, device=self.device), torch.arange(w, device=self.device), indexing="ij")
+            self.cached_x = self.downscale(full_x)
+            self.cached_y = self.downscale(full_y)
+            ds_h, ds_w = self.cached_x.shape
+            self.cached_row_ids, self.cached_col_ids = torch.meshgrid(
+                torch.arange(ds_h, device=self.device),
+                torch.arange(ds_w, device=self.device),
+                indexing="ij",
+            )
+            self.cached_depth_shape = depth_shape
+        return self.cached_x, self.cached_y, self.cached_row_ids, self.cached_col_ids
+
     def _append_points(self, points: torch.Tensor, colors: torch.Tensor, normals: torch.Tensor, features: torch.Tensor) -> None:
-        self.feature_shard_starts.append(self.n_features)
-        self.points = torch.vstack((self.points, points))
-        self.colors = torch.vstack((self.colors, colors))
-        self.normals = torch.vstack((self.normals, normals))
-        self.color_sum = torch.vstack((self.color_sum, colors.float()))
-        self.normal_sum = torch.vstack((self.normal_sum, normals.float()))
-        self.obs_count = torch.cat((self.obs_count, torch.ones((points.shape[0],), device=self.device)))
-        shard_path = self.feature_tmpdir / f"{len(self.feature_shards):06d}.npy"
-        np.save(shard_path, torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0).cpu().numpy().astype(np.float16, copy=False))
-        self.feature_shards.append(shard_path)
+        start = self.n_points
+        end = start + int(points.shape[0])
+        self._ensure_capacity(end)
+        self.points[start:end] = points
+        self.colors[start:end] = colors
+        self.normals[start:end] = normals
+        self.color_sum[start:end] = colors.float()
+        self.normal_sum[start:end] = normals.float()
+        self.obs_count[start:end] = 1
+        self.n_points = end
+        feature_block = np.ascontiguousarray(
+            torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0).cpu().numpy(),
+            dtype=np.float16,
+        )
+        feature_block.tofile(self.feature_tmp_file)
         self.n_features += int(features.shape[0])
 
     def _update_observed_points(self, point_ids: torch.Tensor, colors: torch.Tensor, normals: torch.Tensor) -> None:
         if point_ids.numel() == 0:
             return
         point_ids = point_ids.long()
-        unique_ids, inverse = torch.unique(point_ids, return_inverse=True)
+        unique_ids = torch.unique(point_ids)
         self.color_sum.index_add_(0, point_ids, colors.float())
         self.normal_sum.index_add_(0, point_ids, normals.float())
         self.obs_count.index_add_(0, point_ids, torch.ones((point_ids.shape[0],), device=self.device))
@@ -410,39 +463,37 @@ class RGBMapper:
         labels_np = self.mask_extractor.extract_labels(frame_id, image_np.shape[:2]) if self.use_inst_gt else self.mask_extractor.extract_labels(image_np)
         instance_labels_full = torch.from_numpy(labels_np).to(self.device)
         c2w = torch.from_numpy(c2w_np).to(self.device)
-        depth = torch.from_numpy(depth_np.astype(np.float32)).to(self.device)
-        image = torch.from_numpy(image_np.astype(np.uint8)).to(self.device)
+        depth = torch.from_numpy(depth_np).to(self.device)
+        image = torch.from_numpy(image_np).to(self.device)
         full_image = image
         h, w = depth.shape
-        y, x = torch.meshgrid(torch.arange(h, device=self.device), torch.arange(w, device=self.device), indexing="ij")
+        x, y, row_ids, col_ids = self._get_cached_grids((h, w))
         mask = depth > 0
-        point_ids_full = torch.full((h, w), -1, dtype=torch.int64, device=self.device)
+        point_ids_full = torch.full((h, w), -1, dtype=torch.int32, device=self.device)
 
-        if self.points.shape[0] > 0:
+        if self.n_points > 0:
             frustum_corners = geometry_utils.compute_camera_frustum_corners(depth, c2w, self.cam_intrinsics)
-            frustum_mask = geometry_utils.compute_frustum_point_ids(self.points, frustum_corners, device=self.device)
+            w2c = invert_rigid_transform(c2w)
+            frustum_mask = geometry_utils.compute_frustum_point_ids(self.points[: self.n_points], frustum_corners, device=self.device)
             if frustum_mask.numel() > 0:
                 matched_ids, matches = geometry_utils.match_3d_points_to_2d_pixels(
                     depth,
-                    torch.linalg.inv(c2w),
+                    w2c,
                     self.points[frustum_mask],
                     self.cam_intrinsics,
                     self.match_distance_th,
                 )
                 if matches.numel() > 0:
-                    global_ids = frustum_mask[matched_ids]
+                    global_ids = frustum_mask[matched_ids].to(point_ids_full.dtype)
                     point_ids_full[matches[:, 1], matches[:, 0]] = global_ids
                     mask[matches[:, 1], matches[:, 0]] = False
             mask = self.pooling(mask)
 
-        x = self.downscale(x)
-        y = self.downscale(y)
         depth = self.downscale(depth)
         mask = self.downscale(mask)
         image = self.downscale(image)
         point_ids_ds = self.downscale(point_ids_full)
         instance_labels_ds = self.downscale(instance_labels_full)
-        row_ids, col_ids = torch.meshgrid(torch.arange(depth.shape[0], device=self.device), torch.arange(depth.shape[1], device=self.device), indexing="ij")
         normals_cam, normal_valid = compute_normals_from_depth(x, y, depth, self.cam_intrinsics)
         visible_existing = (point_ids_ds >= 0) & normal_valid
         if visible_existing.any():
@@ -477,8 +528,8 @@ class RGBMapper:
             points = torch.einsum("ij,mj->mi", c2w, points)[:, :3]
             normals = torch.einsum("ij,mj->mi", c2w[:3, :3], normals_cam)
             normals = normals / torch.linalg.norm(normals, dim=1, keepdim=True).clamp_min(1e-8)
-            old_n = int(self.points.shape[0])
-            new_ids = torch.arange(old_n, old_n + points.shape[0], device=self.device, dtype=torch.int64)
+            old_n = self.n_points
+            new_ids = torch.arange(old_n, old_n + points.shape[0], device=self.device, dtype=torch.int32)
             point_ids_ds[row_keep, col_keep] = new_ids
             self.instance_tracker.append_new_points(points.shape[0])
             self.instance_tracker.update(point_ids_ds, instance_labels_ds)
@@ -496,28 +547,28 @@ class RGBMapper:
             progress.set_postfix_str("write ply", refresh=True)
             stage_start = time.perf_counter()
             pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(self.points.cpu().numpy())
-            pcd.colors = o3d.utility.Vector3dVector(self.colors.cpu().numpy().astype(np.float32) / 255.0)
-            pcd.normals = o3d.utility.Vector3dVector(self.normals.cpu().numpy())
+            pcd.points = o3d.utility.Vector3dVector(self.points[: self.n_points].cpu().numpy())
+            pcd.colors = o3d.utility.Vector3dVector(self.colors[: self.n_points].cpu().numpy().astype(np.float32) / 255.0)
+            pcd.normals = o3d.utility.Vector3dVector(self.normals[: self.n_points].cpu().numpy())
             o3d.io.write_point_cloud(str(output_dir / "rgb_map.ply"), pcd)
             timings["write_ply_sec"] = time.perf_counter() - stage_start
             progress.update()
 
             progress.set_postfix_str("store clip", refresh=True)
             stage_start = time.perf_counter()
-            clip_feats = np.lib.format.open_memmap(
-                output_dir / CLIP_FEATURE_FILE,
-                mode="w+",
-                dtype=np.float16,
-                shape=(self.n_features, self.clip_extractor.feature_dim),
-            )
-            offset = 0
-            for shard_path in self.feature_shards:
-                shard = np.load(shard_path, mmap_mode="r")
-                next_offset = offset + shard.shape[0]
-                clip_feats[offset:next_offset] = shard
-                offset = next_offset
-            del clip_feats
+            self.feature_tmp_file.flush()
+            self.feature_tmp_file.close()
+            with open(output_dir / CLIP_FEATURE_FILE, "wb") as f:
+                np.lib.format.write_array_header_2_0(
+                    f,
+                    {
+                        "descr": np.lib.format.dtype_to_descr(np.dtype(np.float16)),
+                        "fortran_order": False,
+                        "shape": (self.n_features, self.clip_extractor.feature_dim),
+                    },
+                )
+                with open(self.feature_tmp_path, "rb") as src:
+                    shutil.copyfileobj(src, f, length=16 * 1024 * 1024)
             timings["store_clip_sec"] = time.perf_counter() - stage_start
             progress.update()
 
@@ -558,6 +609,8 @@ class RGBMapper:
         finally:
             progress.set_postfix_str("stats", refresh=True)
             progress.close()
+            if not self.feature_tmp_file.closed:
+                self.feature_tmp_file.close()
             shutil.rmtree(self.feature_tmpdir, ignore_errors=True)
         timings["save_total_sec"] = time.perf_counter() - save_start
         return timings
@@ -587,8 +640,10 @@ def main(args):
     progress = tqdm(range(len(dataset)), desc=args.scene_name, unit="frame")
     frame_loop_start = time.perf_counter()
     for frame_id in progress:
+        if not mapper.should_map_frame(frame_id):
+            continue
         mapper.add_frame(dataset[frame_id])
-        progress.set_postfix(points=int(mapper.points.shape[0]), refresh=False)
+        progress.set_postfix(points=mapper.n_points, refresh=False)
     frame_loop_sec = time.perf_counter() - frame_loop_start
 
     save_timings = mapper.save(
@@ -597,7 +652,7 @@ def main(args):
             "dataset_name": canonical_dataset_name(dataset_name),
             "scene_name": args.scene_name,
             "n_frames": len(dataset),
-            "n_points": int(mapper.points.shape[0]),
+            "n_points": mapper.n_points,
             "has_normals": True,
             "device": device,
             "map_every": mapper.map_every,
@@ -612,8 +667,8 @@ def main(args):
             "clip_feature_dim": mapper.clip_extractor.feature_dim,
             "clip_feature_dtype": "float16",
             "clip_feature_path": CLIP_FEATURE_FILE,
-            "clip_feature_bytes": int(mapper.points.shape[0]) * mapper.clip_extractor.feature_dim * 2,
-            "clip_feature_gib": int(mapper.points.shape[0]) * mapper.clip_extractor.feature_dim * 2 / 1024**3,
+            "clip_feature_bytes": mapper.n_points * mapper.clip_extractor.feature_dim * 2,
+            "clip_feature_gib": mapper.n_points * mapper.clip_extractor.feature_dim * 2 / 1024**3,
             "rgb_normal_point_fusion": True,
             "clip_feature_fusion": False,
         },

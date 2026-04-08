@@ -12,6 +12,11 @@ from build_rgb_map import (
     CLIP_LOAD_SIZE,
     CLIP_MODEL_NAME,
     CLIP_PRETRAINED,
+    DEFAULT_DOWNSCALE_RES,
+    DEFAULT_K_POOLING,
+    DEFAULT_MAP_EVERY,
+    DEFAULT_MATCH_DISTANCE_TH,
+    DEFAULT_MAX_FRAME_POINTS,
     RGBMapper,
     canonical_dataset_name,
     load_dataset,
@@ -247,9 +252,9 @@ def main(args: argparse.Namespace) -> None:
     progress = tqdm(range(len(dataset)), desc=scene_name, unit="frame")
     for frame_id in progress:
         frame_data = dataset[frame_id]
-        prev_n = int(mapper.points.shape[0])
+        prev_n = mapper.n_points
         mapper.add_frame(frame_data)
-        cur_n = int(mapper.points.shape[0])
+        cur_n = mapper.n_points
         progress.set_postfix(points=cur_n, refresh=False)
         if cur_n > prev_n:
             snapshot_counts.append(cur_n)
@@ -262,7 +267,7 @@ def main(args: argparse.Namespace) -> None:
             "dataset_name": canonical_dataset_name(dataset_name),
             "scene_name": scene_name,
             "n_frames": len(dataset),
-            "n_points": int(mapper.points.shape[0]),
+            "n_points": mapper.n_points,
             "has_normals": True,
             "device": mapper.device,
             "map_every": mapper.map_every,
@@ -276,17 +281,17 @@ def main(args: argparse.Namespace) -> None:
             "clip_skip_center_crop": True,
             "clip_feature_dim": mapper.clip_extractor.feature_dim,
             "clip_feature_dtype": "float16",
-            "clip_feature_path": "clip_feats.npy",
-            "clip_feature_bytes": int(mapper.points.shape[0]) * mapper.clip_extractor.feature_dim * 2,
-            "clip_feature_gib": int(mapper.points.shape[0]) * mapper.clip_extractor.feature_dim * 2 / 1024**3,
+            "clip_feature_path": CLIP_FEATURE_FILE,
+            "clip_feature_bytes": mapper.n_points * mapper.clip_extractor.feature_dim * 2,
+            "clip_feature_gib": mapper.n_points * mapper.clip_extractor.feature_dim * 2 / 1024**3,
             "snapshot_counts": snapshot_counts,
             "snapshot_frame_ids": snapshot_frame_ids,
         },
     )
 
-    points = mapper.points.cpu().numpy()
-    rgb_colors = mapper.colors.cpu().numpy()
-    normal_colors = np.clip((mapper.normals.cpu().numpy() + 1.0) * 127.5, 0.0, 255.0).astype(np.uint8)
+    points = mapper.points[: mapper.n_points].cpu().numpy()
+    rgb_colors = mapper.colors[: mapper.n_points].cpu().numpy()
+    normal_colors = np.clip((mapper.normals[: mapper.n_points].cpu().numpy() + 1.0) * 127.5, 0.0, 255.0).astype(np.uint8)
     feat_colors = (
         apply_pca_colormap_chunked(
             np.load(output_dir / CLIP_FEATURE_FILE, mmap_mode="r"),
@@ -326,11 +331,11 @@ if __name__ == "__main__":
     parser.add_argument("--output_root", default="data/output/topdown_vis")
     parser.add_argument("--load-view", required=True, help="Path to a saved view JSON dumped from visualize_rgb_map.py.")
     parser.add_argument("--frame_limit", type=int, default=None)
-    parser.add_argument("--map_every", type=int, default=8)
-    parser.add_argument("--downscale_res", type=int, default=2)
-    parser.add_argument("--k_pooling", type=int, default=1)
-    parser.add_argument("--max_frame_points", type=int, default=5_000_000)
-    parser.add_argument("--match_distance_th", type=float, default=0.03)
+    parser.add_argument("--map_every", type=int, default=DEFAULT_MAP_EVERY)
+    parser.add_argument("--downscale_res", type=int, default=DEFAULT_DOWNSCALE_RES)
+    parser.add_argument("--k_pooling", type=int, default=DEFAULT_K_POOLING)
+    parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
+    parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
     parser.add_argument("--fps", type=int, default=VIDEO_FPS)
     parser.add_argument("--dilate", type=int, default=POINT_DILATE)
     parser.add_argument("--min_component_size", type=int, default=2000)
