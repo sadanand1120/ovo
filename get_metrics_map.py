@@ -545,8 +545,9 @@ def main(args: argparse.Namespace) -> None:
             ply_path.parent,
             pred["points"].shape[0],
             args.min_component_size,
-        )[gt_to_pred_idx]
-        instance_metrics, instance_diag = compute_instance_metrics(gt["instance_labels"], pred_instance_labels)
+        )
+        transferred_instance_labels = pred_instance_labels[gt_to_pred_idx]
+        instance_metrics, instance_diag = compute_instance_metrics(gt["instance_labels"], transferred_instance_labels)
         progress.update()
 
         progress.set_postfix_str("summary", refresh=True)

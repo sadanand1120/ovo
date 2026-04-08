@@ -9,7 +9,7 @@
 ## Build, Test, and Development Commands
 - Use `README.md` as the source of truth for environment setup, checkpoint download, ScanNet decoding, backend build steps, `run_eval.py` commands, metrics inspection, and visualization commands.
 - `git submodule update --init --recursive` fetches `ORB_SLAM3` and `segment-anything-2`.
-- if running inside a container (mostly this is what you'll be asked to do), the conda envs are generally in /opt/miniconda3.
+- Run all commands associated to this repo inside container named 'humble' and inside a conda (/opt/miniconda3) env called 'ovo'. Use docker exec to run commands inside the container.
 
 ## Coding Style & Naming Conventions
 - Use 4-space indentation, `snake_case` for functions and config keys, and `PascalCase` for classes.
