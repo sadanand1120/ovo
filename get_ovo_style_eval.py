@@ -5,6 +5,7 @@ import time
 from copy import deepcopy
 from pathlib import Path
 
+import cv2  # Keep OpenCV loaded before torch in this env.
 import numpy as np
 import torch
 from tqdm.auto import tqdm
@@ -75,16 +76,20 @@ def build_scene(scene_name: str, args: argparse.Namespace) -> tuple[Path, dict]:
         scene_name=scene_name,
         use_inst_gt=args.use_inst_gt,
         sam_model_level_inst=args.sam_model_level_inst,
-        sam_model_level_tr=args.sam_model_level_tr,
+        sam_model_level_textregion=args.sam_model_level_textregion,
+        sam2_model_level_track=args.sam2_model_level_track,
     )
 
     progress = tqdm(range(len(dataset)), desc=scene_name, unit="frame", dynamic_ncols=True)
     frame_loop_start = time.perf_counter()
     for frame_id in progress:
-        if not mapper.should_map_frame(frame_id):
-            continue
         mapper.add_frame(dataset[frame_id])
-        progress.set_postfix(points=mapper.n_points, refresh=False)
+        progress.set_postfix(
+            points=mapper.n_points,
+            active=mapper.instance_manager.num_active_instances(),
+            objs=mapper.instance_manager.num_existing_instances(),
+            refresh=False,
+        )
     frame_loop_sec = time.perf_counter() - frame_loop_start
 
     save_timings = mapper.save(
@@ -285,7 +290,8 @@ if __name__ == "__main__":
     parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
     parser.add_argument("--sam-model-level-inst", type=int, choices=[11, 12, 13], default=13)
-    parser.add_argument("--sam-model-level-tr", type=int, choices=[11, 12, 13], default=13)
+    parser.add_argument("--sam-model-level-textregion", type=int, choices=[11, 12, 13], default=13)
+    parser.add_argument("--sam2-model-level-track", type=int, choices=[21, 22, 23, 24], default=24)
     parser.add_argument("--use-inst-gt", action="store_true")
     parser.add_argument("--feature_prob_th", type=float, default=DEFAULT_FEATURE_PROB_TH)
     parser.add_argument("--min_component_size", type=int, default=2000)

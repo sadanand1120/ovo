@@ -15,6 +15,15 @@ from tqdm.auto import tqdm
 
 from ovo import geometry_utils, io_utils
 from ovo.datasets import get_dataset
+from ovo.sam_mask_utils import (
+    GTInstanceMaskExtractor,
+    SAM1_LEVELS,
+    SAMMaskExtractor,
+    SAM_MIN_MASK_AREA_PERC,
+    SAM_POINTS_PER_SIDE,
+    SAM_SORT_MODE,
+)
+from ovo.sam2_utils import SAM2_MAX_NUM_OBJECTS, SAM2_LEVELS, SAM2VideoTracker, build_label_masks
 
 
 DATASET_DIRS = {"replica": "Replica", "scannet": "ScanNet"}
@@ -28,34 +37,20 @@ DEFAULT_DOWNSCALE_RES = 2
 DEFAULT_K_POOLING = 1
 DEFAULT_MAX_FRAME_POINTS = 5_000_000
 DEFAULT_MATCH_DISTANCE_TH = 0.03
-DEFAULT_INSTANCE_MATCH_TH = 3
-DEFAULT_INSTANCE_NEW_TH = 80
-DEFAULT_INSTANCE_DOMINANT_FRAC_TH = 0.4
 CLIP_MODEL_NAME = "ViT-L-14-336-quickgelu"
 CLIP_PRETRAINED = "openai"
 CLIP_LOAD_SIZE = 1024
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 CLIP_GLOBAL_PATCH_THRESHOLD = 0.07
-SAM_SORT_MODE = "area"
-SAM_MIN_MASK_AREA_PERC = 0.01
-SAM_POINTS_PER_SIDE = 8
-SAM_POINTS_PER_BATCH = 64
-SAM_PRED_IOU_THRESH = 0.88
-SAM_STABILITY_SCORE_THRESH = 0.95
-SAM_STABILITY_SCORE_OFFSET = 1.0
-SAM_BOX_NMS_THRESH = 0.7
-SAM_CROP_N_LAYERS = 0
-SAM_CROP_NMS_THRESH = 0.7
-SAM_CROP_OVERLAP_RATIO = 0.3413333333333333
-SAM_CROP_N_POINTS_DOWNSCALE_FACTOR = 1
-SAM_MIN_MASK_REGION_AREA = 0
-SAM_OUTPUT_MODE = "binary_mask"
-SAM1_LEVELS = {
-    11: ("vit_b", INPUT_DIR / "sam_ckpts" / "sam_vit_b_01ec64.pth"),
-    12: ("vit_l", INPUT_DIR / "sam_ckpts" / "sam_vit_l_0b3195.pth"),
-    13: ("vit_h", INPUT_DIR / "sam_ckpts" / "sam_vit_h_4b8939.pth"),
-}
+TRACK_SUPPORT_MIN = 3
+ATTACH_FRAC_TH = 0.4
+BIRTH_MIN_POINTS = 80
+SEED_EXPLAINED_FRAC_TH = 0.8
+TRACK_MISS_MAX = 3
+CONFIRM_MIN_POINTS = 80
+CONFIRM_MIN_SEED_HITS = 2
+TENTATIVE_MAX_SEED_AGE = 2
 
 
 def canonical_dataset_name(dataset_name: str) -> str:
@@ -190,149 +185,6 @@ def invert_rigid_transform(c2w: torch.Tensor) -> torch.Tensor:
     return world_to_camera
 
 
-def mask_score(mask: dict, sort_mode: str) -> float:
-    predicted_iou = float(mask.get("predicted_iou", 0.0))
-    stability = float(mask.get("stability_score", 0.0))
-    area = float(mask.get("area", 0.0))
-    if sort_mode == "predicted_iou":
-        return predicted_iou
-    if sort_mode == "stability":
-        return stability
-    if sort_mode == "score":
-        return predicted_iou * stability
-    return area
-
-
-def flatten_masks(masks: list[dict], image_shape: tuple[int, int, int], sort_mode: str, min_mask_area_perc: float) -> np.ndarray:
-    height, width = image_shape[:2]
-    min_mask_area = float(min_mask_area_perc) * height * width
-    masks = [mask for mask in masks if float(mask.get("area", 0.0)) >= min_mask_area]
-    if not masks:
-        return np.full((height, width), -1, dtype=np.int32)
-    scores = np.asarray([mask_score(mask, sort_mode) for mask in masks], dtype=np.float32)
-    order = np.argsort(scores)[::-1]
-    winning_idx = np.full((height, width), -1, dtype=np.int32)
-    winning_score = np.full((height, width), -np.inf, dtype=np.float32)
-    for raw_idx in order:
-        segmentation = np.asarray(masks[raw_idx]["segmentation"], dtype=bool)
-        better = segmentation & (scores[raw_idx] > winning_score)
-        winning_idx[better] = int(raw_idx)
-        winning_score[better] = float(scores[raw_idx])
-    labels = np.full((height, width), -1, dtype=np.int32)
-    compact_id = 0
-    for raw_idx in order:
-        claimed = winning_idx == int(raw_idx)
-        if claimed.sum() < min_mask_area:
-            continue
-        if claimed.any():
-            labels[claimed] = compact_id
-            compact_id += 1
-    return labels
-
-
-class SAMMaskExtractor:
-    def __init__(self, device: str, model_level: int) -> None:
-        from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
-
-        if int(model_level) not in SAM1_LEVELS:
-            raise ValueError(f"Unsupported SAM1 level {model_level}. Expected one of {sorted(SAM1_LEVELS)}.")
-        model_type, checkpoint_path = SAM1_LEVELS[int(model_level)]
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(checkpoint_path)
-        self.device = device if device == "cpu" or torch.cuda.is_available() else "cpu"
-        self.model_level = int(model_level)
-        self.model_type = model_type
-        self.checkpoint_path = checkpoint_path
-        sam = sam_model_registry[model_type](checkpoint=str(checkpoint_path)).to(self.device).eval()
-        self.mask_generator = SamAutomaticMaskGenerator(
-            sam,
-            points_per_side=SAM_POINTS_PER_SIDE,
-            points_per_batch=SAM_POINTS_PER_BATCH,
-            pred_iou_thresh=SAM_PRED_IOU_THRESH,
-            stability_score_thresh=SAM_STABILITY_SCORE_THRESH,
-            stability_score_offset=SAM_STABILITY_SCORE_OFFSET,
-            box_nms_thresh=SAM_BOX_NMS_THRESH,
-            crop_n_layers=SAM_CROP_N_LAYERS,
-            crop_nms_thresh=SAM_CROP_NMS_THRESH,
-            crop_overlap_ratio=SAM_CROP_OVERLAP_RATIO,
-            crop_n_points_downscale_factor=SAM_CROP_N_POINTS_DOWNSCALE_FACTOR,
-            point_grids=None,
-            min_mask_region_area=SAM_MIN_MASK_REGION_AREA,
-            output_mode=SAM_OUTPUT_MODE,
-        )
-
-    @torch.inference_mode()
-    def extract_labels(self, image: np.ndarray) -> np.ndarray:
-        masks = self.mask_generator.generate(image)
-        return flatten_masks(masks, image.shape, SAM_SORT_MODE, SAM_MIN_MASK_AREA_PERC)
-
-
-class GTInstanceMaskExtractor:
-    def __init__(self, dataset_name: str, scene_name: str) -> None:
-        if dataset_name.lower() != "scannet":
-            raise ValueError("GT instance masks are only available for ScanNet.")
-        self.mask_dir = INPUT_DIR / canonical_dataset_name(dataset_name) / scene_name / "instance-filt"
-        if not self.mask_dir.exists():
-            raise FileNotFoundError(f"Missing decoded GT instance masks at {self.mask_dir}. Run scannet_decode_sens.py --extract_2d_gt_filt first.")
-
-    def extract_labels(self, frame_id: int, image_shape: tuple[int, int]) -> np.ndarray:
-        path = self.mask_dir / f"{frame_id}.png"
-        labels = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-        if labels is None:
-            raise FileNotFoundError(f"Missing GT instance mask {path}")
-        if labels.shape[:2] != image_shape:
-            labels = cv2.resize(labels, (image_shape[1], image_shape[0]), interpolation=cv2.INTER_NEAREST)
-        labels = labels.astype(np.int32, copy=False)
-        labels[labels == 0] = -1
-        valid = labels >= 0
-        if valid.any():
-            _, local = np.unique(labels[valid], return_inverse=True)
-            labels[valid] = local.astype(np.int32, copy=False)
-        return labels
-
-
-class OnlineInstanceTracker:
-    def __init__(self, match_th: int, new_th: int, dominant_frac_th: float) -> None:
-        self.match_th = int(match_th)
-        self.new_th = int(new_th)
-        self.dominant_frac_th = float(dominant_frac_th)
-        self.point_labels = np.empty((0,), dtype=np.int32)
-        self.next_instance_id = 0
-
-    def append_new_points(self, n_new: int) -> None:
-        if n_new > 0:
-            self.point_labels = np.concatenate((self.point_labels, np.full((int(n_new),), -1, dtype=np.int32)))
-
-    def update(self, point_ids_ds: torch.Tensor, mask_labels_ds: torch.Tensor) -> None:
-        valid = (point_ids_ds >= 0) & (mask_labels_ds >= 0)
-        if not valid.any():
-            return
-        point_ids = point_ids_ds[valid].cpu().numpy().astype(np.int64, copy=False)
-        mask_labels = mask_labels_ds[valid].cpu().numpy().astype(np.int32, copy=False)
-        order = np.lexsort((point_ids, mask_labels))
-        point_ids = point_ids[order]
-        mask_labels = mask_labels[order]
-        starts = np.flatnonzero(np.r_[True, mask_labels[1:] != mask_labels[:-1]])
-        ends = np.r_[starts[1:], mask_labels.shape[0]]
-        for start, end in zip(starts, ends):
-            ids = np.unique(point_ids[start:end])
-            if ids.shape[0] < self.match_th:
-                continue
-            labels = self.point_labels[ids]
-            assigned = labels >= 0
-            if assigned.sum() > 0:
-                label_vals, label_counts = np.unique(labels[assigned], return_counts=True)
-                dominant_idx = int(label_counts.argmax())
-                dominant = int(label_vals[dominant_idx])
-                dominant_frac = float(label_counts[dominant_idx]) / float(assigned.sum())
-                if assigned.sum() >= self.match_th and dominant_frac >= self.dominant_frac_th:
-                    self.point_labels[ids[~assigned]] = dominant
-                    continue
-            if (~assigned).sum() >= self.new_th:
-                self.point_labels[ids[~assigned]] = self.next_instance_id
-                self.next_instance_id += 1
-
-
 class DenseCLIPExtractor:
     def __init__(self, device: str) -> None:
         self.device = torch.device(device)
@@ -428,6 +280,282 @@ class DenseCLIPExtractor:
         return x[0].permute(1, 2, 0).contiguous()
 
 
+class SAM2InstanceManager:
+    def __init__(
+        self,
+        device: str,
+        dataset_name: str,
+        scene_name: str,
+        use_inst_gt: bool,
+        sam_model_level_inst: int,
+        sam_model_level_textregion: int,
+        sam2_model_level_track: int,
+    ) -> None:
+        self.device = device
+        self.use_inst_gt = bool(use_inst_gt)
+        self.sam_model_level_inst = int(sam_model_level_inst)
+        self.sam_model_level_textregion = int(sam_model_level_textregion)
+        self.sam2_model_level_track = int(sam2_model_level_track)
+        self.seed_mask_extractor = (
+            GTInstanceMaskExtractor(dataset_name, scene_name) if self.use_inst_gt else SAMMaskExtractor(device, self.sam_model_level_inst)
+        )
+        self.textregion_mask_extractor = None if self.use_inst_gt else SAMMaskExtractor(device, self.sam_model_level_textregion)
+        self.instances: dict[int, dict] = {}
+        self.active_gids: set[int] = set()
+        self.point_labels = np.empty((0,), dtype=np.int32)
+        self.point_labels_dirty = True
+        self.next_gid = 0
+        self.tracker: SAM2VideoTracker | None = None
+        self.segment_next_local_idx = 0
+        self.seed_frame_counter = 0
+        self.stats = {
+            "sam2_seed_frames": 0,
+            "sam2_births": 0,
+            "sam2_reactivations": 0,
+            "sam2_track_drops": 0,
+            "sam2_tentative_kills": 0,
+            "sam2_seed_object_truncations": 0,
+        }
+
+    def close(self) -> None:
+        if self.tracker is not None:
+            self.tracker.close()
+            self.tracker = None
+        self.segment_next_local_idx = 0
+
+    def extend_point_labels(self, n_new: int) -> None:
+        if n_new > 0:
+            self.point_labels = np.concatenate((self.point_labels, np.full((int(n_new),), -1, dtype=np.int32)))
+            self.point_labels_dirty = True
+
+    def num_active_instances(self) -> int:
+        return len(self.active_gids)
+
+    def num_existing_instances(self) -> int:
+        return sum(1 for state in self.instances.values() if state["status"] != "dead")
+
+    def assign_new_points(self, gids: np.ndarray, frame_id: int) -> None:
+        if gids.size == 0:
+            return
+        start = self.point_labels.shape[0]
+        self.extend_point_labels(int(gids.size))
+        self.point_labels[start:] = gids.astype(np.int32, copy=False)
+        self.point_labels_dirty = True
+        valid = gids >= 0
+        if valid.any():
+            label_vals, label_counts = np.unique(gids[valid], return_counts=True)
+            for gid, count in zip(label_vals.tolist(), label_counts.tolist()):
+                state = self.instances.get(int(gid))
+                if state is None or state["status"] == "dead":
+                    continue
+                state["n_points"] += int(count)
+                state["last_seen"] = int(frame_id)
+        self.cleanup_tentatives(frame_id, is_seed_frame=True)
+
+    def cleanup_tentatives(self, frame_id: int, is_seed_frame: bool) -> None:
+        for gid, state in list(self.instances.items()):
+            if state["status"] != "tentative":
+                continue
+            if state["n_points"] >= CONFIRM_MIN_POINTS and state["seed_hits"] >= CONFIRM_MIN_SEED_HITS:
+                state["status"] = "confirmed"
+                continue
+            if not is_seed_frame:
+                continue
+            if self.seed_frame_counter - state["birth_seed_counter"] >= TENTATIVE_MAX_SEED_AGE:
+                self._kill_instance(gid)
+
+    def extract_textregion_labels(self, image_np: np.ndarray, seed_labels_np: np.ndarray | None) -> np.ndarray:
+        if self.use_inst_gt and seed_labels_np is not None:
+            return seed_labels_np
+        if (not self.use_inst_gt) and seed_labels_np is not None and self.sam_model_level_inst == self.sam_model_level_textregion:
+            return seed_labels_np
+        if self.textregion_mask_extractor is None:
+            raise RuntimeError("TextRegion SAM extractor was not initialized.")
+        return self.textregion_mask_extractor.extract_labels(image_np)
+
+    def prepare_frame_labels(
+        self,
+        frame_id: int,
+        is_seed_frame: bool,
+        image_np: np.ndarray,
+        depth_np: np.ndarray,
+        c2w_np: np.ndarray,
+        point_ids_full: torch.Tensor,
+        gid_img_full: torch.Tensor,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        if np.isinf(c2w_np).any() or np.isnan(c2w_np).any():
+            if is_seed_frame:
+                self.close()
+                self.active_gids.clear()
+            return None, None
+
+        tracked_masks = self._track_frame(frame_id, image_np, gid_img_full)
+        if not is_seed_frame:
+            self.cleanup_tentatives(frame_id, is_seed_frame=False)
+            return None, None
+
+        self.seed_frame_counter += 1
+        self.stats["sam2_seed_frames"] += 1
+        seed_labels = self._extract_seed_labels(frame_id, image_np)
+        seed_masks = build_label_masks(seed_labels)
+        kept_seed_masks = self._remove_explained_seed_masks(seed_masks, tracked_masks)
+        inst_img_full = np.full(image_np.shape[:2], -1, dtype=np.int32)
+        for gid, mask in sorted(tracked_masks.items(), key=lambda item: int(item[1].sum()), reverse=True):
+            inst_img_full[mask] = int(gid)
+
+        valid_new_support = (point_ids_full < 0) & torch.from_numpy(depth_np > 0).to(point_ids_full.device)
+        for _, seed_mask in kept_seed_masks:
+            gid_old, frac_old, support_old = self._dominant_old_gid_under_mask(seed_mask, gid_img_full)
+            if gid_old is not None and support_old >= TRACK_SUPPORT_MIN and frac_old >= ATTACH_FRAC_TH:
+                gid = int(gid_old)
+                state = self.instances[gid]
+                if state["status"] == "inactive":
+                    state["status"] = "confirmed"
+                    self.stats["sam2_reactivations"] += 1
+                state["last_seen"] = int(frame_id)
+                state["miss_count"] = 0
+                self.active_gids.add(gid)
+                inst_img_full[seed_mask] = gid
+                continue
+
+            n_new = int(valid_new_support[torch.from_numpy(seed_mask).to(valid_new_support.device)].sum().item())
+            if n_new < BIRTH_MIN_POINTS:
+                continue
+            gid = self.next_gid
+            self.next_gid += 1
+            self.instances[gid] = {
+                "status": "tentative",
+                "n_points": 0,
+                "miss_count": 0,
+                "seed_hits": 1,
+                "last_seen": int(frame_id),
+                "birth_seed_counter": self.seed_frame_counter,
+                "last_seed_counter": self.seed_frame_counter,
+            }
+            self.active_gids.add(gid)
+            self.stats["sam2_births"] += 1
+            inst_img_full[seed_mask] = gid
+
+        self._mark_seed_hits_for_visible(frame_id, inst_img_full)
+        self._reseed_tracker(image_np, inst_img_full)
+        self.cleanup_tentatives(frame_id, is_seed_frame=True)
+        return inst_img_full, seed_labels
+
+    def _extract_seed_labels(self, frame_id: int, image_np: np.ndarray) -> np.ndarray:
+        if self.use_inst_gt:
+            return self.seed_mask_extractor.extract_labels(frame_id, image_np.shape[:2])
+        return self.seed_mask_extractor.extract_labels(image_np)
+
+    def _track_frame(self, frame_id: int, image_np: np.ndarray, gid_img_full: torch.Tensor) -> dict[int, np.ndarray]:
+        if self.tracker is None or not self.active_gids:
+            return {}
+        local_idx = self.segment_next_local_idx
+        self.tracker.append_frame(local_idx, image_np)
+        tracked_masks = self.tracker.track_frame(local_idx)
+        self.segment_next_local_idx += 1
+        accepted: dict[int, np.ndarray] = {}
+        for gid in list(self.active_gids):
+            mask = tracked_masks.get(int(gid))
+            if mask is None or not mask.any():
+                self._mark_track_miss(gid)
+                continue
+            dominant_gid, dominant_frac, support = self._dominant_old_gid_under_mask(mask, gid_img_full)
+            if dominant_gid == gid and support >= TRACK_SUPPORT_MIN and dominant_frac >= ATTACH_FRAC_TH:
+                accepted[int(gid)] = mask
+                state = self.instances[gid]
+                state["miss_count"] = 0
+                state["last_seen"] = int(frame_id)
+            else:
+                self._mark_track_miss(gid)
+        return accepted
+
+    def _mark_track_miss(self, gid: int) -> None:
+        state = self.instances.get(int(gid))
+        if state is None or state["status"] == "dead":
+            return
+        state["miss_count"] += 1
+        if state["miss_count"] <= TRACK_MISS_MAX:
+            return
+        self.active_gids.discard(int(gid))
+        if state["status"] == "tentative":
+            self._kill_instance(int(gid))
+        else:
+            state["status"] = "inactive"
+            self.stats["sam2_track_drops"] += 1
+
+    def _kill_instance(self, gid: int) -> None:
+        state = self.instances.get(int(gid))
+        if state is None or state["status"] == "dead":
+            return
+        state["status"] = "dead"
+        self.active_gids.discard(int(gid))
+        if self.point_labels.size > 0:
+            self.point_labels[self.point_labels == int(gid)] = -1
+            self.point_labels_dirty = True
+        self.stats["sam2_tentative_kills"] += 1
+
+    def _mark_seed_hits_for_visible(self, frame_id: int, inst_img_full: np.ndarray) -> None:
+        visible_gids = np.unique(inst_img_full[inst_img_full >= 0])
+        for gid in visible_gids.tolist():
+            state = self.instances.get(int(gid))
+            if state is None or state["status"] == "dead" or state["last_seed_counter"] == self.seed_frame_counter:
+                continue
+            state["seed_hits"] += 1
+            state["last_seed_counter"] = self.seed_frame_counter
+            state["last_seen"] = int(frame_id)
+
+    def _remove_explained_seed_masks(self, seed_masks: list[tuple[int, np.ndarray]], tracked_masks: dict[int, np.ndarray]) -> list[tuple[int, np.ndarray]]:
+        if not tracked_masks:
+            return seed_masks
+        kept = []
+        for seed_obj_id, seed_mask in seed_masks:
+            seed_area = int(seed_mask.sum())
+            if seed_area <= 0:
+                continue
+            explained = False
+            for tracked_mask in tracked_masks.values():
+                overlap = int(np.logical_and(seed_mask, tracked_mask).sum())
+                if overlap / float(seed_area) >= SEED_EXPLAINED_FRAC_TH:
+                    explained = True
+                    break
+            if not explained:
+                kept.append((seed_obj_id, seed_mask))
+        return kept
+
+    def _dominant_old_gid_under_mask(self, mask: np.ndarray, gid_img_full: torch.Tensor) -> tuple[int | None, float, int]:
+        mask_tensor = torch.from_numpy(mask).to(gid_img_full.device)
+        gids = gid_img_full[mask_tensor]
+        gids = gids[gids >= 0]
+        if gids.numel() == 0:
+            return None, 0.0, 0
+        unique_gids, counts = torch.unique(gids, return_counts=True)
+        dominant_idx = int(counts.argmax().item())
+        support = int(counts[dominant_idx].item())
+        dominant_gid = int(unique_gids[dominant_idx].item())
+        frac = float(support) / float(gids.numel())
+        return dominant_gid, frac, support
+
+    def _reseed_tracker(self, image_np: np.ndarray, inst_img_full: np.ndarray) -> None:
+        final_masks = build_label_masks(inst_img_full, max_objects=SAM2_MAX_NUM_OBJECTS)
+        visible_gids = {gid for gid, _ in final_masks}
+        self.stats["sam2_seed_object_truncations"] += max(0, len(np.unique(inst_img_full[inst_img_full >= 0])) - len(final_masks))
+        for gid in list(self.active_gids):
+            if gid in visible_gids:
+                continue
+            state = self.instances.get(gid)
+            if state is None or state["status"] == "dead":
+                continue
+            if state["status"] != "tentative":
+                state["status"] = "inactive"
+        self.active_gids = set(visible_gids)
+        self.close()
+        if not final_masks:
+            return
+        self.tracker = SAM2VideoTracker(image_np, self.sam2_model_level_track)
+        self.tracker.reset_and_seed_masks(final_masks)
+        self.segment_next_local_idx = 1
+
+
 class RGBMapper:
     def __init__(
         self,
@@ -442,7 +570,8 @@ class RGBMapper:
         scene_name: str,
         use_inst_gt: bool,
         sam_model_level_inst: int,
-        sam_model_level_tr: int,
+        sam_model_level_textregion: int,
+        sam2_model_level_track: int,
     ) -> None:
         self.device = device
         self.cam_intrinsics = torch.tensor(intrinsics.astype(np.float32), device=device)
@@ -454,15 +583,16 @@ class RGBMapper:
         self.clip_extractor = DenseCLIPExtractor(device)
         self.use_inst_gt = bool(use_inst_gt)
         self.sam_model_level_inst = int(sam_model_level_inst)
-        self.sam_model_level_tr = int(sam_model_level_tr)
-        self.instance_mask_extractor = (
-            GTInstanceMaskExtractor(dataset_name, scene_name) if self.use_inst_gt else SAMMaskExtractor(device, self.sam_model_level_inst)
-        )
-        self.tr_mask_extractor = SAMMaskExtractor(device, self.sam_model_level_tr)
-        self.instance_tracker = OnlineInstanceTracker(
-            DEFAULT_INSTANCE_MATCH_TH,
-            DEFAULT_INSTANCE_NEW_TH,
-            DEFAULT_INSTANCE_DOMINANT_FRAC_TH,
+        self.sam_model_level_textregion = int(sam_model_level_textregion)
+        self.sam2_model_level_track = int(sam2_model_level_track)
+        self.instance_manager = SAM2InstanceManager(
+            device=device,
+            dataset_name=dataset_name,
+            scene_name=scene_name,
+            use_inst_gt=use_inst_gt,
+            sam_model_level_inst=sam_model_level_inst,
+            sam_model_level_textregion=sam_model_level_textregion,
+            sam2_model_level_track=sam2_model_level_track,
         )
         if k_pooling > 1 and k_pooling % 2 == 0:
             raise ValueError("k_pooling must be odd.")
@@ -478,6 +608,7 @@ class RGBMapper:
         self.feature_tmp_path = self.feature_tmpdir / "clip_feats.bin"
         self.feature_tmp_file = open(self.feature_tmp_path, "wb")
         self.n_features = 0
+        self.point_labels_torch = torch.empty((0,), dtype=torch.int32, device=self.device)
         self.cached_depth_shape = None
         self.cached_x = None
         self.cached_y = None
@@ -527,6 +658,15 @@ class RGBMapper:
             self.cached_depth_shape = depth_shape
         return self.cached_x, self.cached_y, self.cached_row_ids, self.cached_col_ids
 
+    def _refresh_point_label_cache(self) -> None:
+        if not self.instance_manager.point_labels_dirty:
+            return
+        if self.instance_manager.point_labels.size == 0:
+            self.point_labels_torch = torch.empty((0,), dtype=torch.int32, device=self.device)
+        else:
+            self.point_labels_torch = torch.from_numpy(self.instance_manager.point_labels).to(self.device)
+        self.instance_manager.point_labels_dirty = False
+
     def _append_points(self, points: torch.Tensor, colors: torch.Tensor, normals: torch.Tensor, features: torch.Tensor) -> None:
         start = self.n_points
         end = start + int(points.shape[0])
@@ -560,22 +700,15 @@ class RGBMapper:
 
     def add_frame(self, frame_data) -> None:
         frame_id, image_np, depth_np, c2w_np = frame_data[:4]
-        if not self.should_map_frame(frame_id):
-            return
+        is_seed_frame = self.should_map_frame(frame_id)
         if np.isinf(c2w_np).any() or np.isnan(c2w_np).any():
+            if is_seed_frame:
+                self.instance_manager.close()
+                self.instance_manager.active_gids.clear()
+            self.instance_manager.cleanup_tentatives(frame_id, is_seed_frame=is_seed_frame)
+            self._refresh_point_label_cache()
             return
 
-        inst_labels_np = (
-            self.instance_mask_extractor.extract_labels(frame_id, image_np.shape[:2])
-            if self.use_inst_gt
-            else self.instance_mask_extractor.extract_labels(image_np)
-        )
-        if self.use_inst_gt or self.sam_model_level_inst == self.sam_model_level_tr:
-            tr_labels_np = inst_labels_np
-        else:
-            tr_labels_np = self.tr_mask_extractor.extract_labels(image_np)
-        instance_labels_full = torch.from_numpy(inst_labels_np).to(self.device)
-        tr_labels_full = torch.from_numpy(tr_labels_np).to(self.device)
         c2w = torch.from_numpy(c2w_np).to(self.device)
         depth = torch.from_numpy(depth_np).to(self.device)
         image = torch.from_numpy(image_np).to(self.device)
@@ -584,8 +717,10 @@ class RGBMapper:
         x, y, row_ids, col_ids = self._get_cached_grids((h, w))
         mask = depth > 0
         point_ids_full = torch.full((h, w), -1, dtype=torch.int32, device=self.device)
+        gid_img_full = torch.full((h, w), -1, dtype=torch.int32, device=self.device)
 
         if self.n_points > 0:
+            self._refresh_point_label_cache()
             frustum_corners = geometry_utils.compute_camera_frustum_corners(depth, c2w, self.cam_intrinsics)
             w2c = invert_rigid_transform(c2w)
             frustum_mask = geometry_utils.compute_frustum_point_ids(self.points[: self.n_points], frustum_corners, device=self.device)
@@ -598,11 +733,28 @@ class RGBMapper:
                     self.match_distance_th,
                 )
                 if matches.numel() > 0:
-                    global_ids = frustum_mask[matched_ids].to(point_ids_full.dtype)
-                    point_ids_full[matches[:, 1], matches[:, 0]] = global_ids
+                    global_ids = frustum_mask[matched_ids].long()
+                    point_ids_full[matches[:, 1], matches[:, 0]] = global_ids.to(point_ids_full.dtype)
+                    gid_img_full[matches[:, 1], matches[:, 0]] = self.point_labels_torch[global_ids]
                     mask[matches[:, 1], matches[:, 0]] = False
             mask = self.pooling(mask)
 
+        inst_img_full, seed_labels_np = self.instance_manager.prepare_frame_labels(
+            frame_id=frame_id,
+            is_seed_frame=is_seed_frame,
+            image_np=image_np,
+            depth_np=depth_np,
+            c2w_np=c2w_np,
+            point_ids_full=point_ids_full,
+            gid_img_full=gid_img_full,
+        )
+        self._refresh_point_label_cache()
+        if not is_seed_frame or inst_img_full is None:
+            return
+
+        tr_labels_np = self.instance_manager.extract_textregion_labels(image_np, seed_labels_np)
+        instance_labels_full = torch.from_numpy(inst_img_full).to(self.device)
+        tr_labels_full = torch.from_numpy(tr_labels_np).to(self.device)
         depth = self.downscale(depth)
         mask = self.downscale(mask)
         image = self.downscale(image)
@@ -645,14 +797,13 @@ class RGBMapper:
             old_n = self.n_points
             new_ids = torch.arange(old_n, old_n + points.shape[0], device=self.device, dtype=torch.int32)
             point_ids_ds[row_keep, col_keep] = new_ids
-            self.instance_tracker.append_new_points(points.shape[0])
-            self.instance_tracker.update(point_ids_ds, instance_labels_ds)
             self._append_points(points, colors, normals, features)
-            return
-
-        self.instance_tracker.update(point_ids_ds, instance_labels_ds)
+            new_gids = instance_labels_ds[row_keep, col_keep].cpu().numpy().astype(np.int32, copy=False)
+            self.instance_manager.assign_new_points(new_gids, frame_id)
+            self._refresh_point_label_cache()
 
     def save(self, output_dir: Path, stats: dict) -> dict:
+        self.instance_manager.close()
         output_dir.mkdir(parents=True, exist_ok=True)
         save_start = time.perf_counter()
         progress = tqdm(total=4, desc=f"{output_dir.name} save", unit="stage", dynamic_ncols=True)
@@ -688,7 +839,7 @@ class RGBMapper:
 
             progress.set_postfix_str("instance labels", refresh=True)
             stage_start = time.perf_counter()
-            np.save(output_dir / "instance_labels.npy", self.instance_tracker.point_labels)
+            np.save(output_dir / "instance_labels.npy", self.instance_manager.point_labels)
             timings["instance_labels_sec"] = time.perf_counter() - stage_start
             progress.update()
 
@@ -703,22 +854,39 @@ class RGBMapper:
                 "rgb_normal_point_fusion": True,
                 "clip_feature_mode": "clip_textregion",
                 "clip_feature_fusion": False,
-                "instance_match_th": DEFAULT_INSTANCE_MATCH_TH,
-                "instance_new_th": DEFAULT_INSTANCE_NEW_TH,
-                "instance_dominant_frac_th": DEFAULT_INSTANCE_DOMINANT_FRAC_TH,
-                "sam_model_level_tr": self.sam_model_level_tr,
-                "sam_model_type_tr": self.tr_mask_extractor.model_type,
-                "sam_checkpoint_path_tr": str(self.tr_mask_extractor.checkpoint_path),
+                "textregion_supervision": "gt" if self.use_inst_gt else "sam",
+                "instance_tracking_backend": "sam2_seed_to_seed",
+                "sam2_model_level_track": self.sam2_model_level_track,
+                "sam2_checkpoint_path_track": str(self.instance_manager.tracker.checkpoint_path) if self.instance_manager.tracker is not None else str((INPUT_DIR / "sam_ckpts" / SAM2_LEVELS[self.sam2_model_level_track][0])),
+                "sam2_config_track": SAM2_LEVELS[self.sam2_model_level_track][1],
+                "sam2_max_num_objects": SAM2_MAX_NUM_OBJECTS,
+                "track_support_min": TRACK_SUPPORT_MIN,
+                "attach_frac_th": ATTACH_FRAC_TH,
+                "birth_min_points": BIRTH_MIN_POINTS,
+                "seed_explained_frac_th": SEED_EXPLAINED_FRAC_TH,
+                "track_miss_max": TRACK_MISS_MAX,
+                "confirm_min_points": CONFIRM_MIN_POINTS,
+                "confirm_min_seed_hits": CONFIRM_MIN_SEED_HITS,
+                "tentative_max_seed_age": TENTATIVE_MAX_SEED_AGE,
                 "sam_points_per_side": SAM_POINTS_PER_SIDE,
                 "sam_sort_mode": SAM_SORT_MODE,
                 "sam_min_mask_area_perc": SAM_MIN_MASK_AREA_PERC,
+                **self.instance_manager.stats,
             }
+            if self.instance_manager.textregion_mask_extractor is not None:
+                stats.update(
+                    {
+                        "sam_model_level_textregion": self.sam_model_level_textregion,
+                        "sam_model_type_textregion": self.instance_manager.textregion_mask_extractor.model_type,
+                        "sam_checkpoint_path_textregion": str(self.instance_manager.textregion_mask_extractor.checkpoint_path),
+                    }
+                )
             if not self.use_inst_gt:
                 stats.update(
                     {
                         "sam_model_level_inst": self.sam_model_level_inst,
-                        "sam_model_type_inst": self.instance_mask_extractor.model_type,
-                        "sam_checkpoint_path_inst": str(self.instance_mask_extractor.checkpoint_path),
+                        "sam_model_type_inst": self.instance_manager.seed_mask_extractor.model_type,
+                        "sam_checkpoint_path_inst": str(self.instance_manager.seed_mask_extractor.checkpoint_path),
                     }
                 )
             with open(output_dir / "stats.json", "w") as f:
@@ -755,16 +923,20 @@ def main(args):
         scene_name=args.scene_name,
         use_inst_gt=args.use_inst_gt,
         sam_model_level_inst=args.sam_model_level_inst,
-        sam_model_level_tr=args.sam_model_level_tr,
+        sam_model_level_textregion=args.sam_model_level_textregion,
+        sam2_model_level_track=args.sam2_model_level_track,
     )
 
     progress = tqdm(range(len(dataset)), desc=args.scene_name, unit="frame")
     frame_loop_start = time.perf_counter()
     for frame_id in progress:
-        if not mapper.should_map_frame(frame_id):
-            continue
         mapper.add_frame(dataset[frame_id])
-        progress.set_postfix(points=mapper.n_points, refresh=False)
+        progress.set_postfix(
+            points=mapper.n_points,
+            active=mapper.instance_manager.num_active_instances(),
+            objs=mapper.instance_manager.num_existing_instances(),
+            refresh=False,
+        )
     frame_loop_sec = time.perf_counter() - frame_loop_start
 
     save_timings = mapper.save(
@@ -819,6 +991,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
     parser.add_argument("--sam-model-level-inst", type=int, choices=sorted(SAM1_LEVELS), default=13)
-    parser.add_argument("--sam-model-level-tr", type=int, choices=sorted(SAM1_LEVELS), default=13)
+    parser.add_argument("--sam-model-level-textregion", type=int, choices=sorted(SAM1_LEVELS), default=13)
+    parser.add_argument("--sam2-model-level-track", type=int, choices=sorted(SAM2_LEVELS), default=24)
     parser.add_argument("--use-inst-gt", action="store_true", help="Use decoded ScanNet instance-filt masks instead of SAM for instance supervision.")
     main(parser.parse_args())
