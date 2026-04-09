@@ -242,6 +242,8 @@ def main(args: argparse.Namespace) -> None:
         dataset_name=dataset_name,
         scene_name=scene_name,
         use_inst_gt=args.use_inst_gt,
+        sam_model_level_inst=args.sam_model_level_inst,
+        sam_model_level_tr=args.sam_model_level_tr,
     )
 
     snapshot_counts: list[int] = []
@@ -336,10 +338,12 @@ if __name__ == "__main__":
     parser.add_argument("--k_pooling", type=int, default=DEFAULT_K_POOLING)
     parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
+    parser.add_argument("--sam-model-level-inst", type=int, choices=[11, 12, 13], default=13)
+    parser.add_argument("--sam-model-level-tr", type=int, choices=[11, 12, 13], default=13)
+    parser.add_argument("--use-inst-gt", action="store_true")
     parser.add_argument("--fps", type=int, default=VIDEO_FPS)
     parser.add_argument("--dilate", type=int, default=POINT_DILATE)
     parser.add_argument("--min_component_size", type=int, default=2000)
     parser.add_argument("--pca_sample_size", type=int, default=DEFAULT_PCA_SAMPLE_SIZE)
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
-    parser.add_argument("--use-inst-gt", action="store_true", help="Use decoded ScanNet instance-filt masks instead of SAM for instance evidence.")
     main(parser.parse_args())

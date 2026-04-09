@@ -37,11 +37,25 @@ CLIP_LOAD_SIZE = 1024
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 CLIP_GLOBAL_PATCH_THRESHOLD = 0.07
-SAM_CHECKPOINT_PATH = INPUT_DIR / "sam_ckpts" / "sam_vit_h_4b8939.pth"
-SAM_MODEL_TYPE = "vit_h"
 SAM_SORT_MODE = "area"
 SAM_MIN_MASK_AREA_PERC = 0.01
 SAM_POINTS_PER_SIDE = 8
+SAM_POINTS_PER_BATCH = 64
+SAM_PRED_IOU_THRESH = 0.88
+SAM_STABILITY_SCORE_THRESH = 0.95
+SAM_STABILITY_SCORE_OFFSET = 1.0
+SAM_BOX_NMS_THRESH = 0.7
+SAM_CROP_N_LAYERS = 0
+SAM_CROP_NMS_THRESH = 0.7
+SAM_CROP_OVERLAP_RATIO = 0.3413333333333333
+SAM_CROP_N_POINTS_DOWNSCALE_FACTOR = 1
+SAM_MIN_MASK_REGION_AREA = 0
+SAM_OUTPUT_MODE = "binary_mask"
+SAM1_LEVELS = {
+    11: ("vit_b", INPUT_DIR / "sam_ckpts" / "sam_vit_b_01ec64.pth"),
+    12: ("vit_l", INPUT_DIR / "sam_ckpts" / "sam_vit_l_0b3195.pth"),
+    13: ("vit_h", INPUT_DIR / "sam_ckpts" / "sam_vit_h_4b8939.pth"),
+}
 
 
 def canonical_dataset_name(dataset_name: str) -> str:
@@ -217,12 +231,35 @@ def flatten_masks(masks: list[dict], image_shape: tuple[int, int, int], sort_mod
 
 
 class SAMMaskExtractor:
-    def __init__(self, device: str) -> None:
+    def __init__(self, device: str, model_level: int) -> None:
         from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
 
+        if int(model_level) not in SAM1_LEVELS:
+            raise ValueError(f"Unsupported SAM1 level {model_level}. Expected one of {sorted(SAM1_LEVELS)}.")
+        model_type, checkpoint_path = SAM1_LEVELS[int(model_level)]
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(checkpoint_path)
         self.device = device if device == "cpu" or torch.cuda.is_available() else "cpu"
-        sam = sam_model_registry[SAM_MODEL_TYPE](checkpoint=str(SAM_CHECKPOINT_PATH)).to(self.device).eval()
-        self.mask_generator = SamAutomaticMaskGenerator(sam, points_per_side=SAM_POINTS_PER_SIDE)
+        self.model_level = int(model_level)
+        self.model_type = model_type
+        self.checkpoint_path = checkpoint_path
+        sam = sam_model_registry[model_type](checkpoint=str(checkpoint_path)).to(self.device).eval()
+        self.mask_generator = SamAutomaticMaskGenerator(
+            sam,
+            points_per_side=SAM_POINTS_PER_SIDE,
+            points_per_batch=SAM_POINTS_PER_BATCH,
+            pred_iou_thresh=SAM_PRED_IOU_THRESH,
+            stability_score_thresh=SAM_STABILITY_SCORE_THRESH,
+            stability_score_offset=SAM_STABILITY_SCORE_OFFSET,
+            box_nms_thresh=SAM_BOX_NMS_THRESH,
+            crop_n_layers=SAM_CROP_N_LAYERS,
+            crop_nms_thresh=SAM_CROP_NMS_THRESH,
+            crop_overlap_ratio=SAM_CROP_OVERLAP_RATIO,
+            crop_n_points_downscale_factor=SAM_CROP_N_POINTS_DOWNSCALE_FACTOR,
+            point_grids=None,
+            min_mask_region_area=SAM_MIN_MASK_REGION_AREA,
+            output_mode=SAM_OUTPUT_MODE,
+        )
 
     @torch.inference_mode()
     def extract_labels(self, image: np.ndarray) -> np.ndarray:
@@ -404,6 +441,8 @@ class RGBMapper:
         dataset_name: str,
         scene_name: str,
         use_inst_gt: bool,
+        sam_model_level_inst: int,
+        sam_model_level_tr: int,
     ) -> None:
         self.device = device
         self.cam_intrinsics = torch.tensor(intrinsics.astype(np.float32), device=device)
@@ -414,7 +453,12 @@ class RGBMapper:
         self.k_pooling = int(k_pooling)
         self.clip_extractor = DenseCLIPExtractor(device)
         self.use_inst_gt = bool(use_inst_gt)
-        self.mask_extractor = GTInstanceMaskExtractor(dataset_name, scene_name) if self.use_inst_gt else SAMMaskExtractor(device)
+        self.sam_model_level_inst = int(sam_model_level_inst)
+        self.sam_model_level_tr = int(sam_model_level_tr)
+        self.instance_mask_extractor = (
+            GTInstanceMaskExtractor(dataset_name, scene_name) if self.use_inst_gt else SAMMaskExtractor(device, self.sam_model_level_inst)
+        )
+        self.tr_mask_extractor = SAMMaskExtractor(device, self.sam_model_level_tr)
         self.instance_tracker = OnlineInstanceTracker(
             DEFAULT_INSTANCE_MATCH_TH,
             DEFAULT_INSTANCE_NEW_TH,
@@ -521,8 +565,17 @@ class RGBMapper:
         if np.isinf(c2w_np).any() or np.isnan(c2w_np).any():
             return
 
-        labels_np = self.mask_extractor.extract_labels(frame_id, image_np.shape[:2]) if self.use_inst_gt else self.mask_extractor.extract_labels(image_np)
-        instance_labels_full = torch.from_numpy(labels_np).to(self.device)
+        inst_labels_np = (
+            self.instance_mask_extractor.extract_labels(frame_id, image_np.shape[:2])
+            if self.use_inst_gt
+            else self.instance_mask_extractor.extract_labels(image_np)
+        )
+        if self.use_inst_gt or self.sam_model_level_inst == self.sam_model_level_tr:
+            tr_labels_np = inst_labels_np
+        else:
+            tr_labels_np = self.tr_mask_extractor.extract_labels(image_np)
+        instance_labels_full = torch.from_numpy(inst_labels_np).to(self.device)
+        tr_labels_full = torch.from_numpy(tr_labels_np).to(self.device)
         c2w = torch.from_numpy(c2w_np).to(self.device)
         depth = torch.from_numpy(depth_np).to(self.device)
         image = torch.from_numpy(image_np).to(self.device)
@@ -581,7 +634,7 @@ class RGBMapper:
                 depth_keep, colors = depth_keep[keep], colors[keep]
                 normals_cam = normals_cam[keep]
 
-            dense_clip = self.clip_extractor.extract_dense(full_image, instance_labels_full)
+            dense_clip = self.clip_extractor.extract_dense(full_image, tr_labels_full)
             features = dense_clip[y_keep, x_keep].half()
             x_3d = (x_keep - self.cam_intrinsics[0, 2]) * depth_keep / self.cam_intrinsics[0, 0]
             y_3d = (y_keep - self.cam_intrinsics[1, 2]) * depth_keep / self.cam_intrinsics[1, 1]
@@ -653,15 +706,19 @@ class RGBMapper:
                 "instance_match_th": DEFAULT_INSTANCE_MATCH_TH,
                 "instance_new_th": DEFAULT_INSTANCE_NEW_TH,
                 "instance_dominant_frac_th": DEFAULT_INSTANCE_DOMINANT_FRAC_TH,
+                "sam_model_level_tr": self.sam_model_level_tr,
+                "sam_model_type_tr": self.tr_mask_extractor.model_type,
+                "sam_checkpoint_path_tr": str(self.tr_mask_extractor.checkpoint_path),
+                "sam_points_per_side": SAM_POINTS_PER_SIDE,
+                "sam_sort_mode": SAM_SORT_MODE,
+                "sam_min_mask_area_perc": SAM_MIN_MASK_AREA_PERC,
             }
             if not self.use_inst_gt:
                 stats.update(
                     {
-                        "sam_model_type": SAM_MODEL_TYPE,
-                        "sam_checkpoint_path": str(SAM_CHECKPOINT_PATH),
-                        "sam_points_per_side": SAM_POINTS_PER_SIDE,
-                        "sam_sort_mode": SAM_SORT_MODE,
-                        "sam_min_mask_area_perc": SAM_MIN_MASK_AREA_PERC,
+                        "sam_model_level_inst": self.sam_model_level_inst,
+                        "sam_model_type_inst": self.instance_mask_extractor.model_type,
+                        "sam_checkpoint_path_inst": str(self.instance_mask_extractor.checkpoint_path),
                     }
                 )
             with open(output_dir / "stats.json", "w") as f:
@@ -697,6 +754,8 @@ def main(args):
         dataset_name=dataset_name,
         scene_name=args.scene_name,
         use_inst_gt=args.use_inst_gt,
+        sam_model_level_inst=args.sam_model_level_inst,
+        sam_model_level_tr=args.sam_model_level_tr,
     )
 
     progress = tqdm(range(len(dataset)), desc=args.scene_name, unit="frame")
@@ -759,5 +818,7 @@ if __name__ == "__main__":
     parser.add_argument("--k_pooling", type=int, default=DEFAULT_K_POOLING)
     parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
-    parser.add_argument("--use-inst-gt", action="store_true", help="Use decoded ScanNet instance-filt masks instead of SAM for instance evidence.")
+    parser.add_argument("--sam-model-level-inst", type=int, choices=sorted(SAM1_LEVELS), default=13)
+    parser.add_argument("--sam-model-level-tr", type=int, choices=sorted(SAM1_LEVELS), default=13)
+    parser.add_argument("--use-inst-gt", action="store_true", help="Use decoded ScanNet instance-filt masks instead of SAM for instance supervision.")
     main(parser.parse_args())

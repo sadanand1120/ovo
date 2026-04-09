@@ -74,6 +74,8 @@ def build_scene(scene_name: str, args: argparse.Namespace) -> tuple[Path, dict]:
         dataset_name=dataset_name,
         scene_name=scene_name,
         use_inst_gt=args.use_inst_gt,
+        sam_model_level_inst=args.sam_model_level_inst,
+        sam_model_level_tr=args.sam_model_level_tr,
     )
 
     progress = tqdm(range(len(dataset)), desc=scene_name, unit="frame", dynamic_ncols=True)
@@ -282,6 +284,8 @@ if __name__ == "__main__":
     parser.add_argument("--k_pooling", type=int, default=DEFAULT_K_POOLING)
     parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
+    parser.add_argument("--sam-model-level-inst", type=int, choices=[11, 12, 13], default=13)
+    parser.add_argument("--sam-model-level-tr", type=int, choices=[11, 12, 13], default=13)
     parser.add_argument("--use-inst-gt", action="store_true")
     parser.add_argument("--feature_prob_th", type=float, default=DEFAULT_FEATURE_PROB_TH)
     parser.add_argument("--min_component_size", type=int, default=2000)
