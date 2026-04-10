@@ -8,6 +8,7 @@ from zipfile import ZipFile
 
 import cv2
 import numpy as np
+import open3d as o3d
 from tqdm import tqdm
 
 
@@ -220,6 +221,16 @@ def write_semantic_gt(scans_root: Path, output_root: Path, scene_name: str, link
         os.symlink(mesh_path.resolve(), link_path)
 
 
+def write_vertex_normals_gt(scans_root: Path, output_root: Path, scene_name: str) -> None:
+    mesh_path = scans_root / scene_name / f"{scene_name}_vh_clean_2.labels.ply"
+    if not mesh_path.exists():
+        raise FileNotFoundError(f"Missing labeled mesh: {mesh_path}")
+    mesh = o3d.io.read_triangle_mesh(str(mesh_path))
+    mesh.compute_vertex_normals()
+    normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
+    np.save(output_root / scene_name / f"{scene_name}_vh_clean_2.vertex_normals.npy", normals)
+
+
 def extract_filtered_2d_gt(scans_root: Path, output_root: Path, scene_name: str, min_free_gb: float) -> None:
     scene_root = scans_root / scene_name
     output_scene_dir = output_root / scene_name
@@ -268,6 +279,7 @@ def main() -> None:
         if not scene_dir.exists():
             raise FileNotFoundError(f"Scene directory not found: {scene_dir}")
         decode_scene(scene_dir, args.output_root / scene_dir.name, args.frame_skip, args.min_free_gb)
+        write_vertex_normals_gt(args.scans_root, args.output_root, scene_dir.name)
         if args.write_semantic_gt or args.link_pcds:
             write_semantic_gt(args.scans_root, args.output_root, scene_dir.name, args.link_pcds)
         if args.extract_2d_gt_filt:
