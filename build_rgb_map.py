@@ -44,7 +44,7 @@ CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 CLIP_GLOBAL_PATCH_THRESHOLD = 0.07
 TRACK_SUPPORT_MIN = 3
-ATTACH_FRAC_TH = 0.4
+ATTACH_FRAC_TH = 0.6
 BIRTH_MIN_POINTS = 80
 SEED_EXPLAINED_FRAC_TH = 0.8
 TRACK_MISS_MAX = 3
@@ -398,13 +398,12 @@ class SAM2InstanceManager:
         self.stats["sam2_seed_frames"] += 1
         seed_labels = self._extract_seed_labels(frame_id, image_np)
         seed_masks = build_label_masks(seed_labels)
-        kept_seed_masks = self._remove_explained_seed_masks(seed_masks, tracked_masks)
         inst_img_full = np.full(image_np.shape[:2], -1, dtype=np.int32)
         for gid, mask in sorted(tracked_masks.items(), key=lambda item: int(item[1].sum()), reverse=True):
             inst_img_full[mask] = int(gid)
 
         valid_new_support = (point_ids_full < 0) & torch.from_numpy(depth_np > 0).to(point_ids_full.device)
-        for _, seed_mask in kept_seed_masks:
+        for _, seed_mask in seed_masks:
             gid_old, frac_old, support_old = self._dominant_old_gid_under_mask(seed_mask, gid_img_full)
             if gid_old is not None and support_old >= TRACK_SUPPORT_MIN and frac_old >= ATTACH_FRAC_TH:
                 gid = int(gid_old)
@@ -503,24 +502,6 @@ class SAM2InstanceManager:
             state["seed_hits"] += 1
             state["last_seed_counter"] = self.seed_frame_counter
             state["last_seen"] = int(frame_id)
-
-    def _remove_explained_seed_masks(self, seed_masks: list[tuple[int, np.ndarray]], tracked_masks: dict[int, np.ndarray]) -> list[tuple[int, np.ndarray]]:
-        if not tracked_masks:
-            return seed_masks
-        kept = []
-        for seed_obj_id, seed_mask in seed_masks:
-            seed_area = int(seed_mask.sum())
-            if seed_area <= 0:
-                continue
-            explained = False
-            for tracked_mask in tracked_masks.values():
-                overlap = int(np.logical_and(seed_mask, tracked_mask).sum())
-                if overlap / float(seed_area) >= SEED_EXPLAINED_FRAC_TH:
-                    explained = True
-                    break
-            if not explained:
-                kept.append((seed_obj_id, seed_mask))
-        return kept
 
     def _dominant_old_gid_under_mask(self, mask: np.ndarray, gid_img_full: torch.Tensor) -> tuple[int | None, float, int]:
         mask_tensor = torch.from_numpy(mask).to(gid_img_full.device)
