@@ -251,7 +251,7 @@ def extract_filtered_2d_gt(scans_root: Path, output_root: Path, scene_name: str,
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Decode ScanNet .sens files into OVO-ready RGB-D folders.")
+    parser = argparse.ArgumentParser(description="Decode ScanNet .sens files into custom-runtime RGB-D folders.")
     parser.add_argument("--scans_root", required=True, type=Path, help="Directory containing ScanNet scene folders.")
     parser.add_argument("--output_root", required=True, type=Path, help="Directory to write decoded scene folders into.")
     parser.add_argument("--scenes", nargs="*", default=None, help="Optional scene names to decode. Defaults to all scenes under scans_root.")

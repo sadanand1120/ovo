@@ -22,6 +22,20 @@ def load_pose_txt(path: Path) -> np.ndarray:
     return np.loadtxt(path, dtype=np.float32).reshape(4, 4)
 
 
+def load_replica_traj(path: Path) -> list[np.ndarray]:
+    poses = []
+    with open(path, "r") as handle:
+        for line in handle:
+            poses.append(np.array(list(map(float, line.split())), dtype=np.float32).reshape(4, 4))
+    return poses
+
+
+def frame_stem_to_id(stem: str) -> int:
+    if stem.startswith("frame"):
+        return int(stem[len("frame") :])
+    return int(stem)
+
+
 def load_predicted_poses(path: Path) -> dict[int, np.ndarray]:
     poses = torch.load(path, map_location="cpu", weights_only=False)
     return {
@@ -31,14 +45,26 @@ def load_predicted_poses(path: Path) -> dict[int, np.ndarray]:
 
 
 def build_scene_inputs(scene_dir: Path, predicted_poses: dict[int, np.ndarray]) -> tuple[list[int], list[Path], dict[int, np.ndarray], dict[int, np.ndarray]]:
-    color_paths = {
-        int(path.stem): path
-        for path in scene_dir.joinpath("color").glob("*.jpg")
-    }
-    gt_poses = {
-        int(path.stem): load_pose_txt(path)
-        for path in scene_dir.joinpath("pose").glob("*.txt")
-    }
+    if scene_dir.joinpath("color").is_dir() and scene_dir.joinpath("pose").is_dir():
+        color_paths = {
+            int(path.stem): path
+            for path in scene_dir.joinpath("color").glob("*.jpg")
+        }
+        gt_poses = {
+            int(path.stem): load_pose_txt(path)
+            for path in scene_dir.joinpath("pose").glob("*.txt")
+        }
+    elif scene_dir.joinpath("results").is_dir() and scene_dir.joinpath("traj.txt").exists():
+        color_paths = {
+            frame_stem_to_id(path.stem): path
+            for path in scene_dir.joinpath("results").glob("frame*.jpg")
+        }
+        gt_poses = {
+            frame_id: pose
+            for frame_id, pose in zip(sorted(color_paths), load_replica_traj(scene_dir / "traj.txt"))
+        }
+    else:
+        raise ValueError(f"Unsupported scene layout for debug visualization: {scene_dir}")
     frame_ids = sorted(
         frame_id
         for frame_id in (set(color_paths) & set(gt_poses) & set(predicted_poses))
@@ -202,9 +228,9 @@ def render_scene_video(scene_dir: Path, predicted_path: Path, output_path: Path,
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Render ScanNet RGB plus GT-vs-predicted trajectory debug videos.")
+    parser = argparse.ArgumentParser(description="Render dataset RGB plus GT-vs-predicted trajectory debug videos.")
     parser.add_argument("run_root", type=Path, help="Run directory that contains per-scene ORB outputs.")
-    parser.add_argument("--data_root", type=Path, default=Path("data/input/ScanNet"), help="Decoded ScanNet scene root.")
+    parser.add_argument("--data_root", type=Path, default=Path("data/input/ScanNet"), help="Dataset scene root that contains the requested scene directories.")
     parser.add_argument("--output_dir", type=Path, default=None, help="Directory for generated MP4 files.")
     parser.add_argument("--scenes", nargs="*", default=None, help="Optional scene list. Defaults to all scene subdirs in run_root.")
     parser.add_argument("--fps", type=int, default=4, help="Output video FPS.")

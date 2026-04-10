@@ -11,39 +11,7 @@ import numpy as np
 import torch
 
 from debug_visualizer import render_scene_video
-from ovo import io_utils
-from ovo.datasets import get_dataset
-from ovo.ovomapping import get_slam_backbone
-
-
-DATASET_DIRS = {
-    "replica": "Replica",
-    "scannet": "ScanNet",
-}
-CONFIG_DIR = Path("configs")
-INPUT_DIR = Path("data/input")
-OUTPUT_DIR = Path("data/output")
-
-
-def build_scene_config(
-    scene: str,
-    dataset_name: str,
-    slam_module: str,
-    config_path: Path,
-    frame_limit: int | None,
-    disable_loop_closure: bool,
-) -> dict:
-    config = io_utils.load_config(config_path)
-    dataset_cfg = io_utils.load_config(CONFIG_DIR / f"{dataset_name.lower()}.yaml")
-    io_utils.update_recursive(config, dataset_cfg)
-    config["slam"]["slam_module"] = slam_module
-    if disable_loop_closure:
-        config["slam"]["close_loops"] = False
-    config["data"]["scene_name"] = scene
-    config["data"]["input_path"] = str(INPUT_DIR / DATASET_DIRS[dataset_name.lower()] / scene)
-    if frame_limit is not None:
-        config["data"]["frame_limit"] = frame_limit
-    return config
+from map_runtime.scene import CONFIG_DIR, OUTPUT_DIR, canonical_dataset_name, load_dataset_and_slam
 
 
 def rotation_error_deg(gt_pose: np.ndarray, pred_pose: np.ndarray) -> float:
@@ -108,14 +76,21 @@ def run_scene(
     video_fps: int,
     pred_label: str,
 ) -> dict:
-    config = build_scene_config(scene, dataset_name, slam_module, config_path, frame_limit, disable_loop_closure)
-    dataset = get_dataset(dataset_name.lower())({**config["data"], **config["cam"]})
-    cam_intrinsics = torch.tensor(dataset.intrinsics.astype(np.float32), device=config.get("device", "cuda"))
-    slam_backbone = get_slam_backbone(config, dataset, cam_intrinsics)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    config, dataset, slam_backbone = load_dataset_and_slam(
+        dataset_name=dataset_name,
+        scene_name=scene,
+        device=device,
+        frame_limit=frame_limit,
+        config_path=config_path,
+        slam_module=slam_module,
+        disable_loop_closure=disable_loop_closure,
+    )
 
     pred_poses = {}
     gt_poses = {}
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     t0 = time.time()
     for frame_id in range(len(dataset)):
         frame_data = dataset[frame_id]
@@ -126,7 +101,8 @@ def run_scene(
         pred_pose = slam_backbone.get_c2w(frame_id)
         if pred_pose is not None:
             pred_poses[frame_id] = pred_pose.detach().cpu().numpy() if isinstance(pred_pose, torch.Tensor) else np.asarray(pred_pose)
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     elapsed_s = time.time() - t0
 
     scene_output = output_root / scene
@@ -165,7 +141,7 @@ def aggregate_metrics(scene_metrics: dict[str, dict]) -> dict:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tracker-only backend benchmark with pose metrics and debug video export.")
-    parser.add_argument("--dataset_name", default="ScanNet")
+    parser.add_argument("--dataset_name", default="ScanNet", choices=["Replica", "ScanNet"])
     parser.add_argument("--slam_module", choices=["vanilla", "orbslam", "cuvslam"], required=True)
     parser.add_argument("--scenes", nargs="+", required=True)
     parser.add_argument("--output_root", type=Path, default=None)
@@ -179,7 +155,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    output_root = args.output_root or OUTPUT_DIR / "pose_debug" / DATASET_DIRS[args.dataset_name.lower()] / args.slam_module
+    output_root = args.output_root or OUTPUT_DIR / "pose_debug" / canonical_dataset_name(args.dataset_name) / args.slam_module
     if output_root.exists():
         shutil.rmtree(output_root)
     output_root.mkdir(parents=True, exist_ok=True)

@@ -1,4 +1,4 @@
-dataset_name: "replica"
+dataset_name: "Replica"
 cam:
   H: 680
   W: 1200

@@ -1,49 +1,14 @@
-project_name: ovo
-checkpoint_path: null
-use_wandb: False
 device: cuda
 data:
   frame_limit: -1
-seed: 0
 slam:
   slam_module: vanilla
   fps: 30.0
   use_viewer: False
   close_loops: False
   save_estimated_cam: True
-vis:
-  stream: False
-  show_stream: False
 mapping:
   map_every: 5
   max_frame_points: 1e5
   k_pooling: 3
   downscale_res: 2
-tracking:
-  track_every: 1
-semantic:
-  segment_every: 10
-  use_gt_masks: False
-  use_gt_clips: False
-  match_distance_th: 0.05
-  track_th: 100
-  depth_filter: True
-  log: True
-  sam:
-    precomputed: False
-    multi_crop: True
-    points_per_side: 16
-    sam_ckpt_path: "data/input/sam_ckpts/"
-    sam_version: "2.1"
-    sam_encoder: "hiera_l"
-    masks_base_path: "data/masks/replica_384_sam2.1"
-  clip:
-    use_half: True
-    embed_type: learned
-    model_card: SigLIP-384
-    mask_res: 384
-    weights_predictor_path: data/input/weights_predictor
-    k_top_views: 10
-    fusion: l1_medoid
-    mv_fuser: False
-  kf_queue_delay: 10

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import contextlib
 import io
 import logging
@@ -45,7 +47,7 @@ def build_label_masks(labels: np.ndarray, max_objects: int | None = None) -> lis
         if area <= 0:
             continue
         pairs.append((int(obj_id), mask, area))
-    pairs.sort(key=lambda x: x[2], reverse=True)
+    pairs.sort(key=lambda item: item[2], reverse=True)
     if max_objects is not None:
         pairs = pairs[: int(max_objects)]
     return [(obj_id, mask) for obj_id, mask, _ in pairs]

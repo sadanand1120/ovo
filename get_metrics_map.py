@@ -12,10 +12,11 @@ from scipy.spatial import cKDTree
 import torch
 from tqdm.auto import tqdm
 
-from ovo import eval_utils, io_utils
+from map_runtime.config import load_config
+from map_runtime.metrics_utils import iou_acc_from_confmat
 
 
-DATASET_DIRS = {"replica": "Replica", "scannet": "ScanNet"}
+DATASET_CONFIG_NAMES = {"Replica": "replica", "ScanNet": "scannet"}
 CONFIG_DIR = Path("configs")
 INPUT_DIR = Path("data/input")
 TIMING_PATH = "timing.json"
@@ -59,7 +60,9 @@ TIMING_ROW_ORDER = (
 
 
 def canonical_dataset_name(dataset_name: str) -> str:
-    return DATASET_DIRS[dataset_name.lower()]
+    if dataset_name not in DATASET_CONFIG_NAMES:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+    return dataset_name
 
 
 def resolve_ply_path(input_path: str) -> Path:
@@ -70,21 +73,28 @@ def resolve_ply_path(input_path: str) -> Path:
 def infer_scene_info_from_path(ply_path: Path) -> tuple[str, str]:
     scene_name = ply_path.parent.name
     dataset_name = ply_path.parent.parent.name
-    if dataset_name.lower() not in DATASET_DIRS:
+    if dataset_name not in DATASET_CONFIG_NAMES:
         raise ValueError(f"Could not infer dataset from path: {ply_path}")
     return dataset_name, scene_name
 
 
 def load_dataset_info(dataset_name: str) -> dict:
-    return io_utils.load_config(CONFIG_DIR / f"{dataset_name.lower()}_eval.yaml")
+    return load_config(CONFIG_DIR / f"{DATASET_CONFIG_NAMES[dataset_name]}_eval.yaml")
 
 
-def load_ply_vertices(ply_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+def read_label_txt(path: Path) -> np.ndarray:
+    return np.array(path.read_text().splitlines(), dtype=np.int32)
+
+
+def load_ply_vertices(ply_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
     vertex = PlyData.read(str(ply_path))["vertex"].data
     points = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=1).astype(np.float32)
     colors = np.stack([vertex["red"], vertex["green"], vertex["blue"]], axis=1).astype(np.uint8)
     labels = np.asarray(vertex["label"], dtype=np.int32) if "label" in vertex.dtype.names else None
-    return points, colors, labels
+    normals = None
+    if {"nx", "ny", "nz"}.issubset(vertex.dtype.names):
+        normals = np.stack([vertex["nx"], vertex["ny"], vertex["nz"]], axis=1).astype(np.float32)
+    return points, colors, labels, normals
 
 
 def resolve_scannet_gt_paths(scene_name: str, raw_root: str | Path) -> tuple[Path, Path, Path]:
@@ -104,7 +114,7 @@ def resolve_scannet_gt_paths(scene_name: str, raw_root: str | Path) -> tuple[Pat
 
 def load_scannet_gt(scene_name: str, raw_root: str | Path) -> dict:
     labels_ply, seg_path, agg_path = resolve_scannet_gt_paths(scene_name, raw_root)
-    points, colors, semantic_raw = load_ply_vertices(labels_ply)
+    points, colors, semantic_raw, _ = load_ply_vertices(labels_ply)
     normals_path = INPUT_DIR / "ScanNet" / scene_name / f"{scene_name}_vh_clean_2.vertex_normals.npy"
     if not normals_path.exists():
         raise FileNotFoundError(
@@ -125,6 +135,45 @@ def load_scannet_gt(scene_name: str, raw_root: str | Path) -> dict:
         "semantic_raw": semantic_raw,
         "instance_labels": instance_labels,
     }
+
+
+def resolve_replica_gt_paths(scene_name: str, replica_root: str | Path | None) -> tuple[Path, Path]:
+    root = Path(replica_root) if replica_root is not None else INPUT_DIR / "Replica"
+    semantic_path = root / "semantic_gt" / f"{scene_name}.txt"
+    mesh_path = root / f"{scene_name}_mesh.ply"
+    if not semantic_path.exists():
+        raise ValueError(f"Missing Replica semantic GT labels: {semantic_path}")
+    if not mesh_path.exists():
+        raise ValueError(f"Missing Replica mesh: {mesh_path}")
+    return semantic_path, mesh_path
+
+
+def load_replica_gt(scene_name: str, replica_root: str | Path | None) -> dict:
+    semantic_path, mesh_path = resolve_replica_gt_paths(scene_name, replica_root)
+    points, colors, _, normals = load_ply_vertices(mesh_path)
+    semantic_raw = read_label_txt(semantic_path)
+    if semantic_raw.shape[0] != points.shape[0]:
+        raise ValueError(
+            f"Replica semantic GT size mismatch for {scene_name}: "
+            f"{semantic_raw.shape[0]} labels vs {points.shape[0]} mesh vertices."
+        )
+    return {
+        "points": points,
+        "colors": colors,
+        "normals": normals,
+        "semantic_raw": semantic_raw,
+        "instance_labels": None,
+    }
+
+
+def load_gt(dataset_name: str, scene_name: str, args: argparse.Namespace) -> dict:
+    if dataset_name == "ScanNet":
+        if args.scannet_raw_root is None:
+            raise ValueError("--scannet_raw_root is required for ScanNet metrics.")
+        return load_scannet_gt(scene_name, Path(args.scannet_raw_root))
+    if dataset_name == "Replica":
+        return load_replica_gt(scene_name, args.replica_root)
+    raise NotImplementedError(f"Unsupported dataset for metrics: {dataset_name}")
 
 
 def load_pred_map(ply_path: Path) -> dict:
@@ -201,7 +250,7 @@ def build_confusion(gt_labels: np.ndarray, pred_labels: np.ndarray, num_classes:
 
 
 def confusion_to_metrics(confusion: np.ndarray, dataset_info: dict) -> dict:
-    iou_values, iou_valid_mask, weights_values, acc_values, acc_valid_mask = eval_utils.iou_acc_from_confmat(
+    iou_values, iou_valid_mask, weights_values, acc_values, acc_valid_mask = iou_acc_from_confmat(
         confusion,
         dataset_info["num_classes"],
         dataset_info.get("ignore", []).copy(),
@@ -629,16 +678,11 @@ def print_compare_report(current_summary: dict, current_run_dir: Path, baseline_
 def main(args: argparse.Namespace) -> None:
     ply_path = resolve_ply_path(args.input_path)
     dataset_name, scene_name = infer_scene_info_from_path(ply_path)
-    dataset_name = dataset_name.lower()
-    if dataset_name != "scannet":
-        raise NotImplementedError("get_metrics_map.py currently supports ScanNet only.")
-
-    raw_root = Path(args.scannet_raw_root)
     progress = tqdm(total=6, desc=scene_name, unit="stage", dynamic_ncols=True)
     try:
         progress.set_postfix_str("load gt", refresh=True)
         dataset_info = load_dataset_info(dataset_name)
-        gt = load_scannet_gt(scene_name, raw_root)
+        gt = load_gt(dataset_name, scene_name, args)
         progress.update()
 
         progress.set_postfix_str("load map", refresh=True)
@@ -651,7 +695,7 @@ def main(args: argparse.Namespace) -> None:
         gt_to_pred_d = assoc["gt_to_pred_d"]
         coverage = float((gt_to_pred_d <= args.match_distance_th).mean())
         transferred_rgb = pred["colors"][gt_to_pred_idx]
-        transferred_normals = pred["normals"][gt_to_pred_idx]
+        transferred_normals = pred["normals"][gt_to_pred_idx] if gt["normals"] is not None else None
         progress.update()
 
         progress.set_postfix_str("semantic", refresh=True)
@@ -700,14 +744,17 @@ def main(args: argparse.Namespace) -> None:
             dataset_info.get("ignore", []),
         )
         semantic_ovo_metrics = confusion_to_metrics(semantic_ovo_conf, dataset_info)
-        transferred_instance_labels = pred_instance_labels[gt_to_pred_idx]
-        instance_metrics, instance_diag = compute_instance_metrics(gt["instance_labels"], transferred_instance_labels)
+        if gt["instance_labels"] is not None:
+            transferred_instance_labels = pred_instance_labels[gt_to_pred_idx]
+            instance_metrics, instance_diag = compute_instance_metrics(gt["instance_labels"], transferred_instance_labels)
+        else:
+            instance_metrics, instance_diag = None, None
         progress.update()
 
         progress.set_postfix_str("summary", refresh=True)
         geometry_metrics, geometry_diag = compute_geometry_metrics(assoc)
-        rgb_metrics = compute_rgb_metrics(gt["colors"], transferred_rgb)
-        normal_metrics = compute_normal_metrics(gt["normals"], transferred_normals)
+        rgb_metrics = compute_rgb_metrics(gt["colors"], transferred_rgb) if gt["colors"] is not None else None
+        normal_metrics = compute_normal_metrics(gt["normals"], transferred_normals) if gt["normals"] is not None else None
         geometry_metrics["coverage"] = coverage
         progress.update()
     finally:
@@ -725,7 +772,6 @@ def main(args: argparse.Namespace) -> None:
         "diagnostics": {
             "dataset_name": canonical_dataset_name(dataset_name),
             "scene_name": scene_name,
-            "scannet_raw_root": str(raw_root.resolve()),
             "n_pred_points": int(pred["points"].shape[0]),
             "n_gt_vertices": int(gt["points"].shape[0]),
             "match_distance_th_m": float(args.match_distance_th),
@@ -736,12 +782,19 @@ def main(args: argparse.Namespace) -> None:
                 **semantic_ovo_diag_2,
             },
             "feature_text_template": FEATURE_TEXT_TEMPLATE,
-            "instance": {
+            "instance": None if instance_diag is None else {
                 **instance_diag,
                 "min_component_size": int(args.min_component_size),
             },
+            "gt_has_normals": bool(gt["normals"] is not None),
+            "gt_has_instances": bool(gt["instance_labels"] is not None),
         },
     }
+    if dataset_name == "ScanNet":
+        summary["diagnostics"]["scannet_raw_root"] = str(Path(args.scannet_raw_root).resolve())
+    elif dataset_name == "Replica":
+        replica_root = Path(args.replica_root) if args.replica_root is not None else INPUT_DIR / "Replica"
+        summary["diagnostics"]["replica_root"] = str(replica_root.resolve())
     print(json.dumps(round_for_print(summary), indent=2))
 
     if args.save_json:
@@ -754,7 +807,7 @@ def main(args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compute 3D map metrics on ScanNet GT mesh vertices.")
+    parser = argparse.ArgumentParser(description="Compute custom-map metrics against dataset GT assets.")
     parser.add_argument("input_path", help="Path to rgb_map.ply or its containing directory.")
     parser.add_argument("--save_json", action="store_true", help="Save summary to metrics.json next to the map.")
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH, help="Distance threshold used in geometry coverage diagnostics.")
@@ -762,5 +815,6 @@ if __name__ == "__main__":
     parser.add_argument("--min_component_size", type=int, default=2000)
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--compare", default="", help="Optional baseline run directory or rgb_map.ply path to compare against after computing current metrics.")
-    parser.add_argument("--scannet_raw_root", required=True, help="ScanNet raw scans root containing aggregation and segs files, e.g. /path/to/scannet_v2/scans.")
+    parser.add_argument("--scannet_raw_root", default=None, help="ScanNet raw scans root containing aggregation and segs files, e.g. /path/to/scannet_v2/scans.")
+    parser.add_argument("--replica_root", default=None, help="Replica root containing semantic_gt/ and *_mesh.ply files. Defaults to data/input/Replica.")
     main(parser.parse_args())

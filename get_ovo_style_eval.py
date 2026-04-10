@@ -23,7 +23,8 @@ from build_rgb_map import (
     RGBMapper,
     TIMING_PATH,
     canonical_dataset_name,
-    load_dataset,
+    get_tracked_pose,
+    load_dataset_and_slam,
 )
 from get_metrics_map import (
     DEFAULT_CHUNK_SIZE,
@@ -48,7 +49,7 @@ OUTPUT_DIR = Path("data/output/ovo_style_eval")
 
 
 def build_scene(scene_name: str, args: argparse.Namespace) -> tuple[Path, dict]:
-    dataset_name = args.dataset_name.lower()
+    dataset_name = args.dataset_name
     output_dir = Path(args.output_root) / canonical_dataset_name(dataset_name) / scene_name
     if output_dir.exists():
         for child in output_dir.iterdir():
@@ -61,9 +62,17 @@ def build_scene(scene_name: str, args: argparse.Namespace) -> tuple[Path, dict]:
 
     run_start = time.perf_counter()
     dataset_load_start = time.perf_counter()
-    dataset = load_dataset(dataset_name, scene_name, args.frame_limit)
-    dataset_load_sec = time.perf_counter() - dataset_load_start
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    config, dataset, slam_backbone = load_dataset_and_slam(
+        dataset_name=dataset_name,
+        scene_name=scene_name,
+        device=device,
+        frame_limit=args.frame_limit,
+        config_path=args.config_path,
+        slam_module=args.slam_module,
+        disable_loop_closure=args.disable_loop_closure,
+    )
+    dataset_load_sec = time.perf_counter() - dataset_load_start
     mapper = RGBMapper(
         intrinsics=dataset.intrinsics,
         device=device,
@@ -83,7 +92,9 @@ def build_scene(scene_name: str, args: argparse.Namespace) -> tuple[Path, dict]:
     progress = tqdm(range(len(dataset)), desc=scene_name, unit="frame", dynamic_ncols=True)
     frame_loop_start = time.perf_counter()
     for frame_id in progress:
-        mapper.add_frame(dataset[frame_id])
+        frame_data = dataset[frame_id]
+        estimated_c2w = get_tracked_pose(slam_backbone, frame_data)
+        mapper.add_frame(frame_data, c2w_override=estimated_c2w)
         progress.set_postfix(
             points=mapper.n_points,
             active=mapper.instance_manager.num_active_instances(),
@@ -101,6 +112,8 @@ def build_scene(scene_name: str, args: argparse.Namespace) -> tuple[Path, dict]:
             "n_points": mapper.n_points,
             "has_normals": True,
             "device": device,
+            "slam_module": config["slam"].get("slam_module", "vanilla"),
+            "slam_close_loops": bool(config["slam"].get("close_loops", True)),
             "map_every": mapper.map_every,
             "downscale_res": args.downscale_res,
             "k_pooling": args.k_pooling,
@@ -128,6 +141,7 @@ def build_scene(scene_name: str, args: argparse.Namespace) -> tuple[Path, dict]:
     }
     with open(output_dir / TIMING_PATH, "w") as f:
         json.dump(timing_summary, f, indent=2)
+    del slam_backbone
     return output_dir, timing_summary
 
 
@@ -200,8 +214,8 @@ def render_table(rows: list[dict], total_metrics: dict) -> str:
 
 
 def main(args: argparse.Namespace) -> None:
-    dataset_name = args.dataset_name.lower()
-    if dataset_name != "scannet":
+    dataset_name = args.dataset_name
+    if dataset_name != "ScanNet":
         raise NotImplementedError("get_ovo_style_eval.py currently supports ScanNet only.")
 
     dataset_info = deepcopy(load_dataset_info(dataset_name))
@@ -279,10 +293,13 @@ def main(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build the 5 ScanNet HVS scenes and report OVO-style semantic metrics directly comparable to the paper table.")
-    parser.add_argument("--dataset_name", required=True, choices=["ScanNet", "scannet"])
+    parser.add_argument("--dataset_name", required=True, choices=["ScanNet"])
     parser.add_argument("--output_root", default=str(OUTPUT_DIR))
     parser.add_argument("--scannet_raw_root", required=True, help="ScanNet raw scans root containing aggregation and segs files.")
     parser.add_argument("--frame_limit", type=int, default=None)
+    parser.add_argument("--slam_module", type=str, default=None, help="Override slam backend, e.g. vanilla, orbslam, or cuvslam.")
+    parser.add_argument("--disable_loop_closure", action="store_true", help="Disable ORB-SLAM loop closure/global BA updates by forcing slam.close_loops=false.")
+    parser.add_argument("--config_path", type=str, default="configs/ovo.yaml", help="Base runtime config file to load.")
     parser.add_argument("--scenes", nargs="*", default=None, help="Optional override scene list. Defaults to the 5 HVS scenes from configs/scannet_eval.yaml.")
     parser.add_argument("--map_every", type=int, default=DEFAULT_MAP_EVERY)
     parser.add_argument("--downscale_res", type=int, default=DEFAULT_DOWNSCALE_RES)

@@ -13,9 +13,8 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from ovo import geometry_utils, io_utils
-from ovo.datasets import get_dataset
-from ovo.sam_mask_utils import (
+from map_runtime import geometry
+from map_runtime.sam_masks import (
     GTInstanceMaskExtractor,
     SAM1_LEVELS,
     SAMMaskExtractor,
@@ -23,12 +22,16 @@ from ovo.sam_mask_utils import (
     SAM_POINTS_PER_SIDE,
     SAM_SORT_MODE,
 )
-from ovo.sam2_utils import SAM2_MAX_NUM_OBJECTS, SAM2_LEVELS, SAM2VideoTracker, build_label_masks
+from map_runtime.sam2_tracking import SAM2_MAX_NUM_OBJECTS, SAM2_LEVELS, SAM2VideoTracker, build_label_masks
+from map_runtime.scene import (
+    INPUT_DIR,
+    canonical_dataset_name,
+    get_tracked_pose,
+    load_dataset as load_scene_dataset,
+    load_dataset_and_slam,
+)
 
 
-DATASET_DIRS = {"replica": "Replica", "scannet": "ScanNet"}
-CONFIG_DIR = Path("configs")
-INPUT_DIR = Path("data/input")
 OUTPUT_DIR = Path("data/output/rgb_maps")
 TIMING_PATH = "timing.json"
 CLIP_FEATURE_FILE = "clip_feats.npy"
@@ -51,21 +54,23 @@ TRACK_MISS_MAX = 3
 CONFIRM_MIN_POINTS = 80
 CONFIRM_MIN_SEED_HITS = 2
 TENTATIVE_MAX_SEED_AGE = 2
-
-
-def canonical_dataset_name(dataset_name: str) -> str:
-    return DATASET_DIRS[dataset_name.lower()]
-
-
-def load_dataset(dataset_name: str, scene_name: str, frame_limit: int | None):
-    config = io_utils.load_config(CONFIG_DIR / "ovo.yaml")
-    io_utils.update_recursive(config, io_utils.load_config(CONFIG_DIR / f"{dataset_name.lower()}.yaml"))
-    dataset_cfg = {
-        **config["cam"],
-        "input_path": str(INPUT_DIR / canonical_dataset_name(dataset_name) / scene_name),
-        "frame_limit": config["data"].get("frame_limit", -1) if frame_limit is None else frame_limit,
-    }
-    return get_dataset(dataset_name.lower())(dataset_cfg)
+def load_dataset(
+    dataset_name: str,
+    scene_name: str,
+    frame_limit: int | None,
+    config_path: str = "configs/ovo.yaml",
+    slam_module: str | None = None,
+    disable_loop_closure: bool = False,
+):
+    _, dataset = load_scene_dataset(
+        dataset_name=dataset_name,
+        scene_name=scene_name,
+        frame_limit=frame_limit,
+        config_path=config_path,
+        slam_module=slam_module,
+        disable_loop_closure=disable_loop_closure,
+    )
+    return dataset
 
 
 def as_int(value) -> int:
@@ -679,9 +684,24 @@ class RGBMapper:
         mean_normals = self.normal_sum[unique_ids] / counts
         self.normals[unique_ids] = mean_normals / torch.linalg.norm(mean_normals, dim=1, keepdim=True).clamp_min(1e-8)
 
-    def add_frame(self, frame_data) -> None:
-        frame_id, image_np, depth_np, c2w_np = frame_data[:4]
-        is_seed_frame = self.should_map_frame(frame_id)
+    def add_frame(self, frame_data, c2w_override=None, is_seed_frame: bool | None = None) -> None:
+        frame_id, image_np, depth_np = frame_data[:3]
+        if is_seed_frame is None:
+            is_seed_frame = self.should_map_frame(frame_id)
+        c2w_np = frame_data[3] if c2w_override is None else c2w_override
+        if c2w_np is None:
+            if is_seed_frame:
+                self.instance_manager.close()
+                self.instance_manager.active_gids.clear()
+            self.instance_manager.cleanup_tentatives(frame_id, is_seed_frame=is_seed_frame)
+            self._refresh_point_label_cache()
+            return
+        if isinstance(c2w_np, torch.Tensor):
+            c2w = c2w_np.to(self.device, dtype=torch.float32)
+            c2w_np = c2w.detach().cpu().numpy()
+        else:
+            c2w_np = np.asarray(c2w_np, dtype=np.float32)
+            c2w = torch.from_numpy(c2w_np).to(self.device)
         if np.isinf(c2w_np).any() or np.isnan(c2w_np).any():
             if is_seed_frame:
                 self.instance_manager.close()
@@ -690,7 +710,6 @@ class RGBMapper:
             self._refresh_point_label_cache()
             return
 
-        c2w = torch.from_numpy(c2w_np).to(self.device)
         depth = torch.from_numpy(depth_np).to(self.device)
         image = torch.from_numpy(image_np).to(self.device)
         full_image = image
@@ -702,11 +721,11 @@ class RGBMapper:
 
         if self.n_points > 0:
             self._refresh_point_label_cache()
-            frustum_corners = geometry_utils.compute_camera_frustum_corners(depth, c2w, self.cam_intrinsics)
+            frustum_corners = geometry.compute_camera_frustum_corners(depth, c2w, self.cam_intrinsics)
             w2c = invert_rigid_transform(c2w)
-            frustum_mask = geometry_utils.compute_frustum_point_ids(self.points[: self.n_points], frustum_corners, device=self.device)
+            frustum_mask = geometry.compute_frustum_point_ids(self.points[: self.n_points], frustum_corners, device=self.device)
             if frustum_mask.numel() > 0:
-                matched_ids, matches = geometry_utils.match_3d_points_to_2d_pixels(
+                matched_ids, matches = geometry.match_3d_points_to_2d_pixels(
                     depth,
                     w2c,
                     self.points[frustum_mask],
@@ -886,12 +905,20 @@ class RGBMapper:
 
 def main(args):
     run_start = time.perf_counter()
-    dataset_name = args.dataset_name.lower()
+    dataset_name = args.dataset_name
     output_dir = Path(args.output_root) / canonical_dataset_name(dataset_name) / args.scene_name
     dataset_load_start = time.perf_counter()
-    dataset = load_dataset(dataset_name, args.scene_name, args.frame_limit)
-    dataset_load_sec = time.perf_counter() - dataset_load_start
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    config, dataset, slam_backbone = load_dataset_and_slam(
+        dataset_name=dataset_name,
+        scene_name=args.scene_name,
+        device=device,
+        frame_limit=args.frame_limit,
+        config_path=args.config_path,
+        slam_module=args.slam_module,
+        disable_loop_closure=args.disable_loop_closure,
+    )
+    dataset_load_sec = time.perf_counter() - dataset_load_start
     mapper = RGBMapper(
         intrinsics=dataset.intrinsics,
         device=device,
@@ -911,7 +938,9 @@ def main(args):
     progress = tqdm(range(len(dataset)), desc=args.scene_name, unit="frame")
     frame_loop_start = time.perf_counter()
     for frame_id in progress:
-        mapper.add_frame(dataset[frame_id])
+        frame_data = dataset[frame_id]
+        estimated_c2w = get_tracked_pose(slam_backbone, frame_data)
+        mapper.add_frame(frame_data, c2w_override=estimated_c2w)
         progress.set_postfix(
             points=mapper.n_points,
             active=mapper.instance_manager.num_active_instances(),
@@ -929,6 +958,8 @@ def main(args):
             "n_points": mapper.n_points,
             "has_normals": True,
             "device": device,
+            "slam_module": config["slam"].get("slam_module", "vanilla"),
+            "slam_close_loops": bool(config["slam"].get("close_loops", True)),
             "map_every": mapper.map_every,
             "downscale_res": args.downscale_res,
             "k_pooling": mapper.k_pooling,
@@ -956,16 +987,20 @@ def main(args):
     }
     with open(output_dir / TIMING_PATH, "w") as f:
         json.dump(timing_summary, f, indent=2)
+    del slam_backbone
     print(json.dumps({"timing": timing_summary}, indent=2))
     print(output_dir / "rgb_map.ply")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Build a standalone RGB pointcloud map from RGB-D + GT poses.")
-    parser.add_argument("--dataset_name", required=True, choices=["Replica", "ScanNet", "replica", "scannet"])
+    parser = argparse.ArgumentParser(description="Build a standalone RGB pointcloud map from RGB-D using the selected SLAM pose backend.")
+    parser.add_argument("--dataset_name", required=True, choices=["Replica", "ScanNet"])
     parser.add_argument("--scene_name", required=True)
     parser.add_argument("--output_root", default=str(OUTPUT_DIR))
     parser.add_argument("--frame_limit", type=int, default=None)
+    parser.add_argument("--slam_module", type=str, default=None, help="Override slam backend, e.g. vanilla, orbslam, or cuvslam.")
+    parser.add_argument("--disable_loop_closure", action="store_true", help="Disable ORB-SLAM loop closure/global BA updates by forcing slam.close_loops=false.")
+    parser.add_argument("--config_path", type=str, default="configs/ovo.yaml", help="Base runtime config file to load.")
     parser.add_argument("--map_every", type=int, default=DEFAULT_MAP_EVERY)
     parser.add_argument("--downscale_res", type=int, default=DEFAULT_DOWNSCALE_RES)
     parser.add_argument("--k_pooling", type=int, default=DEFAULT_K_POOLING)
@@ -975,4 +1010,7 @@ if __name__ == "__main__":
     parser.add_argument("--sam-model-level-textregion", type=int, choices=sorted(SAM1_LEVELS), default=13)
     parser.add_argument("--sam2-model-level-track", type=int, choices=sorted(SAM2_LEVELS), default=24)
     parser.add_argument("--use-inst-gt", action="store_true", help="Use decoded ScanNet instance-filt masks instead of SAM for instance supervision.")
-    main(parser.parse_args())
+    parsed = parser.parse_args()
+    if parsed.use_inst_gt and parsed.dataset_name != "ScanNet":
+        raise ValueError("--use-inst-gt is only supported for ScanNet decoded instance-filt masks.")
+    main(parsed)

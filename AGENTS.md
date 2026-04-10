@@ -1,13 +1,13 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `run_eval.py` is the main entry point for mapping, projection, and metrics. `visualize_scene.py` inspects saved runs. `scannet_decode_sens.py` prepares ScanNet RGB-D folders and `semantic_gt`.
-- `ovo/` is intentionally flat. `ovomapping.py` orchestrates runs, `ovo.py` manages 3D instances, `clip_generator.py` / `mask_generator.py` wrap the semantic backbones, `vanilla_mapper.py` and `orbslam.py` provide the geometry backends, and the remaining modules are focused helpers.
+- `build_rgb_map.py` is the main entry point for the RGB+normal+CLIP+instance map workflow. `topdown_vis.py`, `visualize_rgb_map.py`, and `get_metrics_map.py` inspect and evaluate those outputs.
+- `map_runtime/` holds the first-party runtime used by the main scripts: config loading, datasets, geometry, SAM/SAM2 wrappers, and SLAM backends.
 - `configs/` holds the runtime config and dataset metadata: `ovo.yaml`, `replica.yaml`, `scannet.yaml`, `replica_eval.yaml`, and `scannet_eval.yaml`.
 - `data/input/` holds datasets and checkpoints. `data/output/` holds generated runs. `thirdParty/` is reserved for external dependencies.
 
 ## Build, Test, and Development Commands
-- Use `README.md` as the source of truth for environment setup, checkpoint download, ScanNet decoding, backend build steps, `run_eval.py` commands, metrics inspection, and visualization commands.
+- Use `README.md` as the source of truth for environment setup, checkpoint download, ScanNet decoding, backend build steps, and the map build/eval/viewer commands.
 - `git submodule update --init --recursive` fetches `ORB_SLAM3` and `segment-anything-2`.
 - Run all commands associated to this repo inside container named 'humble' and inside a conda (/opt/miniconda3) env called 'ovo'. Use docker exec to run commands inside the container.
 
@@ -18,8 +18,8 @@
 
 ## Testing Guidelines
 - There is no first-party unit test suite; validation is command-driven.
-- For backend or mapping changes, run at least one small `run_eval.py` scene using the exact command patterns in `README.md`. For viewer changes, rerun `visualize_scene.py`.
-- If you touch config loading, dataset prep, or output writing, confirm `config.yaml` and `ovo_map.ckpt` appear under `data/output/<Dataset>/<experiment>/<scene>/`.
+- For backend or mapping changes, run at least one small `build_rgb_map.py` scene using the exact command patterns in `README.md`. For viewer changes, rerun the relevant viewer (`topdown_vis.py` or `visualize_rgb_map.py`).
+- If you touch config loading, dataset prep, or output writing, confirm `rgb_map.ply`, `clip_feats.npy`, `instance_labels.npy`, `stats.json`, and `timing.json` appear under the output scene directory.
 - `vanilla` is deterministic here and is the best regression check. `orbslam` is functional but not bit-stable run to run.
 - `--use-inst-gt` is only for isolating supervision-source issues while developing the instance pipeline; use it to separate SAM-side errors from instance-tracking bugs. This is NOT to be used to cheat in any sneaky way, or to sidestep the real intent of what the code is trying to do.
 - If a long-running validation command is interrupted or a tool session aborts, verify whether the process is still running and kill it directly by PID or `pkill` before continuing. This applies especially to `docker exec ... python ...` wrappers, which may survive a client-side abort.

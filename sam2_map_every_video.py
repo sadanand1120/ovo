@@ -7,10 +7,10 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from ovo.sam_mask_utils import GTInstanceMaskExtractor, SAMMaskExtractor
-from ovo.sam2_utils import SAM2_LEVELS, SAM2_MAX_NUM_OBJECTS, SAM2VideoTracker, build_seed_objects
+from map_runtime.sam_masks import GTInstanceMaskExtractor, SAMMaskExtractor
+from map_runtime.sam2_tracking import SAM2_LEVELS, SAM2_MAX_NUM_OBJECTS, SAM2VideoTracker, build_seed_objects
+from map_runtime.scene import INPUT_DIR, canonical_dataset_name
 
-INPUT_DIR = Path("data/input/ScanNet")
 OUTPUT_DIR = Path("data/output/sam2_map_every_video")
 TEXT_COLOR = (255, 255, 255)
 TEXT_BG = (20, 20, 20)
@@ -22,21 +22,32 @@ def parse_map_every(value: str) -> float:
     return float(int(value))
 
 
-def list_frames(scene_dir: Path, frame_limit: int | None) -> list[int]:
-    color_dir = scene_dir / "color"
-    frame_ids = sorted(int(path.stem) for path in color_dir.iterdir() if path.suffix.lower() in {".jpg", ".jpeg", ".png"})
+def frame_stem_to_id(stem: str) -> int:
+    if stem.startswith("frame"):
+        return int(stem[len("frame") :])
+    return int(stem)
+
+
+def build_frame_lookup(scene_dir: Path, dataset_name: str, frame_limit: int | None) -> dict[int, Path]:
+    if dataset_name == "ScanNet":
+        candidates = [
+            path
+            for path in (scene_dir / "color").iterdir()
+            if path.suffix.lower() in {".jpg", ".jpeg", ".png"}
+        ]
+    else:
+        candidates = list((scene_dir / "results").glob("frame*.jpg")) + list((scene_dir / "results").glob("frame*.png"))
+    frame_lookup = {frame_stem_to_id(path.stem): path for path in candidates}
     if frame_limit is not None:
-        frame_ids = [frame_id for frame_id in frame_ids if frame_id < frame_limit]
-    return frame_ids
+        frame_lookup = {frame_id: path for frame_id, path in frame_lookup.items() if frame_id < frame_limit}
+    return dict(sorted(frame_lookup.items()))
 
 
-def load_color_frame(scene_dir: Path, frame_id: int) -> np.ndarray:
-    for suffix in (".jpg", ".png"):
-        path = scene_dir / "color" / f"{frame_id}{suffix}"
-        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-        if image is not None:
-            return image
-    raise FileNotFoundError(scene_dir / "color" / f"{frame_id}.jpg")
+def load_color_frame(frame_path: Path) -> np.ndarray:
+    image = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(frame_path)
+    return image
 
 
 def color_for_id(label: int) -> np.ndarray:
@@ -117,23 +128,23 @@ def colorize_with_display_map(labels: np.ndarray, display_map: dict[int, int]) -
 
 
 def write_video(
+    dataset_name: str,
     scene_dir: Path,
     output_path: Path,
     frame_ids: list[int],
+    frame_lookup: dict[int, Path],
     map_every: float,
     fps: float,
     use_inst_gt: bool,
     sam_model_level_inst: int,
     sam2_model_level_track: int,
 ) -> None:
-    color_dir = scene_dir / "color"
-    frame_paths = [
-        color_dir / f"{frame_id}.jpg" if (color_dir / f"{frame_id}.jpg").exists() else color_dir / f"{frame_id}.png"
-        for frame_id in frame_ids
-    ]
+    frame_paths = [frame_lookup[frame_id] for frame_id in frame_ids]
+    if use_inst_gt and dataset_name != "ScanNet":
+        raise ValueError("--use-inst-gt is only supported for ScanNet decoded instance-filt masks.")
     gt_extractor = GTInstanceMaskExtractor("ScanNet", scene_dir.name) if use_inst_gt else None
     sam_extractor = None if use_inst_gt else SAMMaskExtractor("cuda" if torch.cuda.is_available() else "cpu", sam_model_level_inst)
-    first_image = load_color_frame(scene_dir, frame_ids[0])
+    first_image = load_color_frame(frame_lookup[frame_ids[0]])
     h, w = first_image.shape[:2]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w * 3, h))
@@ -150,7 +161,7 @@ def write_video(
                 seg_end = min(len(frame_ids), seg_start + int(map_every))
             segment_frame_paths = frame_paths[seg_start:seg_end]
             mask_tracker = SAM2VideoTracker(segment_frame_paths[0], sam2_model_level_track)
-            seed_rgb = load_color_frame(scene_dir, seed_frame_id)
+            seed_rgb = load_color_frame(frame_lookup[seed_frame_id])
             seed_labels, display_map = extract_seed_labels(
                 scene_dir,
                 seed_frame_id,
@@ -170,7 +181,7 @@ def write_video(
                 mask_seed_outputs = mask_tracker.reset_and_seed_masks(seed_masks)
                 mask_obj_to_display = {int(obj_id): display_map[int(obj_id)] for obj_id, _ in seed_masks}
                 for seg_local_idx, frame_id in enumerate(frame_ids[seg_start:seg_end]):
-                    rgb = load_color_frame(scene_dir, frame_id)
+                    rgb = load_color_frame(frame_lookup[frame_id])
                     mask_vis = np.zeros_like(panel2_vis)
                     mask_frame_masks = mask_seed_outputs if seg_local_idx == 0 else mask_tracker.track_frame(seg_local_idx)
                     for obj_id, mask in mask_frame_masks.items():
@@ -205,19 +216,23 @@ def write_video(
 
 
 def main(args) -> None:
-    scene_dir = INPUT_DIR / args.scene_name
+    dataset_name = args.dataset_name
+    scene_dir = INPUT_DIR / canonical_dataset_name(dataset_name) / args.scene_name
     if not scene_dir.exists():
         raise FileNotFoundError(scene_dir)
-    frame_ids = list_frames(scene_dir, args.frame_limit)
+    frame_lookup = build_frame_lookup(scene_dir, dataset_name, args.frame_limit)
+    frame_ids = list(frame_lookup)
     if not frame_ids:
         raise RuntimeError("No frames found.")
     map_every = parse_map_every(args.map_every)
     out_name = f"{args.scene_name}_mapevery_{args.map_every}.mp4"
-    output_path = Path(args.output_root) / args.scene_name / out_name
+    output_path = Path(args.output_root) / canonical_dataset_name(dataset_name) / args.scene_name / out_name
     write_video(
+        dataset_name,
         scene_dir,
         output_path,
         frame_ids,
+        frame_lookup,
         map_every,
         args.fps,
         args.use_inst_gt,
@@ -229,6 +244,7 @@ def main(args) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset_name", default="ScanNet", choices=["Replica", "ScanNet"])
     parser.add_argument("--scene_name", default="scene0011_00")
     parser.add_argument("--output_root", default=str(OUTPUT_DIR))
     parser.add_argument("--map_every", default="10000")

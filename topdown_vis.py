@@ -19,7 +19,8 @@ from build_rgb_map import (
     DEFAULT_MAX_FRAME_POINTS,
     RGBMapper,
     canonical_dataset_name,
-    load_dataset,
+    get_tracked_pose,
+    load_dataset_and_slam,
 )
 from visualize_rgb_map import (
     DEFAULT_CHUNK_SIZE,
@@ -225,15 +226,24 @@ def render_incremental_video(
 
 
 def main(args: argparse.Namespace) -> None:
-    dataset_name = args.dataset_name.lower()
+    dataset_name = args.dataset_name
     scene_name = args.scene_name
     output_dir = Path(args.output_root) / canonical_dataset_name(dataset_name) / scene_name
-    dataset = load_dataset(dataset_name, scene_name, args.frame_limit)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    config, dataset, slam_backbone = load_dataset_and_slam(
+        dataset_name=dataset_name,
+        scene_name=scene_name,
+        device=device,
+        frame_limit=args.frame_limit,
+        config_path=args.config_path,
+        slam_module=args.slam_module,
+        disable_loop_closure=args.disable_loop_closure,
+    )
     intrinsic, extrinsic, width, height = load_view(Path(args.load_view))
 
     mapper = RGBMapper(
         intrinsics=dataset.intrinsics,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device=device,
         map_every=args.map_every,
         downscale_res=args.downscale_res,
         k_pooling=args.k_pooling,
@@ -256,13 +266,15 @@ def main(args: argparse.Namespace) -> None:
     for frame_id in progress:
         frame_data = dataset[frame_id]
         prev_n = mapper.n_points
-        mapper.add_frame(frame_data)
+        estimated_c2w = get_tracked_pose(slam_backbone, frame_data)
+        mapper.add_frame(frame_data, c2w_override=estimated_c2w)
         cur_n = mapper.n_points
         progress.set_postfix(points=cur_n, refresh=False)
-        if cur_n > prev_n:
+        if cur_n > prev_n and estimated_c2w is not None:
             snapshot_counts.append(cur_n)
             snapshot_frame_ids.append(frame_id)
-            snapshot_c2w.append(np.asarray(frame_data[3], dtype=np.float32).copy())
+            pose_np = estimated_c2w.detach().cpu().numpy() if isinstance(estimated_c2w, torch.Tensor) else np.asarray(estimated_c2w, dtype=np.float32)
+            snapshot_c2w.append(pose_np.astype(np.float32, copy=True))
 
     mapper.save(
         output_dir,
@@ -273,6 +285,8 @@ def main(args: argparse.Namespace) -> None:
             "n_points": mapper.n_points,
             "has_normals": True,
             "device": mapper.device,
+            "slam_module": config["slam"].get("slam_module", "vanilla"),
+            "slam_close_loops": bool(config["slam"].get("close_loops", True)),
             "map_every": mapper.map_every,
             "downscale_res": args.downscale_res,
             "k_pooling": args.k_pooling,
@@ -324,16 +338,20 @@ def main(args: argparse.Namespace) -> None:
         "n_snapshots": len(snapshot_counts),
         "n_points": int(points.shape[0]),
     }
+    del slam_backbone
     print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build RGB+normal+CLIP maps and render incremental view videos.")
-    parser.add_argument("--dataset_name", required=True, choices=["Replica", "ScanNet", "replica", "scannet"])
+    parser.add_argument("--dataset_name", required=True, choices=["Replica", "ScanNet"])
     parser.add_argument("--scene_name", required=True)
     parser.add_argument("--output_root", default="data/output/topdown_vis")
     parser.add_argument("--load-view", required=True, help="Path to a saved view JSON dumped from visualize_rgb_map.py.")
     parser.add_argument("--frame_limit", type=int, default=None)
+    parser.add_argument("--slam_module", type=str, default=None, help="Override slam backend, e.g. vanilla, orbslam, or cuvslam.")
+    parser.add_argument("--disable_loop_closure", action="store_true", help="Disable ORB-SLAM loop closure/global BA updates by forcing slam.close_loops=false.")
+    parser.add_argument("--config_path", type=str, default="configs/ovo.yaml", help="Base runtime config file to load.")
     parser.add_argument("--map_every", type=int, default=DEFAULT_MAP_EVERY)
     parser.add_argument("--downscale_res", type=int, default=DEFAULT_DOWNSCALE_RES)
     parser.add_argument("--k_pooling", type=int, default=DEFAULT_K_POOLING)
@@ -348,4 +366,7 @@ if __name__ == "__main__":
     parser.add_argument("--min_component_size", type=int, default=2000)
     parser.add_argument("--pca_sample_size", type=int, default=DEFAULT_PCA_SAMPLE_SIZE)
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
-    main(parser.parse_args())
+    parsed = parser.parse_args()
+    if parsed.use_inst_gt and parsed.dataset_name != "ScanNet":
+        raise ValueError("--use-inst-gt is only supported for ScanNet decoded instance-filt masks.")
+    main(parsed)
