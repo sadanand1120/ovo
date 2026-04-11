@@ -8,7 +8,7 @@ import torch
 from tqdm.auto import tqdm
 
 from map_runtime.metrics_utils import compute_instance_ap_dataset
-from map_runtime.sam_masks import GTInstanceMaskExtractor, SAM_AMG_LEVELS, SAMAutomaticMaskConfig, SAMMaskExtractor, mask_score
+from map_runtime.sam_masks import GTInstanceMaskExtractor, SAM_AMG_LEVELS, SAMAutomaticMaskConfig, SAMMaskExtractor
 from map_runtime.sam2_tracking import SAM2_MODE
 from map_runtime.scene import INPUT_DIR, canonical_dataset_name
 
@@ -89,22 +89,50 @@ def labels_to_instance_masks(labels: np.ndarray) -> tuple[list[np.ndarray], np.n
     return masks, np.asarray(scores, dtype=np.float32)
 
 
+def mask_ranking_score(
+    mask: dict,
+    sort_mode: str,
+    pred_iou_power: float,
+    stability_power: float,
+    area_power: float,
+) -> float:
+    predicted_iou = max(float(mask.get("predicted_iou", 0.0)), 1e-12)
+    stability = max(float(mask.get("stability_score", 0.0)), 1e-12)
+    area = max(float(mask.get("area", 0.0)), 1.0)
+    if sort_mode == "predicted_iou":
+        return (predicted_iou**pred_iou_power) * (area**area_power)
+    if sort_mode == "stability":
+        return (stability**stability_power) * (area**area_power)
+    if sort_mode == "score":
+        return (predicted_iou**pred_iou_power) * (stability**stability_power) * (area**area_power)
+    return area
+
+
 def sam_masks_with_scores(
     pred_extractor: SAMMaskExtractor,
     image_rgb: np.ndarray,
     min_mask_area_perc: float,
+    max_mask_area_perc: float,
     sort_mode: str,
+    pred_iou_power: float,
+    stability_power: float,
+    area_power: float,
 ) -> tuple[list[np.ndarray], np.ndarray]:
     height, width = image_rgb.shape[:2]
-    min_mask_area = float(min_mask_area_perc) * height * width
+    image_area = float(height * width)
+    min_mask_area = float(min_mask_area_perc) * image_area
+    max_mask_area = None if max_mask_area_perc <= 0 else float(max_mask_area_perc) * image_area
     raw_masks = pred_extractor.mask_generator.generate(image_rgb)
     masks = []
     scores = []
     for mask in raw_masks:
-        if float(mask.get("area", 0.0)) < min_mask_area:
+        mask_area = float(mask.get("area", 0.0))
+        if mask_area < min_mask_area:
+            continue
+        if max_mask_area is not None and mask_area > max_mask_area:
             continue
         masks.append(np.asarray(mask["segmentation"], dtype=bool))
-        scores.append(float(mask_score(mask, sort_mode)))
+        scores.append(float(mask_ranking_score(mask, sort_mode, pred_iou_power, stability_power, area_power)))
     return masks, np.asarray(scores, dtype=np.float32)
 
 
@@ -121,6 +149,80 @@ def build_mask_iou_matrix(gt_masks: list[np.ndarray], pred_masks: list[np.ndarra
     valid = union > 0
     iou[valid] = intersection[valid] / union[valid]
     return iou
+
+
+def suppress_redundant_masks(
+    masks: list[np.ndarray],
+    scores: np.ndarray,
+    iou_thresh: float,
+    containment_thresh: float,
+) -> tuple[list[np.ndarray], np.ndarray]:
+    if len(masks) <= 1 or (iou_thresh <= 0 and containment_thresh <= 0):
+        return masks, scores
+    order = np.argsort(scores)[::-1]
+    kept_masks: list[np.ndarray] = []
+    kept_scores: list[float] = []
+    kept_flat: list[np.ndarray] = []
+    kept_areas: list[int] = []
+    for idx in order.tolist():
+        mask = masks[idx]
+        mask_flat = mask.reshape(-1)
+        area = int(mask_flat.sum())
+        if area <= 0:
+            continue
+        is_redundant = False
+        for prev_flat, prev_area in zip(kept_flat, kept_areas):
+            intersection = int(np.logical_and(mask_flat, prev_flat).sum(dtype=np.int64))
+            if iou_thresh > 0:
+                union = area + prev_area - intersection
+                if union > 0 and (intersection / union) > iou_thresh:
+                    is_redundant = True
+                    break
+            if containment_thresh > 0:
+                smaller_area = min(area, prev_area)
+                if smaller_area > 0 and (intersection / smaller_area) > containment_thresh:
+                    is_redundant = True
+                    break
+        if is_redundant:
+            continue
+        kept_masks.append(mask)
+        kept_scores.append(float(scores[idx]))
+        kept_flat.append(mask_flat)
+        kept_areas.append(area)
+    return kept_masks, np.asarray(kept_scores, dtype=np.float32)
+
+
+def rescore_masks_by_redundancy(
+    masks: list[np.ndarray],
+    scores: np.ndarray,
+    overlap_thresh: float,
+    overlap_power: float,
+) -> np.ndarray:
+    if len(masks) <= 1 or overlap_power <= 0 or overlap_thresh <= 0:
+        return scores
+    order = np.argsort(scores)[::-1]
+    adjusted = scores.astype(np.float32, copy=True)
+    kept_flat: list[np.ndarray] = []
+    kept_areas: list[int] = []
+    for idx in order.tolist():
+        mask_flat = masks[idx].reshape(-1)
+        area = int(mask_flat.sum())
+        if area <= 0:
+            adjusted[idx] = 0.0
+            continue
+        max_overlap = 0.0
+        for prev_flat, prev_area in zip(kept_flat, kept_areas):
+            intersection = int(np.logical_and(mask_flat, prev_flat).sum(dtype=np.int64))
+            smaller_area = min(area, prev_area)
+            if smaller_area <= 0:
+                continue
+            max_overlap = max(max_overlap, intersection / smaller_area)
+        if max_overlap > overlap_thresh:
+            penalty = max(0.0, 1.0 - max_overlap) ** overlap_power
+            adjusted[idx] = float(adjusted[idx] * penalty)
+        kept_flat.append(mask_flat)
+        kept_areas.append(area)
+    return adjusted
 
 
 def evaluate_scene(args: argparse.Namespace) -> dict:
@@ -152,7 +254,23 @@ def evaluate_scene(args: argparse.Namespace) -> dict:
             pred_extractor,
             cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB),
             args.sam_min_mask_area_perc,
+            args.sam_max_mask_area_perc,
             args.sam_sort_mode,
+            args.sam_score_pred_iou_power,
+            args.sam_score_stability_power,
+            args.sam_score_area_power,
+        )
+        pred_scores = rescore_masks_by_redundancy(
+            pred_masks,
+            pred_scores,
+            args.mask_overlap_rescore_thresh,
+            args.mask_overlap_rescore_power,
+        )
+        pred_masks, pred_scores = suppress_redundant_masks(
+            pred_masks,
+            pred_scores,
+            args.mask_dedupe_iou_thresh,
+            args.mask_containment_thresh,
         )
         entries.append(
             {
@@ -182,6 +300,7 @@ def evaluate_scene(args: argparse.Namespace) -> dict:
         {
             "sam_sort_mode": amg.sort_mode,
             "sam_min_mask_area_perc": amg.min_mask_area_perc,
+            "sam_max_mask_area_perc": float(args.sam_max_mask_area_perc),
             "sam_points_per_side": amg.points_per_side,
             "sam_points_per_batch": amg.points_per_batch,
             "sam_pred_iou_thresh": amg.pred_iou_thresh,
@@ -199,6 +318,13 @@ def evaluate_scene(args: argparse.Namespace) -> dict:
             "sam2_mode": args.sam2_mode,
             "sam2_hydra_overrides": list(args.sam2_hydra_override or ()),
             "sam2_apply_postprocessing": not bool(args.sam2_disable_postprocessing),
+            "sam_score_pred_iou_power": float(args.sam_score_pred_iou_power),
+            "sam_score_stability_power": float(args.sam_score_stability_power),
+            "sam_score_area_power": float(args.sam_score_area_power),
+            "mask_overlap_rescore_thresh": float(args.mask_overlap_rescore_thresh),
+            "mask_overlap_rescore_power": float(args.mask_overlap_rescore_power),
+            "mask_dedupe_iou_thresh": float(args.mask_dedupe_iou_thresh),
+            "mask_containment_thresh": float(args.mask_containment_thresh),
         }
     )
     return summary
@@ -214,19 +340,20 @@ def main() -> None:
     parser.add_argument("--frame_sample_seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--save_json", action="store_true")
-    parser.add_argument("--sam-model-level-inst", type=int, choices=sorted(SAM_AMG_LEVELS), default=13)
-    parser.add_argument("--sam-sort-mode", choices=["area", "predicted_iou", "stability", "score"], default=DEFAULT_AMG_CONFIG.sort_mode)
-    parser.add_argument("--sam-min-mask-area-perc", type=float, default=DEFAULT_AMG_CONFIG.min_mask_area_perc)
-    parser.add_argument("--sam-points-per-side", type=int, default=DEFAULT_AMG_CONFIG.points_per_side)
+    parser.add_argument("--sam-model-level-inst", type=int, choices=sorted(SAM_AMG_LEVELS), default=24)
+    parser.add_argument("--sam-sort-mode", choices=["area", "predicted_iou", "stability", "score"], default="score")
+    parser.add_argument("--sam-min-mask-area-perc", type=float, default=0.001)
+    parser.add_argument("--sam-max-mask-area-perc", type=float, default=0.0)
+    parser.add_argument("--sam-points-per-side", type=int, default=20)
     parser.add_argument("--sam-points-per-batch", type=int, default=DEFAULT_AMG_CONFIG.points_per_batch)
     parser.add_argument("--sam-pred-iou-thresh", type=float, default=DEFAULT_AMG_CONFIG.pred_iou_thresh)
-    parser.add_argument("--sam-stability-score-thresh", type=float, default=DEFAULT_AMG_CONFIG.stability_score_thresh)
+    parser.add_argument("--sam-stability-score-thresh", type=float, default=0.92)
     parser.add_argument("--sam-stability-score-offset", type=float, default=DEFAULT_AMG_CONFIG.stability_score_offset)
     parser.add_argument("--sam-mask-threshold", type=float, default=DEFAULT_AMG_CONFIG.mask_threshold)
     parser.add_argument("--sam-box-nms-thresh", type=float, default=DEFAULT_AMG_CONFIG.box_nms_thresh)
-    parser.add_argument("--sam-crop-n-layers", type=int, default=DEFAULT_AMG_CONFIG.crop_n_layers)
+    parser.add_argument("--sam-crop-n-layers", type=int, default=0)
     parser.add_argument("--sam-crop-nms-thresh", type=float, default=DEFAULT_AMG_CONFIG.crop_nms_thresh)
-    parser.add_argument("--sam-crop-overlap-ratio", type=float, default=DEFAULT_AMG_CONFIG.crop_overlap_ratio)
+    parser.add_argument("--sam-crop-overlap-ratio", type=float, default=0.6)
     parser.add_argument("--sam-crop-n-points-downscale-factor", type=int, default=DEFAULT_AMG_CONFIG.crop_n_points_downscale_factor)
     parser.add_argument("--sam-min-mask-region-area", type=int, default=DEFAULT_AMG_CONFIG.min_mask_region_area)
     parser.add_argument("--sam-use-m2m", action="store_true")
@@ -234,6 +361,13 @@ def main() -> None:
     parser.add_argument("--sam2-mode", type=str, default=SAM2_MODE)
     parser.add_argument("--sam2-hydra-override", action="append", default=None)
     parser.add_argument("--sam2-disable-postprocessing", action="store_true")
+    parser.add_argument("--sam-score-pred-iou-power", type=float, default=2.0)
+    parser.add_argument("--sam-score-stability-power", type=float, default=1.0)
+    parser.add_argument("--sam-score-area-power", type=float, default=0.0)
+    parser.add_argument("--mask-overlap-rescore-thresh", type=float, default=0.0)
+    parser.add_argument("--mask-overlap-rescore-power", type=float, default=1.0)
+    parser.add_argument("--mask-dedupe-iou-thresh", type=float, default=0.85)
+    parser.add_argument("--mask-containment-thresh", type=float, default=0.0)
     args = parser.parse_args()
 
     summary = evaluate_scene(args)
