@@ -140,9 +140,7 @@ def write_video(
     sam2_model_level_track: int,
 ) -> None:
     frame_paths = [frame_lookup[frame_id] for frame_id in frame_ids]
-    if use_inst_gt and dataset_name != "ScanNet":
-        raise ValueError("--use-inst-gt is only supported for ScanNet decoded instance-filt masks.")
-    gt_extractor = GTInstanceMaskExtractor("ScanNet", scene_dir.name) if use_inst_gt else None
+    gt_extractor = GTInstanceMaskExtractor(dataset_name, scene_dir.name) if use_inst_gt else None
     sam_extractor = None if use_inst_gt else SAMMaskExtractor("cuda" if torch.cuda.is_available() else "cpu", sam_model_level_inst)
     first_image = load_color_frame(frame_lookup[frame_ids[0]])
     h, w = first_image.shape[:2]

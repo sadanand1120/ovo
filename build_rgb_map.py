@@ -1009,8 +1009,6 @@ if __name__ == "__main__":
     parser.add_argument("--sam-model-level-inst", type=int, choices=sorted(SAM1_LEVELS), default=13)
     parser.add_argument("--sam-model-level-textregion", type=int, choices=sorted(SAM1_LEVELS), default=13)
     parser.add_argument("--sam2-model-level-track", type=int, choices=sorted(SAM2_LEVELS), default=24)
-    parser.add_argument("--use-inst-gt", action="store_true", help="Use decoded ScanNet instance-filt masks instead of SAM for instance supervision.")
+    parser.add_argument("--use-inst-gt", action="store_true", help="Use decoded instance-filt masks instead of SAM for instance supervision.")
     parsed = parser.parse_args()
-    if parsed.use_inst_gt and parsed.dataset_name != "ScanNet":
-        raise ValueError("--use-inst-gt is only supported for ScanNet decoded instance-filt masks.")
     main(parsed)

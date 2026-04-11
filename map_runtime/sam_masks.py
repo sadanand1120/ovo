@@ -113,12 +113,10 @@ class SAMMaskExtractor:
 
 class GTInstanceMaskExtractor:
     def __init__(self, dataset_name: str, scene_name: str) -> None:
-        if dataset_name != "ScanNet":
-            raise ValueError("GT instance masks are only available for ScanNet.")
         self.mask_dir = INPUT_DIR / canonical_dataset_name(dataset_name) / scene_name / "instance-filt"
         if not self.mask_dir.exists():
             raise FileNotFoundError(
-                f"Missing decoded GT instance masks at {self.mask_dir}. Run scannet_decode_sens.py --extract_2d_gt_filt first."
+                f"Missing decoded GT instance masks at {self.mask_dir}."
             )
 
     def extract_labels(self, frame_id: int, image_shape: tuple[int, int]) -> np.ndarray:

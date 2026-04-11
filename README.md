@@ -181,7 +181,7 @@ Full Replica root:
 
 ```text
 <replica_full_root>/
-  office0/
+  office_0/
     habitat/
       mesh_semantic.ply
       info_semantic.json
@@ -193,7 +193,7 @@ Full Replica root:
     preseg.json
     glass.sur
     textures/
-  office1/
+  office_1/
   ...
 ```
 
@@ -205,6 +205,8 @@ data/input/Replica/
   office0/
     results/
     traj.txt
+    label-filt/
+    instance-filt/
     habitat/
     mesh.ply
     semantic.bin
@@ -237,9 +239,9 @@ cd /tmp/Replica-Dataset
 
 The full Replica download uses scene names like `office_0` and `room_0`; `replica_decode.py` maps those automatically to the NICE-SLAM names `office0` and `room0`.
 
-3. Replica semantic GT for the standard scenes lives in `data/input/Replica/semantic_gt`.
+3. Replica semantic GT for the standard scenes lives in `data/input/Replica/semantic_gt`. In this repo, those are the `ovo-semantics` labels. The default Replica `semantics` and `instances` come from the full Replica Habitat assets.
 
-4. Stage Replica into the runtime layout used by this repo. This merges the NICE-SLAM trajectories with the full Replica per-scene assets so `data/input/Replica` contains both the current mapping inputs and the additional official scene files.
+4. Stage Replica into the runtime layout used by this repo. This merges the NICE-SLAM trajectories with the full Replica per-scene assets and generates per-frame `label-filt/*.png` and `instance-filt/*.png` files from the Habitat semantic mesh.
 
 By default this creates symlinks in `data/input/Replica`:
 

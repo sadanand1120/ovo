@@ -367,6 +367,4 @@ if __name__ == "__main__":
     parser.add_argument("--pca_sample_size", type=int, default=DEFAULT_PCA_SAMPLE_SIZE)
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
     parsed = parser.parse_args()
-    if parsed.use_inst_gt and parsed.dataset_name != "ScanNet":
-        raise ValueError("--use-inst-gt is only supported for ScanNet decoded instance-filt masks.")
     main(parsed)

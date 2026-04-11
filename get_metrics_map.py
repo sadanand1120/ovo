@@ -26,10 +26,13 @@ CLIP_MODEL_NAME = "ViT-L-14-336-quickgelu"
 CLIP_PRETRAINED = "openai"
 FEATURE_TEXT_TEMPLATE = "{}"
 FEATURE_SOFTMAX_TEMP = 0.01
+OVO_TEXT_TEMPLATE = "This is a photo of a {}"
 DEFAULT_MATCH_DISTANCE_TH = 0.03
 DEFAULT_FEATURE_PROB_TH = 0.0
+DEFAULT_OVO_SCORE_TH = 0.0
 DEFAULT_CHUNK_SIZE = 100_000
-OVO_FEATURE_AGG = "mean_probs"
+FEATURE_INSTANCE_AGG = "mean_probs"
+OVO_FEATURE_AGG = "mean_l2norm_point_features_then_cosine"
 GEOM_THRESHOLDS = (0.01, 0.03, 0.05)
 INSTANCE_IOU_THRESHOLDS = (0.5,)
 METRIC_ROW_ORDER = (
@@ -137,19 +140,49 @@ def load_scannet_gt(scene_name: str, raw_root: str | Path) -> dict:
     }
 
 
-def resolve_replica_gt_paths(scene_name: str, replica_root: str | Path | None) -> tuple[Path, Path]:
+def resolve_replica_gt_paths(scene_name: str, replica_root: str | Path | None) -> tuple[Path, Path, Path]:
     root = Path(replica_root) if replica_root is not None else INPUT_DIR / "Replica"
     semantic_path = root / "semantic_gt" / f"{scene_name}.txt"
     mesh_path = root / f"{scene_name}_mesh.ply"
+    habitat_mesh_path = root / scene_name / "habitat" / "mesh_semantic.ply"
     if not semantic_path.exists():
         raise ValueError(f"Missing Replica semantic GT labels: {semantic_path}")
     if not mesh_path.exists():
         raise ValueError(f"Missing Replica mesh: {mesh_path}")
-    return semantic_path, mesh_path
+    if not habitat_mesh_path.exists():
+        raise ValueError(f"Missing Replica habitat semantic mesh: {habitat_mesh_path}")
+    return semantic_path, mesh_path, habitat_mesh_path
+
+
+def project_face_labels_to_vertices(face_vertices, face_labels: np.ndarray, n_vertices: int) -> np.ndarray:
+    lengths = np.fromiter((len(v) for v in face_vertices), dtype=np.int32, count=len(face_vertices))
+    vertex_indices = np.concatenate(face_vertices).astype(np.int64)
+    repeated_labels = np.repeat(face_labels.astype(np.int64), lengths)
+    pairs = np.stack([vertex_indices, repeated_labels], axis=1)
+    unique_pairs, counts = np.unique(pairs, axis=0, return_counts=True)
+    order = np.lexsort((-counts, unique_pairs[:, 0]))
+    ordered_pairs = unique_pairs[order]
+    first_per_vertex = np.ones(ordered_pairs.shape[0], dtype=bool)
+    first_per_vertex[1:] = ordered_pairs[1:, 0] != ordered_pairs[:-1, 0]
+    selected = ordered_pairs[first_per_vertex]
+    labels = np.full(n_vertices, -1, dtype=np.int32)
+    labels[selected[:, 0].astype(np.int64)] = selected[:, 1].astype(np.int32)
+    return labels
+
+
+def load_replica_vertex_instance_labels(habitat_mesh_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    points, _, _, ply = load_ply_vertices(habitat_mesh_path)
+    face = ply["face"].data
+    if "object_id" not in face.dtype.names:
+        raise ValueError(f"Replica habitat semantic mesh missing face field 'object_id': {habitat_mesh_path}")
+    face_vertices = face["vertex_indices"]
+    face_object_ids = np.asarray(face["object_id"], dtype=np.int32)
+    vertex_instance_labels = project_face_labels_to_vertices(face_vertices, face_object_ids, points.shape[0])
+    return points, vertex_instance_labels
 
 
 def load_replica_gt(scene_name: str, replica_root: str | Path | None) -> dict:
-    semantic_path, mesh_path = resolve_replica_gt_paths(scene_name, replica_root)
+    semantic_path, mesh_path, habitat_mesh_path = resolve_replica_gt_paths(scene_name, replica_root)
     points, colors, _, normals = load_ply_vertices(mesh_path)
     semantic_raw = read_label_txt(semantic_path)
     if semantic_raw.shape[0] != points.shape[0]:
@@ -157,12 +190,18 @@ def load_replica_gt(scene_name: str, replica_root: str | Path | None) -> dict:
             f"Replica semantic GT size mismatch for {scene_name}: "
             f"{semantic_raw.shape[0]} labels vs {points.shape[0]} mesh vertices."
         )
+    habitat_points, habitat_instance_labels = load_replica_vertex_instance_labels(habitat_mesh_path)
+    if habitat_points.shape == points.shape and np.allclose(habitat_points, points):
+        instance_labels = habitat_instance_labels
+    else:
+        _, nn_idx = cKDTree(habitat_points).query(points, k=1, workers=-1)
+        instance_labels = habitat_instance_labels[np.asarray(nn_idx, dtype=np.int64)]
     return {
         "points": points,
         "colors": colors,
         "normals": normals,
         "semantic_raw": semantic_raw,
-        "instance_labels": None,
+        "instance_labels": instance_labels,
     }
 
 
@@ -258,12 +297,24 @@ def confusion_to_metrics(confusion: np.ndarray, dataset_info: dict) -> dict:
         verbose=False,
         labels=dataset_info.get("class_names_reduced", dataset_info.get("class_names")),
     )
-    return {
+    metrics = {
         "mIoU": float(np.mean(iou_values[iou_valid_mask])) if iou_valid_mask.any() else float("nan"),
         "mAcc": float(np.mean(acc_values[acc_valid_mask])) if acc_valid_mask.any() else float("nan"),
         "f_mIoU": float(np.sum(iou_values[iou_valid_mask] * weights_values[iou_valid_mask]) / weights_values[iou_valid_mask].sum()) if iou_valid_mask.any() else float("nan"),
         "f_mAcc": float(np.sum(acc_values[acc_valid_mask] * weights_values[acc_valid_mask]) / weights_values[acc_valid_mask].sum()) if acc_valid_mask.any() else float("nan"),
     }
+    if iou_values.shape[0] == 51:
+        thirds = iou_values.shape[0] // 3
+        for idx, split in enumerate(("head", "comm", "tail")):
+            start = thirds * idx
+            end = thirds * (idx + 1)
+            split_iou = iou_values[start:end]
+            split_acc = acc_values[start:end]
+            split_iou_mask = iou_valid_mask[start:end]
+            split_acc_mask = acc_valid_mask[start:end]
+            metrics[f"iou_{split}"] = float(np.mean(split_iou[split_iou_mask])) if split_iou_mask.any() else float("nan")
+            metrics[f"acc_{split}"] = float(np.mean(split_acc[split_acc_mask])) if split_acc_mask.any() else float("nan")
+    return metrics
 
 
 def compute_geometry_metrics(assoc: dict) -> tuple[dict, dict]:
@@ -302,10 +353,10 @@ def compute_normal_metrics(gt_normals: np.ndarray, pred_normals: np.ndarray) -> 
 
 
 @torch.inference_mode()
-def encode_class_texts(class_names: list[str], device: str) -> torch.Tensor:
+def encode_class_texts(class_names: list[str], device: str, template: str = FEATURE_TEXT_TEMPLATE) -> torch.Tensor:
     model = open_clip.create_model_and_transforms(CLIP_MODEL_NAME, pretrained=CLIP_PRETRAINED, device=device)[0].eval()
     tokenizer = open_clip.get_tokenizer(CLIP_MODEL_NAME)
-    phrases = [FEATURE_TEXT_TEMPLATE.format(name) for name in class_names]
+    phrases = [template.format(name) for name in class_names]
     text = model.encode_text(tokenizer(phrases).to(device)).float()
     text = text / text.norm(dim=-1, keepdim=True).clamp_min(1e-8)
     return text / text.norm(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -319,6 +370,36 @@ def grouped_reduce(labels: np.ndarray, values: np.ndarray, sum_buffer: np.ndarra
     unique_labels = labels_sorted[starts]
     sum_buffer[unique_labels] += np.add.reduceat(values_sorted, starts, axis=0)
     count_buffer[unique_labels] += np.diff(np.r_[starts, labels_sorted.shape[0]])
+
+
+def pool_instance_clip_features(
+    clip_features: np.ndarray,
+    pred_instance_labels: np.ndarray,
+    chunk_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    valid_instances = pred_instance_labels >= 0
+    feature_dim = int(clip_features.shape[1])
+    if not valid_instances.any():
+        return np.zeros((0, feature_dim), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+
+    num_instances = int(pred_instance_labels[valid_instances].max()) + 1
+    feature_sum = np.zeros((num_instances, feature_dim), dtype=np.float32)
+    feature_count = np.zeros((num_instances,), dtype=np.int64)
+
+    for start in range(0, int(clip_features.shape[0]), chunk_size):
+        end = min(start + chunk_size, int(clip_features.shape[0]))
+        chunk = np.array(clip_features[start:end], copy=True).astype(np.float32, copy=False)
+        chunk = np.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
+        chunk = normalize_rows(chunk)
+        labels_chunk = pred_instance_labels[start:end]
+        valid_chunk = labels_chunk >= 0
+        if valid_chunk.any():
+            grouped_reduce(labels_chunk[valid_chunk], chunk[valid_chunk], feature_sum, feature_count)
+
+    keep = feature_count > 0
+    feature_sum[keep] /= feature_count[keep, None].clip(min=1)
+    feature_sum[keep] = normalize_rows(feature_sum[keep])
+    return feature_sum, feature_count
 
 
 def score_pred_points_and_instances(
@@ -387,7 +468,7 @@ def score_pred_points_and_instances(
             "num_instances": 0,
             "mean_points_per_instance": 0.0,
             "mean_max_prob": float("nan"),
-            "agg_mode": OVO_FEATURE_AGG,
+            "agg_mode": FEATURE_INSTANCE_AGG,
         }
     else:
         keep = score_count > 0
@@ -402,7 +483,7 @@ def score_pred_points_and_instances(
             "num_instances": int(keep.sum()),
             "mean_points_per_instance": float(score_count[keep].mean()) if keep.any() else 0.0,
             "mean_max_prob": float(instance_max_prob.mean()) if instance_max_prob.size > 0 else float("nan"),
-            "agg_mode": OVO_FEATURE_AGG,
+            "agg_mode": FEATURE_INSTANCE_AGG,
         }
 
     return pred_point_labels, max_point_probs, instance_classes, instance_diag
@@ -429,18 +510,44 @@ def classify_instance_features_ovo_style(
     clip_features: np.ndarray,
     pred_instance_labels: np.ndarray,
     text_embeds: torch.Tensor,
-    background_idx: int | None,
-    feature_prob_th: float,
+    score_th: float,
     chunk_size: int,
 ) -> tuple[np.ndarray, dict]:
-    _, _, instance_classes, instance_diag = score_pred_points_and_instances(
+    instance_descriptors, feature_count = pool_instance_clip_features(
         clip_features,
         pred_instance_labels,
-        text_embeds,
-        background_idx,
-        feature_prob_th,
         chunk_size,
     )
+    if instance_descriptors.shape[0] == 0:
+        instance_classes = np.empty((0,), dtype=np.int32)
+        instance_diag = {
+            "num_instances": 0,
+            "mean_points_per_instance": 0.0,
+            "mean_max_score": float("nan"),
+            "score_th": float(score_th),
+            "text_template": OVO_TEXT_TEMPLATE,
+            "agg_mode": OVO_FEATURE_AGG,
+        }
+        return instance_classes, instance_diag
+
+    valid = feature_count > 0
+    instance_classes = np.full((instance_descriptors.shape[0],), -1, dtype=np.int32)
+    descriptors_t = torch.from_numpy(instance_descriptors[valid]).to(text_embeds.device, dtype=text_embeds.dtype)
+    similarity = (descriptors_t @ text_embeds.T).float().cpu().numpy()
+    instance_classes_kept = similarity.argmax(axis=1).astype(np.int32, copy=False)
+    instance_max_score = similarity[np.arange(similarity.shape[0]), instance_classes_kept].astype(np.float32, copy=False)
+    if score_th > 0:
+        reject = instance_max_score <= score_th
+        instance_classes_kept[reject] = -1
+    instance_classes[np.flatnonzero(valid)] = instance_classes_kept
+    instance_diag = {
+        "num_instances": int(valid.sum()),
+        "mean_points_per_instance": float(feature_count[valid].mean()) if valid.any() else 0.0,
+        "mean_max_score": float(instance_max_score.mean()) if instance_max_score.size > 0 else float("nan"),
+        "score_th": float(score_th),
+        "text_template": OVO_TEXT_TEMPLATE,
+        "agg_mode": OVO_FEATURE_AGG,
+    }
     return instance_classes, instance_diag
 
 
@@ -703,6 +810,7 @@ def main(args: argparse.Namespace) -> None:
         class_names = dataset_info.get("class_names_reduced", dataset_info.get("class_names"))
         device = "cuda" if torch.cuda.is_available() else "cpu"
         text_embeds = encode_class_texts(class_names, device)
+        ovo_text_embeds = encode_class_texts(class_names, device, template=OVO_TEXT_TEMPLATE)
         background_idx = class_names.index("background") if "background" in class_names else None
         from visualize_rgb_map import resolve_instance_labels
 
@@ -711,7 +819,7 @@ def main(args: argparse.Namespace) -> None:
             pred["points"].shape[0],
             args.min_component_size,
         )
-        pred_point_labels, max_point_probs, instance_classes, semantic_ovo_diag_1 = score_pred_points_and_instances(
+        pred_point_labels, max_point_probs, _, _ = score_pred_points_and_instances(
             pred["clip_features"],
             pred_instance_labels,
             text_embeds,
@@ -731,6 +839,13 @@ def main(args: argparse.Namespace) -> None:
         progress.update()
 
         progress.set_postfix_str("instances", refresh=True)
+        instance_classes, semantic_ovo_diag_1 = classify_instance_features_ovo_style(
+            pred["clip_features"],
+            pred_instance_labels,
+            ovo_text_embeds,
+            args.ovo_score_th,
+            args.chunk_size,
+        )
         pred_semantic_ovo_labels, semantic_ovo_diag_2 = transfer_semantic_labels_ovo_style(
             pred["points"],
             pred_instance_labels,
@@ -782,6 +897,7 @@ def main(args: argparse.Namespace) -> None:
                 **semantic_ovo_diag_2,
             },
             "feature_text_template": FEATURE_TEXT_TEMPLATE,
+            "ovo_text_template": OVO_TEXT_TEMPLATE,
             "instance": None if instance_diag is None else {
                 **instance_diag,
                 "min_component_size": int(args.min_component_size),
@@ -812,6 +928,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_json", action="store_true", help="Save summary to metrics.json next to the map.")
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH, help="Distance threshold used in geometry coverage diagnostics.")
     parser.add_argument("--feature_prob_th", type=float, default=DEFAULT_FEATURE_PROB_TH, help="Minimum class softmax probability before assigning background.")
+    parser.add_argument("--ovo_score_th", type=float, default=DEFAULT_OVO_SCORE_TH, help="Minimum cosine similarity before assigning an OVO-style instance class.")
     parser.add_argument("--min_component_size", type=int, default=2000)
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--compare", default="", help="Optional baseline run directory or rgb_map.ply path to compare against after computing current metrics.")

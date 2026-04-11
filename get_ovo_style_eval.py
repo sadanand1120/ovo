@@ -28,16 +28,17 @@ from build_rgb_map import (
 )
 from get_metrics_map import (
     DEFAULT_CHUNK_SIZE,
-    DEFAULT_FEATURE_PROB_TH,
+    DEFAULT_OVO_SCORE_TH,
     FEATURE_TEXT_TEMPLATE,
+    OVO_TEXT_TEMPLATE,
     OVO_FEATURE_AGG,
     build_confusion,
     classify_instance_features_ovo_style,
     confusion_to_metrics,
     encode_class_texts,
     load_dataset_info,
+    load_gt,
     load_pred_map,
-    load_scannet_gt,
     map_gt_labels_to_eval_ids,
     round_for_print,
     transfer_semantic_labels_ovo_style,
@@ -46,6 +47,7 @@ from visualize_rgb_map import resolve_instance_labels
 
 
 OUTPUT_DIR = Path("data/output/ovo_style_eval")
+PAPER_MAP_EVERY = 10
 
 
 def build_scene(scene_name: str, args: argparse.Namespace) -> tuple[Path, dict]:
@@ -146,17 +148,17 @@ def build_scene(scene_name: str, args: argparse.Namespace) -> tuple[Path, dict]:
 
 
 def evaluate_scene_ovo_style(
+    dataset_name: str,
     scene_name: str,
     run_dir: Path,
-    raw_root: Path,
     dataset_info: dict,
     text_embeds: torch.Tensor,
-    background_idx: int | None,
-    feature_prob_th: float,
+    ovo_score_th: float,
     chunk_size: int,
     min_component_size: int,
+    args: argparse.Namespace,
 ) -> tuple[dict, np.ndarray, dict]:
-    gt = load_scannet_gt(scene_name, raw_root)
+    gt = load_gt(dataset_name, scene_name, args)
     pred = load_pred_map(run_dir / "rgb_map.ply")
     pred_instance_labels = resolve_instance_labels(run_dir, pred["points"].shape[0], min_component_size)
     gt_semantic = map_gt_labels_to_eval_ids(gt["semantic_raw"], dataset_info)
@@ -165,8 +167,7 @@ def evaluate_scene_ovo_style(
         pred["clip_features"],
         pred_instance_labels,
         text_embeds,
-        background_idx,
-        feature_prob_th,
+        ovo_score_th,
         chunk_size,
     )
     pred_semantic_labels, diag_2 = transfer_semantic_labels_ovo_style(
@@ -180,53 +181,76 @@ def evaluate_scene_ovo_style(
     return metrics, confusion, {**diag_1, **diag_2}
 
 
-def render_table(rows: list[dict], total_metrics: dict) -> str:
-    headers = ["scene", "mIoU", "mAcc", "f-mIoU", "f-mAcc", "build_s"]
-    table_rows = [
+def format_percent(value: float) -> str:
+    return f"{100.0 * value:.1f}" if np.isfinite(value) else "nan"
+
+
+def infer_paper_method_label(args: argparse.Namespace) -> str:
+    slam_module = (args.slam_module or "vanilla").lower()
+    if args.use_inst_gt:
+        return "Custom run"
+    if slam_module == "vanilla":
+        return "OVO-mapping (ours) \u2020"
+    return "OVO-SLAM (ours)"
+
+
+def render_replica_paper_table(method_label: str, metrics: dict) -> str:
+    rows = [
+        ["", "All", "", "Head", "", "Common", "", "Tail", ""],
+        ["Method", "mIoU", "mAcc", "mIoU", "mAcc", "mIoU", "mAcc", "mIoU", "mAcc"],
         [
-            row["scene"],
-            f"{row['mIoU']:.3f}",
-            f"{row['mAcc']:.3f}",
-            f"{row['f_mIoU']:.3f}",
-            f"{row['f_mAcc']:.3f}",
-            f"{row['build_sec']:.1f}",
-        ]
-        for row in rows
+            method_label,
+            format_percent(metrics["mIoU"]),
+            format_percent(metrics["mAcc"]),
+            format_percent(metrics["iou_head"]),
+            format_percent(metrics["acc_head"]),
+            format_percent(metrics["iou_comm"]),
+            format_percent(metrics["acc_comm"]),
+            format_percent(metrics["iou_tail"]),
+            format_percent(metrics["acc_tail"]),
+        ],
     ]
-    table_rows.append(
+    widths = [max(len(row[idx]) for row in rows) for idx in range(len(rows[0]))]
+    return "\n".join("  ".join(cell.ljust(widths[idx]) for idx, cell in enumerate(row)) for row in rows)
+
+
+def render_scannet_paper_table(method_label: str, metrics: dict) -> str:
+    rows = [
+        ["", "ScanNet20", "", "", ""],
+        ["Method", "mIoU", "mAcc", "f-mIoU", "f-mAcc"],
         [
-            "ALL_5_HVS",
-            f"{total_metrics['mIoU']:.3f}",
-            f"{total_metrics['mAcc']:.3f}",
-            f"{total_metrics['f_mIoU']:.3f}",
-            f"{total_metrics['f_mAcc']:.3f}",
-            "-",
-        ]
-    )
-    widths = [max(len(header), *(len(row[i]) for row in table_rows)) for i, header in enumerate(headers)]
-    lines = [
-        "  ".join(header.ljust(widths[i]) for i, header in enumerate(headers)),
-        "  ".join("-" * widths[i] for i in range(len(headers))),
+            method_label,
+            format_percent(metrics["mIoU"]),
+            format_percent(metrics["mAcc"]),
+            format_percent(metrics["f_mIoU"]),
+            format_percent(metrics["f_mAcc"]),
+        ],
     ]
-    for row in table_rows:
-        lines.append("  ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
-    return "\n".join(lines)
+    widths = [max(len(row[idx]) for row in rows) for idx in range(len(rows[0]))]
+    return "\n".join("  ".join(cell.ljust(widths[idx]) for idx, cell in enumerate(row)) for row in rows)
+
+
+def render_paper_table(dataset_name: str, args: argparse.Namespace, metrics: dict) -> str:
+    method_label = infer_paper_method_label(args)
+    if dataset_name == "Replica":
+        title = "Table 2 style: Evaluation on Replica with the 51 most common labels"
+        body = render_replica_paper_table(method_label, metrics)
+    else:
+        title = "Table 4 style: Quantitative results on ScanNetv2"
+        body = render_scannet_paper_table(method_label, metrics)
+    notes = ["\u2020 Uses GT camera poses.", "\u2021 Uses GT camera poses and 3D geometry."]
+    return "\n".join([title, body, *notes])
 
 
 def main(args: argparse.Namespace) -> None:
     dataset_name = args.dataset_name
-    if dataset_name != "ScanNet":
-        raise NotImplementedError("get_ovo_style_eval.py currently supports ScanNet only.")
-
     dataset_info = deepcopy(load_dataset_info(dataset_name))
     if args.ignore_background:
         dataset_info["ignore"] = dataset_info.get("ignore", []).copy() + dataset_info.get("background_reduced_ids", [])
     class_names = dataset_info.get("class_names_reduced", dataset_info.get("class_names"))
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    text_embeds = encode_class_texts(class_names, device)
-    background_idx = class_names.index("background") if "background" in class_names else None
+    text_embeds = encode_class_texts(class_names, device, template=OVO_TEXT_TEMPLATE)
     scenes = args.scenes or dataset_info["scenes"]
-    raw_root = Path(args.scannet_raw_root)
 
     per_scene_rows = []
     confusion_sum = np.zeros((dataset_info["num_classes"], dataset_info["num_classes"]), dtype=np.ulonglong)
@@ -235,15 +259,15 @@ def main(args: argparse.Namespace) -> None:
     for scene_name in scenes:
         run_dir, timing = build_scene(scene_name, args)
         metrics, confusion, diag = evaluate_scene_ovo_style(
+            dataset_name,
             scene_name,
             run_dir,
-            raw_root,
             dataset_info,
             text_embeds,
-            background_idx,
-            args.feature_prob_th,
+            args.ovo_score_th,
             args.chunk_size,
             args.min_component_size,
+            args,
         )
         confusion_sum += confusion
         per_scene_rows.append(
@@ -269,16 +293,22 @@ def main(args: argparse.Namespace) -> None:
         "dataset_name": canonical_dataset_name(dataset_name),
         "scenes": scenes,
         "use_inst_gt": bool(args.use_inst_gt),
-        "feature_prob_th": float(args.feature_prob_th),
+        "ovo_score_th": float(args.ovo_score_th),
         "feature_text_template": FEATURE_TEXT_TEMPLATE,
+        "ovo_text_template": OVO_TEXT_TEMPLATE,
         "ovo_feature_agg": OVO_FEATURE_AGG,
         "min_component_size": int(args.min_component_size),
         "metrics_per_scene": per_scene_rows,
-        "metrics_all_5_hvs": total_metrics,
+        "metrics_all": total_metrics,
+        "paper_method_label": infer_paper_method_label(args),
         "diagnostics": diagnostics,
     }
+    if dataset_name == "ScanNet":
+        summary["scannet_raw_root"] = str(Path(args.scannet_raw_root).resolve()) if args.scannet_raw_root else None
+    elif dataset_name == "Replica":
+        summary["replica_root"] = str((Path(args.replica_root) if args.replica_root else Path("data/input/Replica")).resolve())
 
-    print(render_table(per_scene_rows, total_metrics))
+    print(render_paper_table(dataset_name, args, total_metrics))
     print()
     print(json.dumps(round_for_print(summary), indent=2))
 
@@ -292,16 +322,17 @@ def main(args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Build the 5 ScanNet HVS scenes and report OVO-style semantic metrics directly comparable to the paper table.")
-    parser.add_argument("--dataset_name", required=True, choices=["ScanNet"])
+    parser = argparse.ArgumentParser(description="Build scenes and report OVO-style semantic metrics on the selected dataset.")
+    parser.add_argument("--dataset_name", required=True, choices=["Replica", "ScanNet"])
     parser.add_argument("--output_root", default=str(OUTPUT_DIR))
-    parser.add_argument("--scannet_raw_root", required=True, help="ScanNet raw scans root containing aggregation and segs files.")
+    parser.add_argument("--scannet_raw_root", default=None, help="ScanNet raw scans root containing aggregation and segs files.")
+    parser.add_argument("--replica_root", default=None, help="Replica root containing semantic_gt/ and *_mesh.ply files. Defaults to data/input/Replica.")
     parser.add_argument("--frame_limit", type=int, default=None)
     parser.add_argument("--slam_module", type=str, default=None, help="Override slam backend, e.g. vanilla, orbslam, or cuvslam.")
     parser.add_argument("--disable_loop_closure", action="store_true", help="Disable ORB-SLAM loop closure/global BA updates by forcing slam.close_loops=false.")
     parser.add_argument("--config_path", type=str, default="configs/ovo.yaml", help="Base runtime config file to load.")
-    parser.add_argument("--scenes", nargs="*", default=None, help="Optional override scene list. Defaults to the 5 HVS scenes from configs/scannet_eval.yaml.")
-    parser.add_argument("--map_every", type=int, default=DEFAULT_MAP_EVERY)
+    parser.add_argument("--scenes", nargs="*", default=None, help="Optional override scene list. Defaults to the dataset scenes from the eval config.")
+    parser.add_argument("--map_every", type=int, default=PAPER_MAP_EVERY)
     parser.add_argument("--downscale_res", type=int, default=DEFAULT_DOWNSCALE_RES)
     parser.add_argument("--k_pooling", type=int, default=DEFAULT_K_POOLING)
     parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
@@ -310,7 +341,7 @@ if __name__ == "__main__":
     parser.add_argument("--sam-model-level-textregion", type=int, choices=[11, 12, 13], default=13)
     parser.add_argument("--sam2-model-level-track", type=int, choices=[21, 22, 23, 24], default=24)
     parser.add_argument("--use-inst-gt", action="store_true")
-    parser.add_argument("--feature_prob_th", type=float, default=DEFAULT_FEATURE_PROB_TH)
+    parser.add_argument("--ovo_score_th", type=float, default=DEFAULT_OVO_SCORE_TH)
     parser.add_argument("--min_component_size", type=int, default=2000)
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--ignore_background", action="store_true")
