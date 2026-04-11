@@ -150,10 +150,10 @@ PY
 
 ### Replica
 
-Raw Replica root:
+NICE-SLAM Replica root:
 
 ```text
-<replica_root>/
+<replica_niceslam_root>/
   office0/
     results/
       frame000000.jpg
@@ -175,15 +175,26 @@ Raw Replica root:
   room0_mesh.ply
   room1_mesh.ply
   room2_mesh.ply
-  semantic_gt/
-    office0.txt
-    office1.txt
-    office2.txt
-    office3.txt
-    office4.txt
-    room0.txt
-    room1.txt
-    room2.txt
+```
+
+Full Replica root:
+
+```text
+<replica_full_root>/
+  office0/
+    habitat/
+      mesh_semantic.ply
+      info_semantic.json
+      ...
+    mesh.ply
+    semantic.bin
+    semantic.json
+    preseg.bin
+    preseg.json
+    glass.sur
+    textures/
+  office1/
+  ...
 ```
 
 Runtime layout:
@@ -194,13 +205,21 @@ data/input/Replica/
   office0/
     results/
     traj.txt
+    habitat/
+    mesh.ply
+    semantic.bin
+    semantic.json
+    preseg.bin
+    preseg.json
+    glass.sur
+    textures/
   office0_mesh.ply
   ...
 ```
 
 Setup flow:
 
-1. Download the NICE-SLAM Replica bundle.
+1. Download the NICE-SLAM Replica bundle. This provides the RGB-D frames, poses, and root-level `<scene>_mesh.ply` files used by the mapping pipeline.
 
 ```bash
 wget https://cvg-data.inf.ethz.ch/nice-slam/data/Replica.zip
@@ -208,22 +227,35 @@ unzip Replica.zip
 rm Replica.zip
 ```
 
-In the rest of this section, treat `/path/to/Replica` as `<replica_root>`.
+2. Download the full Replica dataset. This provides the additional official scene assets that NICE-SLAM does not include, including the Habitat semantic/instance files such as `habitat/mesh_semantic.ply` and `habitat/info_semantic.json`.
 
-2. Semantic GT for the standard Replica scenes is already available in this repo under `data/input/Replica/semantic_gt`. `replica_decode.py` uses that automatically if `<replica_root>/semantic_gt` is missing.
+```bash
+git clone https://github.com/facebookresearch/Replica-Dataset /tmp/Replica-Dataset
+cd /tmp/Replica-Dataset
+./download.sh <replica_full_root>
+```
 
-3. Stage Replica into the runtime layout used by this repo.
+The full Replica download uses scene names like `office_0` and `room_0`; `replica_decode.py` maps those automatically to the NICE-SLAM names `office0` and `room0`.
+
+3. Replica semantic GT for the standard scenes lives in `data/input/Replica/semantic_gt`.
+
+4. Stage Replica into the runtime layout used by this repo. This merges the NICE-SLAM trajectories with the full Replica per-scene assets so `data/input/Replica` contains both the current mapping inputs and the additional official scene files.
 
 By default this creates symlinks in `data/input/Replica`:
 
 ```bash
-python replica_decode.py --source_root <replica_root>
+python replica_decode.py \
+  --source_root <replica_niceslam_root> \
+  --full_replica_root <replica_full_root>
 ```
 
 If you want actual copies instead of symlinks:
 
 ```bash
-python replica_decode.py --source_root <replica_root> --copy
+python replica_decode.py \
+  --source_root <replica_niceslam_root> \
+  --full_replica_root <replica_full_root> \
+  --copy
 ```
 
 ### ScanNet
