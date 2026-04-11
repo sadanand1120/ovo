@@ -12,6 +12,9 @@ from build_rgb_map import (
     CLIP_LOAD_SIZE,
     CLIP_MODEL_NAME,
     CLIP_PRETRAINED,
+    add_sam_runtime_args,
+    build_sam_amg_config,
+    build_sam2_tracker_config,
     DEFAULT_DOWNSCALE_RES,
     DEFAULT_K_POOLING,
     DEFAULT_MAP_EVERY,
@@ -240,6 +243,8 @@ def main(args: argparse.Namespace) -> None:
         disable_loop_closure=args.disable_loop_closure,
     )
     intrinsic, extrinsic, width, height = load_view(Path(args.load_view))
+    sam_amg_config = build_sam_amg_config(args)
+    sam2_tracker_config = build_sam2_tracker_config(args)
 
     mapper = RGBMapper(
         intrinsics=dataset.intrinsics,
@@ -255,6 +260,8 @@ def main(args: argparse.Namespace) -> None:
         sam_model_level_inst=args.sam_model_level_inst,
         sam_model_level_textregion=args.sam_model_level_textregion,
         sam2_model_level_track=args.sam2_model_level_track,
+        sam_amg_config=sam_amg_config,
+        sam2_tracker_config=sam2_tracker_config,
     )
 
     snapshot_counts: list[int] = []
@@ -357,9 +364,7 @@ if __name__ == "__main__":
     parser.add_argument("--k_pooling", type=int, default=DEFAULT_K_POOLING)
     parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
-    parser.add_argument("--sam-model-level-inst", type=int, choices=[11, 12, 13], default=13)
-    parser.add_argument("--sam-model-level-textregion", type=int, choices=[11, 12, 13], default=13)
-    parser.add_argument("--sam2-model-level-track", type=int, choices=[21, 22, 23, 24], default=24)
+    add_sam_runtime_args(parser, include_textregion=True)
     parser.add_argument("--use-inst-gt", action="store_true")
     parser.add_argument("--fps", type=int, default=VIDEO_FPS)
     parser.add_argument("--dilate", type=int, default=POINT_DILATE)

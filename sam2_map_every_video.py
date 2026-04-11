@@ -7,8 +7,9 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from build_rgb_map import add_sam_runtime_args, build_sam_amg_config, build_sam2_tracker_config
 from map_runtime.sam_masks import GTInstanceMaskExtractor, SAMMaskExtractor
-from map_runtime.sam2_tracking import SAM2_LEVELS, SAM2_MAX_NUM_OBJECTS, SAM2VideoTracker, build_seed_objects
+from map_runtime.sam2_tracking import SAM2TrackerConfig, SAM2VideoTracker, build_seed_objects
 from map_runtime.scene import INPUT_DIR, canonical_dataset_name
 
 OUTPUT_DIR = Path("data/output/sam2_map_every_video")
@@ -138,10 +139,23 @@ def write_video(
     use_inst_gt: bool,
     sam_model_level_inst: int,
     sam2_model_level_track: int,
+    sam_amg_config,
+    sam2_tracker_config: SAM2TrackerConfig,
 ) -> None:
     frame_paths = [frame_lookup[frame_id] for frame_id in frame_ids]
     gt_extractor = GTInstanceMaskExtractor(dataset_name, scene_dir.name) if use_inst_gt else None
-    sam_extractor = None if use_inst_gt else SAMMaskExtractor("cuda" if torch.cuda.is_available() else "cpu", sam_model_level_inst)
+    sam_extractor = (
+        None
+        if use_inst_gt
+        else SAMMaskExtractor(
+            "cuda" if torch.cuda.is_available() else "cpu",
+            sam_model_level_inst,
+            amg_config=sam_amg_config,
+            sam2_mode=sam2_tracker_config.mode,
+            sam2_hydra_overrides=sam2_tracker_config.hydra_overrides,
+            sam2_apply_postprocessing=sam2_tracker_config.apply_postprocessing,
+        )
+    )
     first_image = load_color_frame(frame_lookup[frame_ids[0]])
     h, w = first_image.shape[:2]
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -158,7 +172,7 @@ def write_video(
             else:
                 seg_end = min(len(frame_ids), seg_start + int(map_every))
             segment_frame_paths = frame_paths[seg_start:seg_end]
-            mask_tracker = SAM2VideoTracker(segment_frame_paths[0], sam2_model_level_track)
+            mask_tracker = SAM2VideoTracker(segment_frame_paths[0], sam2_model_level_track, tracker_config=sam2_tracker_config)
             seed_rgb = load_color_frame(frame_lookup[seed_frame_id])
             seed_labels, display_map = extract_seed_labels(
                 scene_dir,
@@ -174,7 +188,7 @@ def write_video(
             else:
                 panel2_vis = colorize_with_display_map(seed_labels, display_map)
                 panel2_title = "SAM AMG"
-            seed_masks = build_seed_objects(seed_labels)
+            seed_masks = build_seed_objects(seed_labels, max_objects=sam2_tracker_config.max_num_objects)
             try:
                 mask_seed_outputs = mask_tracker.reset_and_seed_masks(seed_masks)
                 mask_obj_to_display = {int(obj_id): display_map[int(obj_id)] for obj_id, _ in seed_masks}
@@ -196,7 +210,7 @@ def write_video(
                     track_panel = overlay_header(
                         mask_vis,
                         "SAM2.1 Masks",
-                        f"{cycle_text}  seed={seed_frame_id}  tracked={len(mask_obj_to_display)}/{SAM2_MAX_NUM_OBJECTS}  lvl={sam2_model_level_track}",
+                        f"{cycle_text}  seed={seed_frame_id}  tracked={len(mask_obj_to_display)}/{sam2_tracker_config.max_num_objects}  lvl={sam2_model_level_track}",
                     )
                     writer.write(np.hstack((rgb_panel, ref_panel, track_panel)))
                     pbar.update(1)
@@ -223,6 +237,8 @@ def main(args) -> None:
     if not frame_ids:
         raise RuntimeError("No frames found.")
     map_every = parse_map_every(args.map_every)
+    sam_amg_config = build_sam_amg_config(args)
+    sam2_tracker_config = build_sam2_tracker_config(args)
     out_name = f"{args.scene_name}_mapevery_{args.map_every}.mp4"
     output_path = Path(args.output_root) / canonical_dataset_name(dataset_name) / args.scene_name / out_name
     write_video(
@@ -236,6 +252,8 @@ def main(args) -> None:
         args.use_inst_gt,
         args.sam_model_level_inst,
         args.sam2_model_level_track,
+        sam_amg_config,
+        sam2_tracker_config,
     )
     print(output_path)
 
@@ -248,7 +266,6 @@ if __name__ == "__main__":
     parser.add_argument("--map_every", default="10000")
     parser.add_argument("--frame_limit", type=int, default=None)
     parser.add_argument("--fps", type=float, default=12.0)
-    parser.add_argument("--sam-model-level-inst", type=int, choices=[11, 12, 13], default=13)
-    parser.add_argument("--sam2-model-level-track", type=int, choices=sorted(SAM2_LEVELS), default=24)
+    add_sam_runtime_args(parser, include_textregion=False)
     parser.add_argument("--use-inst-gt", action="store_true")
     main(parser.parse_args())

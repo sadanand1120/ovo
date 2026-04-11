@@ -7,13 +7,12 @@ import numpy as np
 import open3d as o3d
 import open_clip
 from plyfile import PlyData
-from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 import torch
 from tqdm.auto import tqdm
 
 from map_runtime.config import load_config
-from map_runtime.metrics_utils import iou_acc_from_confmat
+from map_runtime.metrics_utils import compute_instance_ap_dataset, iou_acc_from_confmat
 
 
 DATASET_CONFIG_NAMES = {"Replica": "replica", "ScanNet": "scannet"}
@@ -34,7 +33,7 @@ DEFAULT_CHUNK_SIZE = 100_000
 FEATURE_INSTANCE_AGG = "mean_probs"
 OVO_FEATURE_AGG = "mean_l2norm_point_features_then_cosine"
 GEOM_THRESHOLDS = (0.01, 0.03, 0.05)
-INSTANCE_IOU_THRESHOLDS = (0.5,)
+INSTANCE_AP_THRESHOLDS = (0.25, 0.5)
 METRIC_ROW_ORDER = (
     ("geometry", "chamfer_l1_m"),
     ("geometry", "fscore_3cm"),
@@ -47,8 +46,9 @@ METRIC_ROW_ORDER = (
     ("semantic_ovo_style", "mAcc"),
     ("semantic_ovo_style", "f_mIoU"),
     ("semantic_ovo_style", "f_mAcc"),
-    ("instance", "mwcov"),
-    ("instance", "f1_50"),
+    ("instance", "ap"),
+    ("instance", "ap_25"),
+    ("instance", "ap_50"),
 )
 TIMING_ROW_ORDER = (
     ("timing.total_sec", ("total_sec",)),
@@ -512,7 +512,7 @@ def classify_instance_features_ovo_style(
     text_embeds: torch.Tensor,
     score_th: float,
     chunk_size: int,
-) -> tuple[np.ndarray, dict]:
+) -> tuple[np.ndarray, np.ndarray, dict]:
     instance_descriptors, feature_count = pool_instance_clip_features(
         clip_features,
         pred_instance_labels,
@@ -520,6 +520,7 @@ def classify_instance_features_ovo_style(
     )
     if instance_descriptors.shape[0] == 0:
         instance_classes = np.empty((0,), dtype=np.int32)
+        instance_scores = np.empty((0,), dtype=np.float32)
         instance_diag = {
             "num_instances": 0,
             "mean_points_per_instance": 0.0,
@@ -528,14 +529,16 @@ def classify_instance_features_ovo_style(
             "text_template": OVO_TEXT_TEMPLATE,
             "agg_mode": OVO_FEATURE_AGG,
         }
-        return instance_classes, instance_diag
+        return instance_classes, instance_scores, instance_diag
 
     valid = feature_count > 0
     instance_classes = np.full((instance_descriptors.shape[0],), -1, dtype=np.int32)
+    instance_scores = np.full((instance_descriptors.shape[0],), -np.inf, dtype=np.float32)
     descriptors_t = torch.from_numpy(instance_descriptors[valid]).to(text_embeds.device, dtype=text_embeds.dtype)
     similarity = (descriptors_t @ text_embeds.T).float().cpu().numpy()
     instance_classes_kept = similarity.argmax(axis=1).astype(np.int32, copy=False)
     instance_max_score = similarity[np.arange(similarity.shape[0]), instance_classes_kept].astype(np.float32, copy=False)
+    instance_scores[np.flatnonzero(valid)] = instance_max_score
     if score_th > 0:
         reject = instance_max_score <= score_th
         instance_classes_kept[reject] = -1
@@ -548,7 +551,7 @@ def classify_instance_features_ovo_style(
         "text_template": OVO_TEXT_TEMPLATE,
         "agg_mode": OVO_FEATURE_AGG,
     }
-    return instance_classes, instance_diag
+    return instance_classes, instance_scores, instance_diag
 
 
 def transfer_semantic_labels_ovo_style(
@@ -603,35 +606,63 @@ def build_iou_matrix(gt_labels: np.ndarray, pred_labels: np.ndarray) -> tuple[np
     return iou, uniq_gt, uniq_pred, gt_count
 
 
-def compute_instance_metrics(gt_labels: np.ndarray, pred_labels: np.ndarray) -> tuple[dict, dict]:
-    iou, uniq_gt, uniq_pred, gt_count = build_iou_matrix(gt_labels, pred_labels)
-    if uniq_gt.size == 0:
-        return {
-            "mwcov": float("nan"),
-            "f1_50": float("nan"),
-        }, {
-            "gt_instance_count": 0,
-            "pred_instance_count": 0,
-        }
-    if uniq_pred.size == 0:
-        metrics = {"mwcov": 0.0, "f1_50": 0.0}
-    else:
-        best_iou = iou.max(axis=1)
-        metrics = {
-            "mwcov": float(np.sum(best_iou * gt_count) / np.sum(gt_count)),
-        }
-        row_ind, col_ind = linear_sum_assignment(1.0 - iou)
-        matched_ious = iou[row_ind, col_ind]
-        for th in INSTANCE_IOU_THRESHOLDS:
-            tp = int((matched_ious >= th).sum())
-            precision = 0.0 if uniq_pred.size == 0 else tp / float(uniq_pred.size)
-            recall = 0.0 if uniq_gt.size == 0 else tp / float(uniq_gt.size)
-            f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
-            metrics[f"f1_{int(th * 100):02d}"] = float(f1)
+def majority_class_per_instance(
+    instance_labels: np.ndarray,
+    semantic_labels: np.ndarray,
+    instance_ids: np.ndarray,
+    ignore_labels: list[int],
+) -> np.ndarray:
+    ignore_set = set(int(x) for x in ignore_labels)
+    class_ids = np.full((instance_ids.shape[0],), -1, dtype=np.int32)
+    for idx, instance_id in enumerate(instance_ids.tolist()):
+        mask = instance_labels == int(instance_id)
+        semantic = semantic_labels[mask]
+        semantic = semantic[(semantic >= 0) & (~np.isin(semantic, list(ignore_set)))]
+        if semantic.size == 0:
+            continue
+        values, counts = np.unique(semantic.astype(np.int32, copy=False), return_counts=True)
+        class_ids[idx] = int(values[np.argmax(counts)])
+    return class_ids
 
+
+def compute_instance_metrics(
+    gt_instance_labels: np.ndarray,
+    gt_semantic_labels: np.ndarray,
+    pred_instance_labels: np.ndarray,
+    pred_instance_classes: np.ndarray,
+    pred_instance_scores: np.ndarray,
+    dataset_info: dict,
+) -> tuple[dict, dict]:
+    iou, uniq_gt, uniq_pred, _ = build_iou_matrix(gt_instance_labels, pred_instance_labels)
+    ignore_labels = dataset_info.get("ignore", []).copy() + dataset_info.get("background_reduced_ids", [])
+    if uniq_gt.size == 0:
+        metrics = {"ap": float("nan")}
+        for threshold in INSTANCE_AP_THRESHOLDS:
+            metrics[f"ap_{int(round(threshold * 100)):02d}"] = float("nan")
+        diagnostics = {"gt_instance_count": 0, "pred_instance_count": int(uniq_pred.shape[0])}
+        return metrics, diagnostics
+
+    gt_class_ids = majority_class_per_instance(gt_instance_labels, gt_semantic_labels, uniq_gt, ignore_labels)
+    pred_class_ids = pred_instance_classes[uniq_pred] if uniq_pred.size > 0 else np.empty((0,), dtype=np.int32)
+    pred_scores = pred_instance_scores[uniq_pred] if uniq_pred.size > 0 else np.empty((0,), dtype=np.float32)
+    class_ids = np.unique(gt_class_ids[gt_class_ids >= 0])
+    metrics, ap_diag = compute_instance_ap_dataset(
+        entries=[
+            {
+                "iou": iou,
+                "gt_class_ids": gt_class_ids,
+                "pred_class_ids": pred_class_ids,
+                "pred_scores": pred_scores,
+            }
+        ],
+        class_ids=class_ids,
+        iou_thresholds=INSTANCE_AP_THRESHOLDS,
+    )
     diagnostics = {
-        "gt_instance_count": int(uniq_gt.shape[0]),
-        "pred_instance_count": int(uniq_pred.shape[0]),
+        "gt_instance_count": int(np.sum(gt_class_ids >= 0)),
+        "pred_instance_count": int(np.sum(pred_class_ids >= 0)),
+        "ignored_gt_instance_count": int(np.sum(gt_class_ids < 0)),
+        **ap_diag,
     }
     return metrics, diagnostics
 
@@ -839,7 +870,7 @@ def main(args: argparse.Namespace) -> None:
         progress.update()
 
         progress.set_postfix_str("instances", refresh=True)
-        instance_classes, semantic_ovo_diag_1 = classify_instance_features_ovo_style(
+        instance_classes, instance_scores, semantic_ovo_diag_1 = classify_instance_features_ovo_style(
             pred["clip_features"],
             pred_instance_labels,
             ovo_text_embeds,
@@ -861,7 +892,14 @@ def main(args: argparse.Namespace) -> None:
         semantic_ovo_metrics = confusion_to_metrics(semantic_ovo_conf, dataset_info)
         if gt["instance_labels"] is not None:
             transferred_instance_labels = pred_instance_labels[gt_to_pred_idx]
-            instance_metrics, instance_diag = compute_instance_metrics(gt["instance_labels"], transferred_instance_labels)
+            instance_metrics, instance_diag = compute_instance_metrics(
+                gt["instance_labels"],
+                gt_semantic,
+                transferred_instance_labels,
+                instance_classes,
+                instance_scores,
+                dataset_info,
+            )
         else:
             instance_metrics, instance_diag = None, None
         progress.update()

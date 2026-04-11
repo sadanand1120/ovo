@@ -16,13 +16,11 @@ from tqdm.auto import tqdm
 from map_runtime import geometry
 from map_runtime.sam_masks import (
     GTInstanceMaskExtractor,
-    SAM1_LEVELS,
+    SAMAutomaticMaskConfig,
+    SAM_AMG_LEVELS,
     SAMMaskExtractor,
-    SAM_MIN_MASK_AREA_PERC,
-    SAM_POINTS_PER_SIDE,
-    SAM_SORT_MODE,
 )
-from map_runtime.sam2_tracking import SAM2_MAX_NUM_OBJECTS, SAM2_LEVELS, SAM2VideoTracker, build_label_masks
+from map_runtime.sam2_tracking import SAM2_LEVELS, SAM2TrackerConfig, SAM2VideoTracker, build_label_masks
 from map_runtime.scene import (
     INPUT_DIR,
     canonical_dataset_name,
@@ -54,6 +52,65 @@ TRACK_MISS_MAX = 3
 CONFIRM_MIN_POINTS = 80
 CONFIRM_MIN_SEED_HITS = 2
 TENTATIVE_MAX_SEED_AGE = 2
+DEFAULT_SAM_AMG_CONFIG = SAMAutomaticMaskConfig()
+DEFAULT_SAM2_TRACKER_CONFIG = SAM2TrackerConfig()
+
+
+def add_sam_runtime_args(parser: argparse.ArgumentParser, *, include_textregion: bool = True) -> None:
+    parser.add_argument("--sam-model-level-inst", type=int, choices=sorted(SAM_AMG_LEVELS), default=13)
+    if include_textregion:
+        parser.add_argument("--sam-model-level-textregion", type=int, choices=sorted(SAM_AMG_LEVELS), default=13)
+    parser.add_argument("--sam2-model-level-track", type=int, choices=sorted(SAM2_LEVELS), default=24)
+    parser.add_argument("--sam-sort-mode", choices=["area", "predicted_iou", "stability", "score"], default=DEFAULT_SAM_AMG_CONFIG.sort_mode)
+    parser.add_argument("--sam-min-mask-area-perc", type=float, default=DEFAULT_SAM_AMG_CONFIG.min_mask_area_perc)
+    parser.add_argument("--sam-points-per-side", type=int, default=DEFAULT_SAM_AMG_CONFIG.points_per_side)
+    parser.add_argument("--sam-points-per-batch", type=int, default=DEFAULT_SAM_AMG_CONFIG.points_per_batch)
+    parser.add_argument("--sam-pred-iou-thresh", type=float, default=DEFAULT_SAM_AMG_CONFIG.pred_iou_thresh)
+    parser.add_argument("--sam-stability-score-thresh", type=float, default=DEFAULT_SAM_AMG_CONFIG.stability_score_thresh)
+    parser.add_argument("--sam-stability-score-offset", type=float, default=DEFAULT_SAM_AMG_CONFIG.stability_score_offset)
+    parser.add_argument("--sam-mask-threshold", type=float, default=DEFAULT_SAM_AMG_CONFIG.mask_threshold)
+    parser.add_argument("--sam-box-nms-thresh", type=float, default=DEFAULT_SAM_AMG_CONFIG.box_nms_thresh)
+    parser.add_argument("--sam-crop-n-layers", type=int, default=DEFAULT_SAM_AMG_CONFIG.crop_n_layers)
+    parser.add_argument("--sam-crop-nms-thresh", type=float, default=DEFAULT_SAM_AMG_CONFIG.crop_nms_thresh)
+    parser.add_argument("--sam-crop-overlap-ratio", type=float, default=DEFAULT_SAM_AMG_CONFIG.crop_overlap_ratio)
+    parser.add_argument("--sam-crop-n-points-downscale-factor", type=int, default=DEFAULT_SAM_AMG_CONFIG.crop_n_points_downscale_factor)
+    parser.add_argument("--sam-min-mask-region-area", type=int, default=DEFAULT_SAM_AMG_CONFIG.min_mask_region_area)
+    parser.add_argument("--sam-use-m2m", action="store_true")
+    parser.add_argument("--sam-disable-multimask-output", action="store_true")
+    parser.add_argument("--sam2-max-num-objects", type=int, default=DEFAULT_SAM2_TRACKER_CONFIG.max_num_objects)
+    parser.add_argument("--sam2-mode", type=str, default=DEFAULT_SAM2_TRACKER_CONFIG.mode)
+    parser.add_argument("--sam2-hydra-override", action="append", default=None)
+    parser.add_argument("--sam2-disable-postprocessing", action="store_true")
+
+
+def build_sam_amg_config(args: argparse.Namespace) -> SAMAutomaticMaskConfig:
+    return SAMAutomaticMaskConfig(
+        sort_mode=args.sam_sort_mode,
+        min_mask_area_perc=args.sam_min_mask_area_perc,
+        points_per_side=args.sam_points_per_side,
+        points_per_batch=args.sam_points_per_batch,
+        pred_iou_thresh=args.sam_pred_iou_thresh,
+        stability_score_thresh=args.sam_stability_score_thresh,
+        stability_score_offset=args.sam_stability_score_offset,
+        mask_threshold=args.sam_mask_threshold,
+        box_nms_thresh=args.sam_box_nms_thresh,
+        crop_n_layers=args.sam_crop_n_layers,
+        crop_nms_thresh=args.sam_crop_nms_thresh,
+        crop_overlap_ratio=args.sam_crop_overlap_ratio,
+        crop_n_points_downscale_factor=args.sam_crop_n_points_downscale_factor,
+        min_mask_region_area=args.sam_min_mask_region_area,
+        use_m2m=bool(args.sam_use_m2m),
+        multimask_output=not bool(args.sam_disable_multimask_output),
+    )
+
+
+def build_sam2_tracker_config(args: argparse.Namespace) -> SAM2TrackerConfig:
+    return SAM2TrackerConfig(
+        max_num_objects=args.sam2_max_num_objects,
+        mode=args.sam2_mode,
+        hydra_overrides=tuple(args.sam2_hydra_override or ()),
+        apply_postprocessing=not bool(args.sam2_disable_postprocessing),
+    )
 def load_dataset(
     dataset_name: str,
     scene_name: str,
@@ -295,16 +352,40 @@ class SAM2InstanceManager:
         sam_model_level_inst: int,
         sam_model_level_textregion: int,
         sam2_model_level_track: int,
+        sam_amg_config: SAMAutomaticMaskConfig,
+        sam2_tracker_config: SAM2TrackerConfig,
     ) -> None:
         self.device = device
         self.use_inst_gt = bool(use_inst_gt)
         self.sam_model_level_inst = int(sam_model_level_inst)
         self.sam_model_level_textregion = int(sam_model_level_textregion)
         self.sam2_model_level_track = int(sam2_model_level_track)
+        self.sam_amg_config = sam_amg_config
+        self.sam2_tracker_config = sam2_tracker_config
         self.seed_mask_extractor = (
-            GTInstanceMaskExtractor(dataset_name, scene_name) if self.use_inst_gt else SAMMaskExtractor(device, self.sam_model_level_inst)
+            GTInstanceMaskExtractor(dataset_name, scene_name)
+            if self.use_inst_gt
+            else SAMMaskExtractor(
+                device,
+                self.sam_model_level_inst,
+                amg_config=self.sam_amg_config,
+                sam2_mode=self.sam2_tracker_config.mode,
+                sam2_hydra_overrides=self.sam2_tracker_config.hydra_overrides,
+                sam2_apply_postprocessing=self.sam2_tracker_config.apply_postprocessing,
+            )
         )
-        self.textregion_mask_extractor = None if self.use_inst_gt else SAMMaskExtractor(device, self.sam_model_level_textregion)
+        self.textregion_mask_extractor = (
+            None
+            if self.use_inst_gt
+            else SAMMaskExtractor(
+                device,
+                self.sam_model_level_textregion,
+                amg_config=self.sam_amg_config,
+                sam2_mode=self.sam2_tracker_config.mode,
+                sam2_hydra_overrides=self.sam2_tracker_config.hydra_overrides,
+                sam2_apply_postprocessing=self.sam2_tracker_config.apply_postprocessing,
+            )
+        )
         self.instances: dict[int, dict] = {}
         self.active_gids: set[int] = set()
         self.point_labels = np.empty((0,), dtype=np.int32)
@@ -522,7 +603,7 @@ class SAM2InstanceManager:
         return dominant_gid, frac, support
 
     def _reseed_tracker(self, image_np: np.ndarray, inst_img_full: np.ndarray) -> None:
-        final_masks = build_label_masks(inst_img_full, max_objects=SAM2_MAX_NUM_OBJECTS)
+        final_masks = build_label_masks(inst_img_full, max_objects=self.sam2_tracker_config.max_num_objects)
         visible_gids = {gid for gid, _ in final_masks}
         self.stats["sam2_seed_object_truncations"] += max(0, len(np.unique(inst_img_full[inst_img_full >= 0])) - len(final_masks))
         for gid in list(self.active_gids):
@@ -537,7 +618,7 @@ class SAM2InstanceManager:
         self.close()
         if not final_masks:
             return
-        self.tracker = SAM2VideoTracker(image_np, self.sam2_model_level_track)
+        self.tracker = SAM2VideoTracker(image_np, self.sam2_model_level_track, tracker_config=self.sam2_tracker_config)
         self.tracker.reset_and_seed_masks(final_masks)
         self.segment_next_local_idx = 1
 
@@ -558,6 +639,8 @@ class RGBMapper:
         sam_model_level_inst: int,
         sam_model_level_textregion: int,
         sam2_model_level_track: int,
+        sam_amg_config: SAMAutomaticMaskConfig,
+        sam2_tracker_config: SAM2TrackerConfig,
     ) -> None:
         self.device = device
         self.cam_intrinsics = torch.tensor(intrinsics.astype(np.float32), device=device)
@@ -571,6 +654,8 @@ class RGBMapper:
         self.sam_model_level_inst = int(sam_model_level_inst)
         self.sam_model_level_textregion = int(sam_model_level_textregion)
         self.sam2_model_level_track = int(sam2_model_level_track)
+        self.sam_amg_config = sam_amg_config
+        self.sam2_tracker_config = sam2_tracker_config
         self.instance_manager = SAM2InstanceManager(
             device=device,
             dataset_name=dataset_name,
@@ -579,6 +664,8 @@ class RGBMapper:
             sam_model_level_inst=sam_model_level_inst,
             sam_model_level_textregion=sam_model_level_textregion,
             sam2_model_level_track=sam2_model_level_track,
+            sam_amg_config=sam_amg_config,
+            sam2_tracker_config=sam2_tracker_config,
         )
         if k_pooling > 1 and k_pooling % 2 == 0:
             raise ValueError("k_pooling must be odd.")
@@ -859,7 +946,10 @@ class RGBMapper:
                 "sam2_model_level_track": self.sam2_model_level_track,
                 "sam2_checkpoint_path_track": str(self.instance_manager.tracker.checkpoint_path) if self.instance_manager.tracker is not None else str((INPUT_DIR / "sam_ckpts" / SAM2_LEVELS[self.sam2_model_level_track][0])),
                 "sam2_config_track": SAM2_LEVELS[self.sam2_model_level_track][1],
-                "sam2_max_num_objects": SAM2_MAX_NUM_OBJECTS,
+                "sam2_max_num_objects": self.sam2_tracker_config.max_num_objects,
+                "sam2_mode": self.sam2_tracker_config.mode,
+                "sam2_hydra_overrides": list(self.sam2_tracker_config.hydra_overrides),
+                "sam2_apply_postprocessing": self.sam2_tracker_config.apply_postprocessing,
                 "track_support_min": TRACK_SUPPORT_MIN,
                 "attach_frac_th": ATTACH_FRAC_TH,
                 "birth_min_points": BIRTH_MIN_POINTS,
@@ -868,9 +958,23 @@ class RGBMapper:
                 "confirm_min_points": CONFIRM_MIN_POINTS,
                 "confirm_min_seed_hits": CONFIRM_MIN_SEED_HITS,
                 "tentative_max_seed_age": TENTATIVE_MAX_SEED_AGE,
-                "sam_points_per_side": SAM_POINTS_PER_SIDE,
-                "sam_sort_mode": SAM_SORT_MODE,
-                "sam_min_mask_area_perc": SAM_MIN_MASK_AREA_PERC,
+                "sam_sort_mode": self.sam_amg_config.sort_mode,
+                "sam_min_mask_area_perc": self.sam_amg_config.min_mask_area_perc,
+                "sam_points_per_side": self.sam_amg_config.points_per_side,
+                "sam_points_per_batch": self.sam_amg_config.points_per_batch,
+                "sam_pred_iou_thresh": self.sam_amg_config.pred_iou_thresh,
+                "sam_stability_score_thresh": self.sam_amg_config.stability_score_thresh,
+                "sam_stability_score_offset": self.sam_amg_config.stability_score_offset,
+                "sam_mask_threshold": self.sam_amg_config.mask_threshold,
+                "sam_box_nms_thresh": self.sam_amg_config.box_nms_thresh,
+                "sam_crop_n_layers": self.sam_amg_config.crop_n_layers,
+                "sam_crop_nms_thresh": self.sam_amg_config.crop_nms_thresh,
+                "sam_crop_overlap_ratio": self.sam_amg_config.crop_overlap_ratio,
+                "sam_crop_n_points_downscale_factor": self.sam_amg_config.crop_n_points_downscale_factor,
+                "sam_min_mask_region_area": self.sam_amg_config.min_mask_region_area,
+                "sam_output_mode": self.sam_amg_config.output_mode,
+                "sam_use_m2m": self.sam_amg_config.use_m2m,
+                "sam_multimask_output": self.sam_amg_config.multimask_output,
                 **self.instance_manager.stats,
             }
             if self.instance_manager.textregion_mask_extractor is not None:
@@ -879,6 +983,7 @@ class RGBMapper:
                         "sam_model_level_textregion": self.sam_model_level_textregion,
                         "sam_model_type_textregion": self.instance_manager.textregion_mask_extractor.model_type,
                         "sam_checkpoint_path_textregion": str(self.instance_manager.textregion_mask_extractor.checkpoint_path),
+                        "sam_config_textregion": self.instance_manager.textregion_mask_extractor.config_path,
                     }
                 )
             if not self.use_inst_gt:
@@ -887,6 +992,7 @@ class RGBMapper:
                         "sam_model_level_inst": self.sam_model_level_inst,
                         "sam_model_type_inst": self.instance_manager.seed_mask_extractor.model_type,
                         "sam_checkpoint_path_inst": str(self.instance_manager.seed_mask_extractor.checkpoint_path),
+                        "sam_config_inst": self.instance_manager.seed_mask_extractor.config_path,
                     }
                 )
             with open(output_dir / "stats.json", "w") as f:
@@ -919,6 +1025,8 @@ def main(args):
         disable_loop_closure=args.disable_loop_closure,
     )
     dataset_load_sec = time.perf_counter() - dataset_load_start
+    sam_amg_config = build_sam_amg_config(args)
+    sam2_tracker_config = build_sam2_tracker_config(args)
     mapper = RGBMapper(
         intrinsics=dataset.intrinsics,
         device=device,
@@ -933,6 +1041,8 @@ def main(args):
         sam_model_level_inst=args.sam_model_level_inst,
         sam_model_level_textregion=args.sam_model_level_textregion,
         sam2_model_level_track=args.sam2_model_level_track,
+        sam_amg_config=sam_amg_config,
+        sam2_tracker_config=sam2_tracker_config,
     )
 
     progress = tqdm(range(len(dataset)), desc=args.scene_name, unit="frame")
@@ -1006,9 +1116,7 @@ if __name__ == "__main__":
     parser.add_argument("--k_pooling", type=int, default=DEFAULT_K_POOLING)
     parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
-    parser.add_argument("--sam-model-level-inst", type=int, choices=sorted(SAM1_LEVELS), default=13)
-    parser.add_argument("--sam-model-level-textregion", type=int, choices=sorted(SAM1_LEVELS), default=13)
-    parser.add_argument("--sam2-model-level-track", type=int, choices=sorted(SAM2_LEVELS), default=24)
+    add_sam_runtime_args(parser, include_textregion=True)
     parser.add_argument("--use-inst-gt", action="store_true", help="Use decoded instance-filt masks instead of SAM for instance supervision.")
     parsed = parser.parse_args()
     main(parsed)

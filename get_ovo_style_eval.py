@@ -15,6 +15,9 @@ from build_rgb_map import (
     CLIP_LOAD_SIZE,
     CLIP_MODEL_NAME,
     CLIP_PRETRAINED,
+    add_sam_runtime_args,
+    build_sam_amg_config,
+    build_sam2_tracker_config,
     DEFAULT_DOWNSCALE_RES,
     DEFAULT_K_POOLING,
     DEFAULT_MAP_EVERY,
@@ -75,6 +78,8 @@ def build_scene(scene_name: str, args: argparse.Namespace) -> tuple[Path, dict]:
         disable_loop_closure=args.disable_loop_closure,
     )
     dataset_load_sec = time.perf_counter() - dataset_load_start
+    sam_amg_config = build_sam_amg_config(args)
+    sam2_tracker_config = build_sam2_tracker_config(args)
     mapper = RGBMapper(
         intrinsics=dataset.intrinsics,
         device=device,
@@ -89,6 +94,8 @@ def build_scene(scene_name: str, args: argparse.Namespace) -> tuple[Path, dict]:
         sam_model_level_inst=args.sam_model_level_inst,
         sam_model_level_textregion=args.sam_model_level_textregion,
         sam2_model_level_track=args.sam2_model_level_track,
+        sam_amg_config=sam_amg_config,
+        sam2_tracker_config=sam2_tracker_config,
     )
 
     progress = tqdm(range(len(dataset)), desc=scene_name, unit="frame", dynamic_ncols=True)
@@ -163,7 +170,7 @@ def evaluate_scene_ovo_style(
     pred_instance_labels = resolve_instance_labels(run_dir, pred["points"].shape[0], min_component_size)
     gt_semantic = map_gt_labels_to_eval_ids(gt["semantic_raw"], dataset_info)
 
-    instance_classes, diag_1 = classify_instance_features_ovo_style(
+    instance_classes, _, diag_1 = classify_instance_features_ovo_style(
         pred["clip_features"],
         pred_instance_labels,
         text_embeds,
@@ -337,9 +344,7 @@ if __name__ == "__main__":
     parser.add_argument("--k_pooling", type=int, default=DEFAULT_K_POOLING)
     parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
-    parser.add_argument("--sam-model-level-inst", type=int, choices=[11, 12, 13], default=13)
-    parser.add_argument("--sam-model-level-textregion", type=int, choices=[11, 12, 13], default=13)
-    parser.add_argument("--sam2-model-level-track", type=int, choices=[21, 22, 23, 24], default=24)
+    add_sam_runtime_args(parser, include_textregion=True)
     parser.add_argument("--use-inst-gt", action="store_true")
     parser.add_argument("--ovo_score_th", type=float, default=DEFAULT_OVO_SCORE_TH)
     parser.add_argument("--min_component_size", type=int, default=2000)
