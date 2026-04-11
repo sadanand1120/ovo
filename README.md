@@ -150,7 +150,43 @@ PY
 
 ### Replica
 
-Expected layout:
+Raw Replica root:
+
+```text
+<replica_root>/
+  office0/
+    results/
+      frame000000.jpg
+      depth000000.png
+      ...
+    traj.txt
+  office1/
+  office2/
+  office3/
+  office4/
+  room0/
+  room1/
+  room2/
+  office0_mesh.ply
+  office1_mesh.ply
+  office2_mesh.ply
+  office3_mesh.ply
+  office4_mesh.ply
+  room0_mesh.ply
+  room1_mesh.ply
+  room2_mesh.ply
+  semantic_gt/
+    office0.txt
+    office1.txt
+    office2.txt
+    office3.txt
+    office4.txt
+    room0.txt
+    room1.txt
+    room2.txt
+```
+
+Runtime layout:
 
 ```text
 data/input/Replica/
@@ -160,6 +196,34 @@ data/input/Replica/
     traj.txt
   office0_mesh.ply
   ...
+```
+
+Setup flow:
+
+1. Download the NICE-SLAM Replica bundle.
+
+```bash
+wget https://cvg-data.inf.ethz.ch/nice-slam/data/Replica.zip
+unzip Replica.zip
+rm Replica.zip
+```
+
+In the rest of this section, treat `/path/to/Replica` as `<replica_root>`.
+
+2. Semantic GT for the standard Replica scenes is already available in this repo under `data/input/Replica/semantic_gt`. `replica_decode.py` uses that automatically if `<replica_root>/semantic_gt` is missing.
+
+3. Stage Replica into the runtime layout used by this repo.
+
+By default this creates symlinks in `data/input/Replica`:
+
+```bash
+python replica_decode.py --source_root <replica_root>
+```
+
+If you want actual copies instead of symlinks:
+
+```bash
+python replica_decode.py --source_root <replica_root> --copy
 ```
 
 ### ScanNet
@@ -250,8 +314,6 @@ Replica:
 python get_metrics_map.py data/output/rgb_maps/Replica/office0 \
   --replica_root data/input/Replica --save_json
 ```
-
-For Replica, metrics that require unavailable GT signals are skipped cleanly.
 
 ### ScanNet HVS report
 
