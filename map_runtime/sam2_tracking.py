@@ -141,14 +141,20 @@ class SAM2VideoTracker:
                 hydra_overrides_extra=list(self.tracker_config.hydra_overrides),
                 apply_postprocessing=self.tracker_config.apply_postprocessing,
             )
-        self.images = LazyFrameLoader(first_frame_source, self.predictor.image_size)
-        self.inference_state = {
+        self.images = None
+        self.inference_state = None
+        self._restart(first_frame_source)
+
+    def _build_inference_state(self, first_frame_source: Path | str | np.ndarray) -> dict:
+        images = LazyFrameLoader(first_frame_source, self.predictor.image_size)
+        self.images = images
+        return {
             "images": self.images,
-            "num_frames": len(self.images),
+            "num_frames": len(images),
             "offload_video_to_cpu": True,
             "offload_state_to_cpu": True,
-            "video_height": self.images.video_height,
-            "video_width": self.images.video_width,
+            "video_height": images.video_height,
+            "video_width": images.video_width,
             "device": self.device,
             "storage_device": torch.device("cpu"),
             "point_inputs_per_obj": {},
@@ -165,6 +171,9 @@ class SAM2VideoTracker:
             "tracking_has_started": False,
             "frames_already_tracked": {},
         }
+
+    def _restart(self, first_frame_source: Path | str | np.ndarray) -> None:
+        self.inference_state = self._build_inference_state(first_frame_source)
         with self._inference_context():
             self.predictor._get_image_feature(self.inference_state, frame_idx=0, batch_size=1)
 
@@ -225,6 +234,14 @@ class SAM2VideoTracker:
         for obj_id, mask in seed_masks:
             self._request_add_mask(frame_idx=0, obj_id=int(obj_id), mask=mask)
         return self._finalize_seed(frame_idx=0)
+
+    def restart_and_seed_masks(
+        self,
+        first_frame_source: Path | str | np.ndarray,
+        seed_masks: list[tuple[int, np.ndarray]],
+    ) -> dict[int, np.ndarray]:
+        self._restart(first_frame_source)
+        return self.reset_and_seed_masks(seed_masks)
 
     def track_frame(self, frame_idx: int) -> dict[int, np.ndarray]:
         batch_size = self.predictor._get_obj_num(self.inference_state)

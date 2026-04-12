@@ -631,11 +631,14 @@ class SAM2InstanceManager:
             if state["status"] != "tentative":
                 state["status"] = "inactive"
         self.active_gids = set(visible_gids)
-        self.close()
         if not final_masks:
+            self.close()
             return
-        self.tracker = SAM2VideoTracker(image_np, self.sam2_model_level_track, tracker_config=self.sam2_tracker_config)
-        self.tracker.reset_and_seed_masks(final_masks)
+        if self.tracker is None:
+            self.tracker = SAM2VideoTracker(image_np, self.sam2_model_level_track, tracker_config=self.sam2_tracker_config)
+            self.tracker.reset_and_seed_masks(final_masks)
+        else:
+            self.tracker.restart_and_seed_masks(image_np, final_masks)
         self.segment_next_local_idx = 1
 
 
@@ -873,7 +876,6 @@ class RGBMapper:
             visible_normals = visible_normals / torch.linalg.norm(visible_normals, dim=1, keepdim=True).clamp_min(1e-8)
             self._update_observed_points(visible_ids, visible_colors, visible_normals)
         mask = mask & normal_valid
-
         if mask.any():
             x_keep = x[mask]
             y_keep = y[mask]
