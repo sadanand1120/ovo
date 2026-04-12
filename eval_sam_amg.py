@@ -1,6 +1,7 @@
 import argparse
 import json
 from pathlib import Path
+import time
 
 import cv2  # Load before torch in this env.
 import numpy as np
@@ -214,6 +215,7 @@ def main() -> None:
     parser.add_argument("--frame_sample_seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--save_json", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--sam-model-level-inst", type=int, choices=sorted(SAM_AMG_LEVELS), default=DEFAULT_SAM_AMG_MODEL_LEVEL)
     parser.add_argument("--sam-sort-mode", choices=["area", "predicted_iou", "stability", "score"], default=DEFAULT_AMG_CONFIG.sort_mode)
     parser.add_argument("--sam-min-mask-area-perc", type=float, default=DEFAULT_AMG_CONFIG.min_mask_area_perc)
@@ -244,12 +246,20 @@ def main() -> None:
     parser.add_argument("--mask-containment-thresh", type=float, default=DEFAULT_AMG_CONFIG.mask_containment_thresh)
     args = parser.parse_args()
 
+    eval_start = time.perf_counter()
     summary = evaluate_scene(args)
+    runtime_sec = time.perf_counter() - eval_start
+    summary["runtime_sec"] = float(runtime_sec)
+    summary["fps"] = float(summary["n_frames"] / max(runtime_sec, 1e-12))
     if args.save_json:
         out_path = INPUT_DIR / canonical_dataset_name(args.dataset_name) / args.scene_name / "sam_amg_eval.json"
         summary["json_path"] = str(out_path)
         with open(out_path, "w") as f:
             json.dump(summary, f, indent=2)
+    if args.quiet:
+        print(f"mean_ap={summary['metric_value']:.6f}")
+        print(f"fps={summary['fps']:.6f}")
+        return
     print(json.dumps(summary, indent=2))
 
 
