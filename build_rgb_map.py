@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from map_runtime import geometry
+from map_runtime.build_debug_videos import RGBMapDebugVideoWriter
 from map_runtime.sam_masks import (
     DEFAULT_SAM_AMG_MODEL_LEVEL,
     GTInstanceMaskExtractor,
@@ -34,6 +35,7 @@ from map_runtime.scene import (
 OUTPUT_DIR = Path("data/output/rgb_maps")
 TIMING_PATH = "timing.json"
 CLIP_FEATURE_FILE = "clip_feats.npy"
+DEBUG_VIDEO_DIR = "debug_videos"
 DEFAULT_MAP_EVERY = 8
 DEFAULT_DOWNSCALE_RES = 2
 DEFAULT_K_POOLING = 1
@@ -126,6 +128,8 @@ def build_sam2_tracker_config(args: argparse.Namespace) -> SAM2TrackerConfig:
         hydra_overrides=tuple(args.sam2_hydra_override or ()),
         apply_postprocessing=not bool(args.sam2_disable_postprocessing),
     )
+
+
 def load_dataset(
     dataset_name: str,
     scene_name: str,
@@ -484,25 +488,26 @@ class SAM2InstanceManager:
         c2w_np: np.ndarray,
         point_ids_full: torch.Tensor,
         gid_img_full: torch.Tensor,
-    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
         if np.isinf(c2w_np).any() or np.isnan(c2w_np).any():
             if is_seed_frame:
                 self.close()
                 self.active_gids.clear()
-            return None, None
+            return None, None, None
 
         tracked_masks = self._track_frame(frame_id, image_np, gid_img_full)
+        current_labels = np.full(image_np.shape[:2], -1, dtype=np.int32)
+        for gid, mask in sorted(tracked_masks.items(), key=lambda item: int(item[1].sum()), reverse=True):
+            current_labels[mask] = int(gid)
         if not is_seed_frame:
             self.cleanup_tentatives(frame_id, is_seed_frame=False)
-            return None, None
+            return None, None, current_labels
 
         self.seed_frame_counter += 1
         self.stats["sam2_seed_frames"] += 1
         seed_labels = self._extract_seed_labels(frame_id, image_np)
         seed_masks = build_label_masks(seed_labels)
-        inst_img_full = np.full(image_np.shape[:2], -1, dtype=np.int32)
-        for gid, mask in sorted(tracked_masks.items(), key=lambda item: int(item[1].sum()), reverse=True):
-            inst_img_full[mask] = int(gid)
+        inst_img_full = current_labels.copy()
 
         valid_new_support = (point_ids_full < 0) & torch.from_numpy(depth_np > 0).to(point_ids_full.device)
         for _, seed_mask in seed_masks:
@@ -540,7 +545,7 @@ class SAM2InstanceManager:
         self._mark_seed_hits_for_visible(frame_id, inst_img_full)
         self._reseed_tracker(image_np, inst_img_full)
         self.cleanup_tentatives(frame_id, is_seed_frame=True)
-        return inst_img_full, seed_labels
+        return inst_img_full, seed_labels, inst_img_full
 
     def _extract_seed_labels(self, frame_id: int, image_np: np.ndarray) -> np.ndarray:
         if self.use_inst_gt:
@@ -660,6 +665,7 @@ class RGBMapper:
         sam2_model_level_track: int,
         sam_amg_config: SAMAutomaticMaskConfig,
         sam2_tracker_config: SAM2TrackerConfig,
+        debug_video_writer: RGBMapDebugVideoWriter | None = None,
     ) -> None:
         self.device = device
         self.cam_intrinsics = torch.tensor(intrinsics.astype(np.float32), device=device)
@@ -675,6 +681,7 @@ class RGBMapper:
         self.sam2_model_level_track = int(sam2_model_level_track)
         self.sam_amg_config = sam_amg_config
         self.sam2_tracker_config = sam2_tracker_config
+        self.debug_video_writer = debug_video_writer
         self.instance_manager = SAM2InstanceManager(
             device=device,
             dataset_name=dataset_name,
@@ -801,6 +808,14 @@ class RGBMapper:
                 self.instance_manager.active_gids.clear()
             self.instance_manager.cleanup_tentatives(frame_id, is_seed_frame=is_seed_frame)
             self._refresh_point_label_cache()
+            if self.debug_video_writer is not None:
+                self.debug_video_writer.write_instance_frame(
+                    frame_id=frame_id,
+                    rgb=image_np,
+                    current_labels=None,
+                    global_labels=None,
+                    is_seed_frame=is_seed_frame,
+                )
             return
         if isinstance(c2w_np, torch.Tensor):
             c2w = c2w_np.to(self.device, dtype=torch.float32)
@@ -814,6 +829,14 @@ class RGBMapper:
                 self.instance_manager.active_gids.clear()
             self.instance_manager.cleanup_tentatives(frame_id, is_seed_frame=is_seed_frame)
             self._refresh_point_label_cache()
+            if self.debug_video_writer is not None:
+                self.debug_video_writer.write_instance_frame(
+                    frame_id=frame_id,
+                    rgb=image_np,
+                    current_labels=None,
+                    global_labels=None,
+                    is_seed_frame=is_seed_frame,
+                )
             return
 
         depth = torch.from_numpy(depth_np).to(self.device)
@@ -845,7 +868,7 @@ class RGBMapper:
                     mask[matches[:, 1], matches[:, 0]] = False
             mask = self.pooling(mask)
 
-        inst_img_full, seed_labels_np = self.instance_manager.prepare_frame_labels(
+        inst_img_full, seed_labels_np, current_labels_np = self.instance_manager.prepare_frame_labels(
             frame_id=frame_id,
             is_seed_frame=is_seed_frame,
             image_np=image_np,
@@ -854,8 +877,26 @@ class RGBMapper:
             point_ids_full=point_ids_full,
             gid_img_full=gid_img_full,
         )
+        global_labels_np = gid_img_full.cpu().numpy().astype(np.int32, copy=True)
         self._refresh_point_label_cache()
-        if not is_seed_frame or inst_img_full is None:
+        if is_seed_frame and seed_labels_np is not None and self.debug_video_writer is not None:
+            self.debug_video_writer.update_latest_seed(
+                frame_id=frame_id,
+                rgb=image_np,
+                seed_labels=seed_labels_np,
+                seed_source="gt inst" if self.use_inst_gt else "sam inst",
+            )
+        if not is_seed_frame:
+            if self.debug_video_writer is not None:
+                self.debug_video_writer.write_instance_frame(
+                    frame_id=frame_id,
+                    rgb=image_np,
+                    current_labels=current_labels_np,
+                    global_labels=global_labels_np,
+                    is_seed_frame=False,
+                )
+            return
+        if inst_img_full is None:
             return
 
         tr_labels_np = self.instance_manager.extract_textregion_labels(image_np, seed_labels_np)
@@ -906,9 +947,32 @@ class RGBMapper:
             new_gids = instance_labels_ds[row_keep, col_keep].cpu().numpy().astype(np.int32, copy=False)
             self.instance_manager.assign_new_points(new_gids, frame_id)
             self._refresh_point_label_cache()
+            global_labels_np[y_keep.cpu().numpy(), x_keep.cpu().numpy()] = new_gids
+            if self.debug_video_writer is not None:
+                raw_tr_labels = torch.full_like(tr_labels_full, -1)
+                dense_clip_raw = self.clip_extractor.extract_dense(full_image, raw_tr_labels)
+                self.debug_video_writer.write_textregion_frame(
+                    frame_id=frame_id,
+                    rgb=image_np,
+                    raw_clip_dense=dense_clip_raw,
+                    textregion_labels=tr_labels_np,
+                    textregion_clip_dense=dense_clip,
+                    mask_source="gt inst" if self.use_inst_gt else "sam textregion",
+                )
+                del dense_clip_raw
+        if self.debug_video_writer is not None:
+            self.debug_video_writer.write_instance_frame(
+                frame_id=frame_id,
+                rgb=image_np,
+                current_labels=current_labels_np,
+                global_labels=global_labels_np,
+                is_seed_frame=True,
+            )
 
     def save(self, output_dir: Path, stats: dict) -> dict:
         self.instance_manager.close()
+        if self.debug_video_writer is not None:
+            self.debug_video_writer.close()
         output_dir.mkdir(parents=True, exist_ok=True)
         save_start = time.perf_counter()
         progress = tqdm(total=4, desc=f"{output_dir.name} save", unit="stage", dynamic_ncols=True)
@@ -1032,6 +1096,9 @@ def main(args):
     run_start = time.perf_counter()
     dataset_name = args.dataset_name
     output_dir = Path(args.output_root) / canonical_dataset_name(dataset_name) / args.scene_name
+    debug_video_writer = None
+    if args.debug_videos:
+        debug_video_writer = RGBMapDebugVideoWriter(output_dir / DEBUG_VIDEO_DIR, fps=args.debug_video_fps)
     dataset_load_start = time.perf_counter()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     config, dataset, slam_backbone = load_dataset_and_slam(
@@ -1062,6 +1129,7 @@ def main(args):
         sam2_model_level_track=args.sam2_model_level_track,
         sam_amg_config=sam_amg_config,
         sam2_tracker_config=sam2_tracker_config,
+        debug_video_writer=debug_video_writer,
     )
 
     progress = tqdm(range(len(dataset)), desc=args.scene_name, unit="frame")
@@ -1137,5 +1205,7 @@ if __name__ == "__main__":
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
     add_sam_runtime_args(parser, include_textregion=True)
     parser.add_argument("--use-inst-gt", action="store_true", help="Use decoded instance-filt masks instead of SAM for instance supervision.")
+    parser.add_argument("--debug-videos", action="store_true", help="Dump per-frame debug videos for instance/tracking and text-region CLIP flow.")
+    parser.add_argument("--debug-video-fps", type=int, default=4)
     parsed = parser.parse_args()
     main(parsed)
