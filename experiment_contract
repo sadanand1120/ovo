@@ -1,0 +1,17 @@
+User objective: run a systematic exploration experiment for eval_sam_amg.py on Replica office0 with frame_samples=100, starting from current defaults as baseline.
+Primary command form: export CUDA_VISIBLE_DEVICES='GPU' && python3 eval_sam_amg.py --dataset_name Replica --scene_name office0 --frame_samples 100 [knob overrides]
+Goal: optimize the Pareto frontier over runtime vs final mean AP metric.
+Requirements:
+- Start with one baseline run using current default arguments.
+- Identify the really high-impact knobs only, including user's current set: sam-model-level-inst, sam-points-per-side, sam-points-per-batch, sam-crop-n-layers. Add only genuinely high-impact knobs for metric and/or speed.
+- Use a systematic exploration in the resulting num_knobs-dimensional space.
+- Run about 8 adaptive batches total.
+- Run 100-150 total experiments overall.
+- Each individual experiment must use one GPU only; no GPU contention.
+- Usable GPU pool: 1,3,4,5,6,7,8,9.
+- Before launching runs in each batch, verify free GPUs with current snapshot; if a GPU is no longer free due to someone else, do not use it.
+- Keep going through batches using available free GPUs from the pool.
+- Record exact runtime and final mean AP for every run.
+- Save knob values for every run clearly alongside results so frontier configs are directly readable.
+- Produce a beautiful time-vs-metric plot of all runs, label each point by run number, highlight baseline distinctly, and highlight Pareto frontier distinctly.
+- Keep this contract file as a persistent reminder during the task.

@@ -1,0 +1,60 @@
+{
+  "dataset_name": "Replica",
+  "scene_name": "office0",
+  "metric_name": "mask_ap",
+  "metric_value": 0.28132666114205,
+  "metrics": {
+    "ap_50": 0.358093531445756,
+    "ap_55": 0.34319918108970976,
+    "ap_60": 0.3325847949238041,
+    "ap_65": 0.31017547934831746,
+    "ap_70": 0.29221324174495655,
+    "ap_75": 0.2758583229126222,
+    "ap_80": 0.27220184175429263,
+    "ap_85": 0.2565107198727194,
+    "ap_90": 0.2220573475306006,
+    "ap_95": 0.15037215079772154,
+    "ap": 0.28132666114205
+  },
+  "n_frames": 100,
+  "frame_samples": 100,
+  "frame_sample_seed": 0,
+  "sam_model_level_inst": 24,
+  "diagnostics": {
+    "num_eval_classes": 1,
+    "num_eval_entries": 100,
+    "gt_instances_per_class": {
+      "1": 1824
+    },
+    "pred_instances_per_class": {
+      "1": 2336
+    }
+  },
+  "sam_sort_mode": "score",
+  "sam_min_mask_area_perc": 0.001,
+  "sam_max_mask_area_perc": 0.0,
+  "sam_points_per_side": 16,
+  "sam_points_per_batch": 64,
+  "sam_pred_iou_thresh": 0.88,
+  "sam_stability_score_thresh": 0.9,
+  "sam_stability_score_offset": 1.0,
+  "sam_mask_threshold": 0.0,
+  "sam_box_nms_thresh": 0.7,
+  "sam_crop_n_layers": 0,
+  "sam_crop_nms_thresh": 0.7,
+  "sam_crop_overlap_ratio": 0.6,
+  "sam_crop_n_points_downscale_factor": 1,
+  "sam_min_mask_region_area": 0,
+  "sam_use_m2m": false,
+  "sam_multimask_output": true,
+  "sam2_mode": "eval",
+  "sam2_hydra_overrides": [],
+  "sam2_apply_postprocessing": true,
+  "sam_score_pred_iou_power": 2.0,
+  "sam_score_stability_power": 1.0,
+  "sam_score_area_power": 0.0,
+  "mask_overlap_rescore_thresh": 0.0,
+  "mask_overlap_rescore_power": 1.0,
+  "mask_dedupe_iou_thresh": 0.85,
+  "mask_containment_thresh": 0.0
+}
