@@ -73,6 +73,24 @@ def resolve_ply_path(input_path: str) -> Path:
     return path if path.suffix == ".ply" else path / "rgb_map.ply"
 
 
+def load_feature_model_spec(map_dir: Path) -> tuple[str, str]:
+    stats_path = map_dir / STATS_PATH
+    if not stats_path.exists():
+        return CLIP_MODEL_NAME, CLIP_PRETRAINED
+    stats = json.loads(stats_path.read_text())
+    return str(stats.get("clip_model_name", CLIP_MODEL_NAME)), str(stats.get("clip_pretrained", CLIP_PRETRAINED))
+
+
+def load_openclip_text_model(device: str, model_name: str, pretrained: str):
+    if pretrained.startswith("hf-hub:"):
+        model = open_clip.create_model_from_pretrained(pretrained)[0].eval().to(device)
+        tokenizer = open_clip.get_tokenizer(pretrained)
+    else:
+        model = open_clip.create_model_and_transforms(model_name, pretrained=pretrained, device=device)[0].eval()
+        tokenizer = open_clip.get_tokenizer(model_name)
+    return model, tokenizer
+
+
 def infer_scene_info_from_path(ply_path: Path) -> tuple[str, str]:
     scene_name = ply_path.parent.name
     dataset_name = ply_path.parent.parent.name
@@ -171,7 +189,8 @@ def project_face_labels_to_vertices(face_vertices, face_labels: np.ndarray, n_ve
 
 
 def load_replica_vertex_instance_labels(habitat_mesh_path: Path) -> tuple[np.ndarray, np.ndarray]:
-    points, _, _, ply = load_ply_vertices(habitat_mesh_path)
+    points, _, _, _ = load_ply_vertices(habitat_mesh_path)
+    ply = PlyData.read(str(habitat_mesh_path))
     face = ply["face"].data
     if "object_id" not in face.dtype.names:
         raise ValueError(f"Replica habitat semantic mesh missing face field 'object_id': {habitat_mesh_path}")
@@ -353,9 +372,15 @@ def compute_normal_metrics(gt_normals: np.ndarray, pred_normals: np.ndarray) -> 
 
 
 @torch.inference_mode()
-def encode_class_texts(class_names: list[str], device: str, template: str = FEATURE_TEXT_TEMPLATE) -> torch.Tensor:
-    model = open_clip.create_model_and_transforms(CLIP_MODEL_NAME, pretrained=CLIP_PRETRAINED, device=device)[0].eval()
-    tokenizer = open_clip.get_tokenizer(CLIP_MODEL_NAME)
+def encode_class_texts(
+    class_names: list[str],
+    device: str,
+    template: str = FEATURE_TEXT_TEMPLATE,
+    *,
+    model_name: str = CLIP_MODEL_NAME,
+    pretrained: str = CLIP_PRETRAINED,
+) -> torch.Tensor:
+    model, tokenizer = load_openclip_text_model(device, model_name, pretrained)
     phrases = [template.format(name) for name in class_names]
     text = model.encode_text(tokenizer(phrases).to(device)).float()
     text = text / text.norm(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -840,8 +865,9 @@ def main(args: argparse.Namespace) -> None:
         gt_semantic = map_gt_labels_to_eval_ids(gt["semantic_raw"], dataset_info)
         class_names = dataset_info.get("class_names_reduced", dataset_info.get("class_names"))
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        text_embeds = encode_class_texts(class_names, device)
-        ovo_text_embeds = encode_class_texts(class_names, device, template=OVO_TEXT_TEMPLATE)
+        feature_model_name, feature_pretrained = load_feature_model_spec(ply_path.parent)
+        text_embeds = encode_class_texts(class_names, device, model_name=feature_model_name, pretrained=feature_pretrained)
+        ovo_text_embeds = encode_class_texts(class_names, device, template=OVO_TEXT_TEMPLATE, model_name=feature_model_name, pretrained=feature_pretrained)
         background_idx = class_names.index("background") if "background" in class_names else None
         from visualize_rgb_map import resolve_instance_labels
 

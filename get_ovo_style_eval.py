@@ -29,6 +29,7 @@ from build_rgb_map import (
     get_tracked_pose,
     load_dataset_and_slam,
 )
+from map_runtime.ovo_style import OVO_MODEL_CARDS, OVO_SIGLIP_MODEL_CARD
 from get_metrics_map import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_OVO_SCORE_TH,
@@ -96,6 +97,9 @@ def build_scene(scene_name: str, args: argparse.Namespace) -> tuple[Path, dict]:
         sam2_model_level_track=args.sam2_model_level_track,
         sam_amg_config=sam_amg_config,
         sam2_tracker_config=sam2_tracker_config,
+        ovo_online_tracking=args.ovo_online_tracking,
+        ovo_style_feature=args.ovo_style_feature,
+        ovo_weights_predictor_fusion=args.ovo_weights_predictor_fusion,
     )
 
     progress = tqdm(range(len(dataset)), desc=scene_name, unit="frame", dynamic_ncols=True)
@@ -128,18 +132,19 @@ def build_scene(scene_name: str, args: argparse.Namespace) -> tuple[Path, dict]:
             "k_pooling": args.k_pooling,
             "max_frame_points": mapper.max_frame_points,
             "match_distance_th": mapper.match_distance_th,
-            "clip_model_name": CLIP_MODEL_NAME,
-            "clip_pretrained": CLIP_PRETRAINED,
-            "clip_load_size": CLIP_LOAD_SIZE,
+            "clip_model_name": mapper.clip_extractor.model_name if mapper.ovo_style_feature else CLIP_MODEL_NAME,
+            "clip_pretrained": mapper.clip_extractor.pretrained if mapper.ovo_style_feature else CLIP_PRETRAINED,
+            "clip_load_size": mapper.clip_extractor.mask_res if mapper.ovo_style_feature else CLIP_LOAD_SIZE,
             "clip_skip_center_crop": True,
             "clip_feature_dim": mapper.clip_extractor.feature_dim,
             "clip_feature_dtype": "float16",
             "clip_feature_path": CLIP_FEATURE_FILE,
             "clip_feature_bytes": mapper.n_points * mapper.clip_extractor.feature_dim * 2,
             "clip_feature_gib": mapper.n_points * mapper.clip_extractor.feature_dim * 2 / 1024**3,
-            "clip_feature_mode": "clip_textregion",
+            "clip_feature_mode": "ovo_instance_siglip" if mapper.ovo_style_feature else "clip_textregion",
             "rgb_normal_point_fusion": True,
-            "clip_feature_fusion": False,
+            "clip_feature_fusion": False if not mapper.ovo_style_feature else "l1_medoid",
+            "ovo_weights_predictor_fusion": mapper.clip_extractor.weights_predictor_fusion if mapper.ovo_style_feature else False,
         },
     )
     timing_summary = {
@@ -256,7 +261,9 @@ def main(args: argparse.Namespace) -> None:
         dataset_info["ignore"] = dataset_info.get("ignore", []).copy() + dataset_info.get("background_reduced_ids", [])
     class_names = dataset_info.get("class_names_reduced", dataset_info.get("class_names"))
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    text_embeds = encode_class_texts(class_names, device, template=OVO_TEXT_TEMPLATE)
+    feature_model_name = OVO_SIGLIP_MODEL_CARD if args.ovo_style_feature else CLIP_MODEL_NAME
+    feature_pretrained = OVO_MODEL_CARDS[OVO_SIGLIP_MODEL_CARD] if args.ovo_style_feature else CLIP_PRETRAINED
+    text_embeds = encode_class_texts(class_names, device, template=OVO_TEXT_TEMPLATE, model_name=feature_model_name, pretrained=feature_pretrained)
     scenes = args.scenes or dataset_info["scenes"]
 
     per_scene_rows = []

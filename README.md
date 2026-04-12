@@ -35,7 +35,7 @@ All repo commands should be run inside the `humble` container and the `ovo` cond
 docker exec -it humble bash
 source /opt/miniconda3/etc/profile.d/conda.sh
 conda activate ovo
-cd /home/dynamo/AMRL_Research/repos/ovo
+cd /robodata/smodak/repos/ovo
 ```
 
 If you need to create the environment from scratch inside the container:
@@ -88,6 +88,8 @@ cd ../..
 ```
 
 `download_ckpts.sh` fetches the SAM1 and SAM2 checkpoints used by the pipeline.
+It also downloads the upstream OVO weights-predictor checkpoint to `data/input/weights_predictor/model.pt`.
+The matching `data/input/weights_predictor/hparams.yaml` is tracked in this repo.
 
 ## Backends
 
@@ -315,6 +317,24 @@ The output scene directory contains:
 - `stats.json`
 - `timing.json`
 
+OVO-compatible switches:
+
+- `--ovo-online-tracking`: use the upstream OVO-style projective online instance association instead of the current SAM2 video tracker.
+- `--ovo-style-feature`: switch from dense CLIP+TextRegion features to OVO-style instance-level SigLIP descriptors.
+- `--ovo-weights-predictor-fusion {none,learned,fixed_weights,hovsg,adaptive_weights,concept_fusion}`: select the OVO per-view fusion mode. `learned` matches the upstream OVO-paper setup when used together with the two OVO flags above. `none` keeps the lighter masked-region-only SigLIP variant.
+
+Upstream OVO-paper instance+feature setup:
+
+```bash
+python build_rgb_map.py \
+  --dataset_name ScanNet \
+  --scene_name scene0011_00 \
+  --slam_module vanilla \
+  --ovo-online-tracking \
+  --ovo-style-feature \
+  --ovo-weights-predictor-fusion learned
+```
+
 ### Render top-down incremental videos
 
 ```bash
@@ -323,6 +343,8 @@ python topdown_vis.py \
   --scene_name scene0011_00 \
   --load-view top_view_scene11.json
 ```
+
+`topdown_vis.py` and `get_ovo_style_eval.py` accept the same OVO flags as `build_rgb_map.py`.
 
 ### Visualize a built map
 

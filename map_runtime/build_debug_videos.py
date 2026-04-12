@@ -237,12 +237,12 @@ class RGBMapDebugVideoWriter:
         raw_pca, tr_pca = _joint_pca_rgb([raw_clip_dense, textregion_clip_dense], sample_size=50_000)
         raw_pca = _resize_to_match(raw_pca, rgb.shape[:2])
         tr_pca = _resize_to_match(tr_pca, rgb.shape[:2])
-        mask_panel = overlay_labels_on_rgb(rgb, textregion_labels, alpha=0.65)
+        mask_panel = colorize_label_map(textregion_labels)
         grid = np.hstack(
             (
                 overlay_header(rgb, "RGB", f"frame={frame_id}"),
-                overlay_header(raw_pca, "CLIP PCA", "pre text-region"),
                 overlay_header(mask_panel, "Text-Region Labels", f"frame={frame_id} source={mask_source}"),
+                overlay_header(raw_pca, "CLIP PCA", "pre text-region"),
                 overlay_header(tr_pca, "Text-Regioned CLIP PCA", "post text-region"),
             )
         )

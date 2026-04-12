@@ -262,6 +262,9 @@ def main(args: argparse.Namespace) -> None:
         sam2_model_level_track=args.sam2_model_level_track,
         sam_amg_config=sam_amg_config,
         sam2_tracker_config=sam2_tracker_config,
+        ovo_online_tracking=args.ovo_online_tracking,
+        ovo_style_feature=args.ovo_style_feature,
+        ovo_weights_predictor_fusion=args.ovo_weights_predictor_fusion,
     )
 
     snapshot_counts: list[int] = []
