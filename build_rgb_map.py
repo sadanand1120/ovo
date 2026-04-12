@@ -377,10 +377,12 @@ class SAM2InstanceManager:
         self.sam2_model_level_track = int(sam2_model_level_track)
         self.sam_amg_config = sam_amg_config
         self.sam2_tracker_config = sam2_tracker_config
-        self.seed_mask_extractor = (
-            GTInstanceMaskExtractor(dataset_name, scene_name)
-            if self.use_inst_gt
-            else SAMMaskExtractor(
+        self.shared_amg_extractor = False
+        if self.use_inst_gt:
+            self.seed_mask_extractor = GTInstanceMaskExtractor(dataset_name, scene_name)
+            self.textregion_mask_extractor = None
+        else:
+            self.seed_mask_extractor = SAMMaskExtractor(
                 device,
                 self.sam_model_level_inst,
                 amg_config=self.sam_amg_config,
@@ -388,19 +390,18 @@ class SAM2InstanceManager:
                 sam2_hydra_overrides=self.sam2_tracker_config.hydra_overrides,
                 sam2_apply_postprocessing=self.sam2_tracker_config.apply_postprocessing,
             )
-        )
-        self.textregion_mask_extractor = (
-            None
-            if self.use_inst_gt
-            else SAMMaskExtractor(
-                device,
-                self.sam_model_level_textregion,
-                amg_config=self.sam_amg_config,
-                sam2_mode=self.sam2_tracker_config.mode,
-                sam2_hydra_overrides=self.sam2_tracker_config.hydra_overrides,
-                sam2_apply_postprocessing=self.sam2_tracker_config.apply_postprocessing,
-            )
-        )
+            if self.sam_model_level_textregion == self.sam_model_level_inst:
+                self.textregion_mask_extractor = self.seed_mask_extractor
+                self.shared_amg_extractor = True
+            else:
+                self.textregion_mask_extractor = SAMMaskExtractor(
+                    device,
+                    self.sam_model_level_textregion,
+                    amg_config=self.sam_amg_config,
+                    sam2_mode=self.sam2_tracker_config.mode,
+                    sam2_hydra_overrides=self.sam2_tracker_config.hydra_overrides,
+                    sam2_apply_postprocessing=self.sam2_tracker_config.apply_postprocessing,
+                )
         self.instances: dict[int, dict] = {}
         self.active_gids: set[int] = set()
         self.point_labels = np.empty((0,), dtype=np.int32)
@@ -468,7 +469,7 @@ class SAM2InstanceManager:
     def extract_textregion_labels(self, image_np: np.ndarray, seed_labels_np: np.ndarray | None) -> np.ndarray:
         if self.use_inst_gt and seed_labels_np is not None:
             return seed_labels_np
-        if (not self.use_inst_gt) and seed_labels_np is not None and self.sam_model_level_inst == self.sam_model_level_textregion:
+        if seed_labels_np is not None and self.textregion_mask_extractor is self.seed_mask_extractor:
             return seed_labels_np
         if self.textregion_mask_extractor is None:
             raise RuntimeError("TextRegion SAM extractor was not initialized.")
@@ -990,6 +991,7 @@ class RGBMapper:
                 "sam_output_mode": self.sam_amg_config.output_mode,
                 "sam_use_m2m": self.sam_amg_config.use_m2m,
                 "sam_multimask_output": self.sam_amg_config.multimask_output,
+                "sam_amg_extractors_shared": self.instance_manager.shared_amg_extractor,
                 **self.instance_manager.stats,
             }
             if self.instance_manager.textregion_mask_extractor is not None:
