@@ -15,6 +15,7 @@ from tqdm.auto import tqdm
 
 from map_runtime import geometry
 from map_runtime.sam_masks import (
+    DEFAULT_SAM_AMG_MODEL_LEVEL,
     GTInstanceMaskExtractor,
     SAMAutomaticMaskConfig,
     SAM_AMG_LEVELS,
@@ -57,9 +58,9 @@ DEFAULT_SAM2_TRACKER_CONFIG = SAM2TrackerConfig()
 
 
 def add_sam_runtime_args(parser: argparse.ArgumentParser, *, include_textregion: bool = True) -> None:
-    parser.add_argument("--sam-model-level-inst", type=int, choices=sorted(SAM_AMG_LEVELS), default=13)
+    parser.add_argument("--sam-model-level-inst", type=int, choices=sorted(SAM_AMG_LEVELS), default=DEFAULT_SAM_AMG_MODEL_LEVEL)
     if include_textregion:
-        parser.add_argument("--sam-model-level-textregion", type=int, choices=sorted(SAM_AMG_LEVELS), default=13)
+        parser.add_argument("--sam-model-level-textregion", type=int, choices=sorted(SAM_AMG_LEVELS), default=DEFAULT_SAM_AMG_MODEL_LEVEL)
     parser.add_argument("--sam2-model-level-track", type=int, choices=sorted(SAM2_LEVELS), default=24)
     parser.add_argument("--sam-sort-mode", choices=["area", "predicted_iou", "stability", "score"], default=DEFAULT_SAM_AMG_CONFIG.sort_mode)
     parser.add_argument("--sam-min-mask-area-perc", type=float, default=DEFAULT_SAM_AMG_CONFIG.min_mask_area_perc)
@@ -75,6 +76,13 @@ def add_sam_runtime_args(parser: argparse.ArgumentParser, *, include_textregion:
     parser.add_argument("--sam-crop-overlap-ratio", type=float, default=DEFAULT_SAM_AMG_CONFIG.crop_overlap_ratio)
     parser.add_argument("--sam-crop-n-points-downscale-factor", type=int, default=DEFAULT_SAM_AMG_CONFIG.crop_n_points_downscale_factor)
     parser.add_argument("--sam-min-mask-region-area", type=int, default=DEFAULT_SAM_AMG_CONFIG.min_mask_region_area)
+    parser.add_argument("--sam-score-pred-iou-power", type=float, default=DEFAULT_SAM_AMG_CONFIG.score_pred_iou_power)
+    parser.add_argument("--sam-score-stability-power", type=float, default=DEFAULT_SAM_AMG_CONFIG.score_stability_power)
+    parser.add_argument("--sam-score-area-power", type=float, default=DEFAULT_SAM_AMG_CONFIG.score_area_power)
+    parser.add_argument("--mask-overlap-rescore-thresh", type=float, default=DEFAULT_SAM_AMG_CONFIG.mask_overlap_rescore_thresh)
+    parser.add_argument("--mask-overlap-rescore-power", type=float, default=DEFAULT_SAM_AMG_CONFIG.mask_overlap_rescore_power)
+    parser.add_argument("--mask-dedupe-iou-thresh", type=float, default=DEFAULT_SAM_AMG_CONFIG.mask_dedupe_iou_thresh)
+    parser.add_argument("--mask-containment-thresh", type=float, default=DEFAULT_SAM_AMG_CONFIG.mask_containment_thresh)
     parser.add_argument("--sam-use-m2m", action="store_true")
     parser.add_argument("--sam-disable-multimask-output", action="store_true")
     parser.add_argument("--sam2-max-num-objects", type=int, default=DEFAULT_SAM2_TRACKER_CONFIG.max_num_objects)
@@ -101,6 +109,13 @@ def build_sam_amg_config(args: argparse.Namespace) -> SAMAutomaticMaskConfig:
         min_mask_region_area=args.sam_min_mask_region_area,
         use_m2m=bool(args.sam_use_m2m),
         multimask_output=not bool(args.sam_disable_multimask_output),
+        score_pred_iou_power=args.sam_score_pred_iou_power,
+        score_stability_power=args.sam_score_stability_power,
+        score_area_power=args.sam_score_area_power,
+        mask_overlap_rescore_thresh=args.mask_overlap_rescore_thresh,
+        mask_overlap_rescore_power=args.mask_overlap_rescore_power,
+        mask_dedupe_iou_thresh=args.mask_dedupe_iou_thresh,
+        mask_containment_thresh=args.mask_containment_thresh,
     )
 
 

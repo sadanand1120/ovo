@@ -17,20 +17,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "thirdParty" / "
 
 INPUT_DIR = Path("data/input")
 DATASET_DIRS = {"Replica": "Replica", "ScanNet": "ScanNet"}
-SAM_SORT_MODE = "area"
-SAM_MIN_MASK_AREA_PERC = 0.01
-SAM_POINTS_PER_SIDE = 8
+SAM_SORT_MODE = "score"
+SAM_MIN_MASK_AREA_PERC = 0.001
+SAM_POINTS_PER_SIDE = 20
 SAM_POINTS_PER_BATCH = 64
 SAM_PRED_IOU_THRESH = 0.88
-SAM_STABILITY_SCORE_THRESH = 0.95
+SAM_STABILITY_SCORE_THRESH = 0.92
 SAM_STABILITY_SCORE_OFFSET = 1.0
 SAM_BOX_NMS_THRESH = 0.7
 SAM_CROP_N_LAYERS = 0
 SAM_CROP_NMS_THRESH = 0.7
-SAM_CROP_OVERLAP_RATIO = 0.3413333333333333
+SAM_CROP_OVERLAP_RATIO = 0.6
 SAM_CROP_N_POINTS_DOWNSCALE_FACTOR = 1
 SAM_MIN_MASK_REGION_AREA = 0
 SAM_OUTPUT_MODE = "binary_mask"
+SAM_SCORE_PRED_IOU_POWER = 2.0
+SAM_SCORE_STABILITY_POWER = 1.0
+SAM_SCORE_AREA_POWER = 0.0
+MASK_OVERLAP_RESCORE_THRESH = 0.0
+MASK_OVERLAP_RESCORE_POWER = 1.0
+MASK_DEDUPE_IOU_THRESH = 0.85
+MASK_CONTAINMENT_THRESH = 0.0
+DEFAULT_SAM_AMG_MODEL_LEVEL = 24
 SAM1_LEVELS = {
     11: ("vit_b", INPUT_DIR / "sam_ckpts" / "sam_vit_b_01ec64.pth"),
     12: ("vit_l", INPUT_DIR / "sam_ckpts" / "sam_vit_l_0b3195.pth"),
@@ -59,38 +67,170 @@ class SAMAutomaticMaskConfig:
     output_mode: str = SAM_OUTPUT_MODE
     use_m2m: bool = False
     multimask_output: bool = True
+    score_pred_iou_power: float = SAM_SCORE_PRED_IOU_POWER
+    score_stability_power: float = SAM_SCORE_STABILITY_POWER
+    score_area_power: float = SAM_SCORE_AREA_POWER
+    mask_overlap_rescore_thresh: float = MASK_OVERLAP_RESCORE_THRESH
+    mask_overlap_rescore_power: float = MASK_OVERLAP_RESCORE_POWER
+    mask_dedupe_iou_thresh: float = MASK_DEDUPE_IOU_THRESH
+    mask_containment_thresh: float = MASK_CONTAINMENT_THRESH
 
 
 def canonical_dataset_name(dataset_name: str) -> str:
     return DATASET_DIRS[dataset_name]
 
 
-def mask_score(mask: dict, sort_mode: str) -> float:
-    predicted_iou = float(mask.get("predicted_iou", 0.0))
-    stability = float(mask.get("stability_score", 0.0))
-    area = float(mask.get("area", 0.0))
+def mask_score(
+    mask: dict,
+    sort_mode: str,
+    pred_iou_power: float,
+    stability_power: float,
+    area_power: float,
+) -> float:
+    predicted_iou = max(float(mask.get("predicted_iou", 0.0)), 1e-12)
+    stability = max(float(mask.get("stability_score", 0.0)), 1e-12)
+    area = max(float(mask.get("area", 0.0)), 1.0)
     if sort_mode == "predicted_iou":
-        return predicted_iou
+        return (predicted_iou**pred_iou_power) * (area**area_power)
     if sort_mode == "stability":
-        return stability
+        return (stability**stability_power) * (area**area_power)
     if sort_mode == "score":
-        return predicted_iou * stability
+        return (predicted_iou**pred_iou_power) * (stability**stability_power) * (area**area_power)
     return area
 
 
-def flatten_masks(masks: list[dict], image_shape: tuple[int, int, int], sort_mode: str, min_mask_area_perc: float) -> np.ndarray:
+def rescore_masks_by_redundancy(
+    masks: list[np.ndarray],
+    scores: np.ndarray,
+    overlap_thresh: float,
+    overlap_power: float,
+) -> np.ndarray:
+    if len(masks) <= 1 or overlap_power <= 0 or overlap_thresh <= 0:
+        return scores
+    order = np.argsort(scores)[::-1]
+    adjusted = scores.astype(np.float32, copy=True)
+    kept_flat: list[np.ndarray] = []
+    kept_areas: list[int] = []
+    for idx in order.tolist():
+        mask_flat = masks[idx].reshape(-1)
+        area = int(mask_flat.sum())
+        if area <= 0:
+            adjusted[idx] = 0.0
+            continue
+        max_overlap = 0.0
+        for prev_flat, prev_area in zip(kept_flat, kept_areas):
+            intersection = int(np.logical_and(mask_flat, prev_flat).sum(dtype=np.int64))
+            smaller_area = min(area, prev_area)
+            if smaller_area <= 0:
+                continue
+            max_overlap = max(max_overlap, intersection / smaller_area)
+        if max_overlap > overlap_thresh:
+            penalty = max(0.0, 1.0 - max_overlap) ** overlap_power
+            adjusted[idx] = float(adjusted[idx] * penalty)
+        kept_flat.append(mask_flat)
+        kept_areas.append(area)
+    return adjusted
+
+
+def suppress_redundant_masks(
+    masks: list[np.ndarray],
+    scores: np.ndarray,
+    iou_thresh: float,
+    containment_thresh: float,
+) -> tuple[list[np.ndarray], np.ndarray]:
+    if len(masks) <= 1 or (iou_thresh <= 0 and containment_thresh <= 0):
+        return masks, scores
+    order = np.argsort(scores)[::-1]
+    kept_masks: list[np.ndarray] = []
+    kept_scores: list[float] = []
+    kept_flat: list[np.ndarray] = []
+    kept_areas: list[int] = []
+    for idx in order.tolist():
+        mask = masks[idx]
+        mask_flat = mask.reshape(-1)
+        area = int(mask_flat.sum())
+        if area <= 0:
+            continue
+        is_redundant = False
+        for prev_flat, prev_area in zip(kept_flat, kept_areas):
+            intersection = int(np.logical_and(mask_flat, prev_flat).sum(dtype=np.int64))
+            if iou_thresh > 0:
+                union = area + prev_area - intersection
+                if union > 0 and (intersection / union) > iou_thresh:
+                    is_redundant = True
+                    break
+            if containment_thresh > 0:
+                smaller_area = min(area, prev_area)
+                if smaller_area > 0 and (intersection / smaller_area) > containment_thresh:
+                    is_redundant = True
+                    break
+        if is_redundant:
+            continue
+        kept_masks.append(mask)
+        kept_scores.append(float(scores[idx]))
+        kept_flat.append(mask_flat)
+        kept_areas.append(area)
+    return kept_masks, np.asarray(kept_scores, dtype=np.float32)
+
+
+def processed_masks_and_scores(
+    masks: list[dict],
+    image_shape: tuple[int, int, int],
+    amg_config: SAMAutomaticMaskConfig,
+    *,
+    max_mask_area_perc: float = 0.0,
+) -> tuple[list[np.ndarray], np.ndarray]:
     height, width = image_shape[:2]
-    min_mask_area = float(min_mask_area_perc) * height * width
-    masks = [mask for mask in masks if float(mask.get("area", 0.0)) >= min_mask_area]
-    if not masks:
+    min_mask_area = float(amg_config.min_mask_area_perc) * height * width
+    max_mask_area = None if max_mask_area_perc <= 0 else float(max_mask_area_perc) * height * width
+    filtered_masks = [
+        mask
+        for mask in masks
+        if float(mask.get("area", 0.0)) >= min_mask_area
+        and (max_mask_area is None or float(mask.get("area", 0.0)) <= max_mask_area)
+    ]
+    if not filtered_masks:
+        return [], np.zeros((0,), dtype=np.float32)
+    segmentations = [np.asarray(mask["segmentation"], dtype=bool) for mask in filtered_masks]
+    scores = np.asarray(
+        [
+            mask_score(
+                mask,
+                amg_config.sort_mode,
+                amg_config.score_pred_iou_power,
+                amg_config.score_stability_power,
+                amg_config.score_area_power,
+            )
+            for mask in filtered_masks
+        ],
+        dtype=np.float32,
+    )
+    scores = rescore_masks_by_redundancy(
+        segmentations,
+        scores,
+        amg_config.mask_overlap_rescore_thresh,
+        amg_config.mask_overlap_rescore_power,
+    )
+    segmentations, scores = suppress_redundant_masks(
+        segmentations,
+        scores,
+        amg_config.mask_dedupe_iou_thresh,
+        amg_config.mask_containment_thresh,
+    )
+    return segmentations, scores
+
+
+def flatten_masks(masks: list[dict], image_shape: tuple[int, int, int], amg_config: SAMAutomaticMaskConfig) -> np.ndarray:
+    height, width = image_shape[:2]
+    min_mask_area = float(amg_config.min_mask_area_perc) * height * width
+    segmentations, scores = processed_masks_and_scores(masks, image_shape, amg_config)
+    if len(segmentations) == 0:
         return np.full((height, width), -1, dtype=np.int32)
-    scores = np.asarray([mask_score(mask, sort_mode) for mask in masks], dtype=np.float32)
     order = np.argsort(scores)[::-1]
     winning_idx = np.full((height, width), -1, dtype=np.int32)
     winning_score = np.full((height, width), -np.inf, dtype=np.float32)
     for raw_idx in order:
-        segmentation = np.asarray(masks[raw_idx]["segmentation"], dtype=bool)
-        better = segmentation & (scores[raw_idx] > winning_score)
+        better = segmentations[raw_idx] & (scores[raw_idx] > winning_score)
         winning_idx[better] = int(raw_idx)
         winning_score[better] = float(scores[raw_idx])
     labels = np.full((height, width), -1, dtype=np.int32)
@@ -197,14 +337,19 @@ class SAMMaskExtractor:
         )
 
     @torch.inference_mode()
-    def extract_labels(self, image: np.ndarray) -> np.ndarray:
+    def extract_masks(self, image: np.ndarray, *, max_mask_area_perc: float = 0.0) -> tuple[list[np.ndarray], np.ndarray]:
         masks = self.mask_generator.generate(image)
-        return flatten_masks(
+        return processed_masks_and_scores(
             masks,
             image.shape,
-            self.amg_config.sort_mode,
-            self.amg_config.min_mask_area_perc,
+            self.amg_config,
+            max_mask_area_perc=max_mask_area_perc,
         )
+
+    @torch.inference_mode()
+    def extract_labels(self, image: np.ndarray) -> np.ndarray:
+        masks = self.mask_generator.generate(image)
+        return flatten_masks(masks, image.shape, self.amg_config)
 
 
 class GTInstanceMaskExtractor:
