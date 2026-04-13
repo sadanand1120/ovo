@@ -8,9 +8,8 @@ import numpy as np
 import torch
 
 from build_rgb_map import (
-    DEFAULT_DOWNSCALE_RES,
-    DEFAULT_K_POOLING,
     DEFAULT_MAX_FRAME_POINTS,
+    DEFAULT_POINT_SAMPLE_STRIDE,
     run_scene_build,
 )
 from get_metrics_map import (
@@ -154,8 +153,7 @@ def run_dataset_ovo_style_eval(args: argparse.Namespace) -> None:
             disable_loop_closure=args.disable_loop_closure,
             config_path=args.config_path,
             map_every=args.map_every,
-            downscale_res=args.downscale_res,
-            k_pooling=args.k_pooling,
+            point_sample_stride=args.point_sample_stride,
             max_frame_points=args.max_frame_points,
             match_distance_th=args.match_distance_th,
         )
@@ -234,8 +232,7 @@ def main() -> None:
     parser.add_argument("--config_path", type=str, default="configs/ovo.yaml", help="Base runtime config file to load.")
     parser.add_argument("--scenes", nargs="*", default=None, help="Optional dataset-eval scene override. Defaults to the dataset scenes from the eval config.")
     parser.add_argument("--map_every", type=int, default=PAPER_MAP_EVERY)
-    parser.add_argument("--downscale_res", type=int, default=DEFAULT_DOWNSCALE_RES)
-    parser.add_argument("--k_pooling", type=int, default=DEFAULT_K_POOLING)
+    parser.add_argument("--point_sample_stride", type=int, default=DEFAULT_POINT_SAMPLE_STRIDE, help="Seed-frame point-sampling stride used during map construction.")
     parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
     parser.add_argument("--ovo_score_th", type=float, default=DEFAULT_OVO_SCORE_TH)

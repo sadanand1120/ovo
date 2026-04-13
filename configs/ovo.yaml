@@ -6,9 +6,3 @@ slam:
   fps: 30.0
   use_viewer: False
   close_loops: False
-  save_estimated_cam: True
-mapping:
-  map_every: 5
-  max_frame_points: 1e5
-  k_pooling: 3
-  downscale_res: 2

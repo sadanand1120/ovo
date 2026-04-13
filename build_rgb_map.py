@@ -37,8 +37,7 @@ OUTPUT_DIR = Path("data/output/rgb_maps")
 TIMING_PATH = "timing.json"
 CLIP_FEATURE_FILE = "clip_feats.npy"
 DEFAULT_MAP_EVERY = 8
-DEFAULT_DOWNSCALE_RES = 2
-DEFAULT_K_POOLING = 1
+DEFAULT_POINT_SAMPLE_STRIDE = 2
 DEFAULT_MAX_FRAME_POINTS = 5_000_000
 DEFAULT_MATCH_DISTANCE_TH = 0.03
 CLIP_MODEL_NAME = "ViT-L-14-336-quickgelu"
@@ -74,6 +73,12 @@ def resolve_resized_hw(width: int, height: int, size: int) -> tuple[int, int]:
     if width <= height:
         return size, max(1, int(round(height * size / width)))
     return max(1, int(round(width * size / height))), size
+
+
+def stride_sample_2d(x: torch.Tensor, stride: int) -> torch.Tensor:
+    if stride == 1:
+        return x
+    return x[::stride, ::stride]
 
 
 def pad_to_multiple(batch: torch.Tensor, patch_size: int) -> torch.Tensor:
@@ -533,18 +538,16 @@ class RGBMapper:
         intrinsics: np.ndarray,
         device: str,
         map_every: int,
-        downscale_res: int,
-        k_pooling: int,
+        point_sample_stride: int,
         max_frame_points: int,
         match_distance_th: float,
     ) -> None:
         self.device = device
         self.cam_intrinsics = torch.tensor(intrinsics.astype(np.float32), device=device)
         self.map_every = max(1, int(map_every))
-        self.downscale_res = max(1, int(downscale_res))
+        self.point_sample_stride = max(1, int(point_sample_stride))
         self.max_frame_points = as_int(max_frame_points)
         self.match_distance_th = float(match_distance_th)
-        self.k_pooling = int(k_pooling)
         self.clip_extractor = DenseCLIPExtractor(device)
         seed_mask_extractor, textregion_mask_extractor, shared_amg_extractor = build_instance_mask_extractors(
             device=device,
@@ -554,8 +557,6 @@ class RGBMapper:
             textregion_mask_extractor=textregion_mask_extractor,
             shared_amg_extractor=shared_amg_extractor,
         )
-        if k_pooling > 1 and k_pooling % 2 == 0:
-            raise ValueError("k_pooling must be odd.")
 
         self.n_points = 0
         self.points = torch.empty((0, 3), device=device)
@@ -575,12 +576,7 @@ class RGBMapper:
         self.cached_row_ids = None
         self.cached_col_ids = None
 
-        if k_pooling > 1:
-            pooling = torch.nn.MaxPool2d(kernel_size=k_pooling, stride=1, padding=k_pooling // 2)
-            self.pooling = lambda mask: ~(pooling((~mask[None]).float())[0].bool())
-        else:
-            self.pooling = lambda mask: mask
-        self.downscale = (lambda x: x) if self.downscale_res == 1 else (lambda x: x[::self.downscale_res, ::self.downscale_res])
+        self.sample_seed_grid = lambda x: stride_sample_2d(x, self.point_sample_stride)
 
     def should_map_frame(self, frame_id: int) -> bool:
         return frame_id % self.map_every == 0
@@ -603,12 +599,12 @@ class RGBMapper:
         self.normal_sum = grow(self.normal_sum, 3)
         self.obs_count = grow(self.obs_count)
 
-    def _get_cached_grids(self, depth_shape: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _get_cached_sampled_grids(self, depth_shape: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.cached_depth_shape != depth_shape:
             h, w = depth_shape
             full_y, full_x = torch.meshgrid(torch.arange(h, device=self.device), torch.arange(w, device=self.device), indexing="ij")
-            self.cached_x = self.downscale(full_x)
-            self.cached_y = self.downscale(full_y)
+            self.cached_x = self.sample_seed_grid(full_x)
+            self.cached_y = self.sample_seed_grid(full_y)
             ds_h, ds_w = self.cached_x.shape
             self.cached_row_ids, self.cached_col_ids = torch.meshgrid(
                 torch.arange(ds_h, device=self.device),
@@ -690,7 +686,7 @@ class RGBMapper:
         image = torch.from_numpy(image_np).to(self.device)
         full_image = image
         h, w = depth.shape
-        x, y, row_ids, col_ids = self._get_cached_grids((h, w))
+        x, y, row_ids, col_ids = self._get_cached_sampled_grids((h, w))
         mask = depth > 0
         point_ids_full = torch.full((h, w), -1, dtype=torch.int32, device=self.device)
         gid_img_full = torch.full((h, w), -1, dtype=torch.int32, device=self.device)
@@ -713,7 +709,6 @@ class RGBMapper:
                     point_ids_full[matches[:, 1], matches[:, 0]] = global_ids.to(point_ids_full.dtype)
                     gid_img_full[matches[:, 1], matches[:, 0]] = self.point_labels_torch[global_ids]
                     mask[matches[:, 1], matches[:, 0]] = False
-            mask = self.pooling(mask)
 
         inst_img_full, seed_labels_np, _ = self.instance_manager.prepare_frame_labels(
             frame_id=frame_id,
@@ -733,15 +728,15 @@ class RGBMapper:
         instance_labels_full = torch.from_numpy(inst_img_full).to(self.device)
         tr_labels_np = self.instance_manager.extract_textregion_labels(image_np, seed_labels_np)
         tr_labels_full = torch.from_numpy(tr_labels_np).to(self.device)
-        depth = self.downscale(depth)
-        mask = self.downscale(mask)
-        image = self.downscale(image)
-        point_ids_ds = self.downscale(point_ids_full)
-        instance_labels_ds = self.downscale(instance_labels_full)
+        depth = self.sample_seed_grid(depth)
+        mask = self.sample_seed_grid(mask)
+        image = self.sample_seed_grid(image)
+        point_ids_sampled = self.sample_seed_grid(point_ids_full)
+        instance_labels_sampled = self.sample_seed_grid(instance_labels_full)
         normals_cam, normal_valid = compute_normals_from_depth(x, y, depth, self.cam_intrinsics)
-        visible_existing = (point_ids_ds >= 0) & normal_valid
+        visible_existing = (point_ids_sampled >= 0) & normal_valid
         if visible_existing.any():
-            visible_ids = point_ids_ds[visible_existing]
+            visible_ids = point_ids_sampled[visible_existing]
             visible_colors = image[visible_existing].reshape(-1, 3)
             visible_normals = normals_cam[visible_existing].reshape(-1, 3)
             visible_normals = torch.einsum("ij,mj->mi", c2w[:3, :3], visible_normals)
@@ -773,9 +768,9 @@ class RGBMapper:
             normals = normals / torch.linalg.norm(normals, dim=1, keepdim=True).clamp_min(1e-8)
             old_n = self.n_points
             new_ids = torch.arange(old_n, old_n + points.shape[0], device=self.device, dtype=torch.int32)
-            point_ids_ds[row_keep, col_keep] = new_ids
+            point_ids_sampled[row_keep, col_keep] = new_ids
             self._append_points(points, colors, normals, features)
-            new_gids = instance_labels_ds[row_keep, col_keep].cpu().numpy().astype(np.int32, copy=False)
+            new_gids = instance_labels_sampled[row_keep, col_keep].cpu().numpy().astype(np.int32, copy=False)
             self.instance_manager.assign_new_points(new_gids, frame_id)
             self._refresh_point_label_cache()
 
@@ -913,7 +908,7 @@ def build_run_stats(
     scene_name: str,
     device: str,
     n_frames: int,
-    downscale_res: int,
+    point_sample_stride: int,
 ) -> dict:
     return {
         "dataset_name": canonical_dataset_name(dataset_name),
@@ -925,8 +920,7 @@ def build_run_stats(
         "slam_module": config["slam"].get("slam_module", "vanilla"),
         "slam_close_loops": bool(config["slam"].get("close_loops", True)),
         "map_every": mapper.map_every,
-        "downscale_res": downscale_res,
-        "k_pooling": mapper.k_pooling,
+        "point_sample_stride": point_sample_stride,
         "max_frame_points": mapper.max_frame_points,
         "match_distance_th": mapper.match_distance_th,
         "clip_model_name": CLIP_MODEL_NAME,
@@ -954,8 +948,7 @@ def run_scene_build(
     disable_loop_closure: bool,
     config_path: str,
     map_every: int,
-    downscale_res: int,
-    k_pooling: int,
+    point_sample_stride: int,
     max_frame_points: int,
     match_distance_th: float,
     extra_stats: dict | None = None,
@@ -981,8 +974,7 @@ def run_scene_build(
         intrinsics=dataset.intrinsics,
         device=device,
         map_every=map_every,
-        downscale_res=downscale_res,
-        k_pooling=k_pooling,
+        point_sample_stride=point_sample_stride,
         max_frame_points=max_frame_points,
         match_distance_th=match_distance_th,
     )
@@ -1014,7 +1006,7 @@ def run_scene_build(
         scene_name=scene_name,
         device=device,
         n_frames=len(dataset),
-        downscale_res=downscale_res,
+        point_sample_stride=point_sample_stride,
     )
     if extra_stats:
         stats.update(extra_stats)
@@ -1045,8 +1037,7 @@ def add_build_args(parser: argparse.ArgumentParser, *, default_output_root: str 
     parser.add_argument("--disable_loop_closure", action="store_true", help="Disable ORB-SLAM loop closure/global BA updates by forcing slam.close_loops=false.")
     parser.add_argument("--config_path", type=str, default="configs/ovo.yaml", help="Base runtime config file to load.")
     parser.add_argument("--map_every", type=int, default=default_map_every)
-    parser.add_argument("--downscale_res", type=int, default=DEFAULT_DOWNSCALE_RES)
-    parser.add_argument("--k_pooling", type=int, default=DEFAULT_K_POOLING)
+    parser.add_argument("--point_sample_stride", type=int, default=DEFAULT_POINT_SAMPLE_STRIDE, help="Seed-frame point-sampling stride used for geometry/normal/label sampling before point fusion.")
     parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
 
@@ -1061,8 +1052,7 @@ def main(args):
         disable_loop_closure=args.disable_loop_closure,
         config_path=args.config_path,
         map_every=args.map_every,
-        downscale_res=args.downscale_res,
-        k_pooling=args.k_pooling,
+        point_sample_stride=args.point_sample_stride,
         max_frame_points=args.max_frame_points,
         match_distance_th=args.match_distance_th,
     )

@@ -36,7 +36,6 @@ def build_scene_config(
     config = load_config(config_path)
     config.setdefault("data", {})
     config.setdefault("slam", {})
-    config.setdefault("mapping", {})
     if slam_module is not None:
         config["slam"]["slam_module"] = slam_module
     if disable_loop_closure:
