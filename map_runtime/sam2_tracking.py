@@ -4,7 +4,6 @@ import contextlib
 import io
 import logging
 from collections import OrderedDict
-from dataclasses import dataclass
 from pathlib import Path
 import sys
 
@@ -18,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "thirdParty" / "
 
 INPUT_DIR = Path("data/input")
 SAM2_MAX_NUM_OBJECTS = 16
+DEFAULT_SAM2_TRACK_MODEL_LEVEL = 24
 SAM2_LEVELS = {
     21: ("sam2.1_hiera_tiny.pt", "configs/sam2.1/sam2.1_hiera_t.yaml"),
     22: ("sam2.1_hiera_small.pt", "configs/sam2.1/sam2.1_hiera_s.yaml"),
@@ -27,14 +27,6 @@ SAM2_LEVELS = {
 SAM2_MODE = "eval"
 SAM2_HYDRA_OVERRIDES: tuple[str, ...] = ()
 SAM2_APPLY_POSTPROCESSING = True
-
-
-@dataclass(frozen=True)
-class SAM2TrackerConfig:
-    max_num_objects: int = SAM2_MAX_NUM_OBJECTS
-    mode: str = SAM2_MODE
-    hydra_overrides: tuple[str, ...] = SAM2_HYDRA_OVERRIDES
-    apply_postprocessing: bool = SAM2_APPLY_POSTPROCESSING
 
 
 def logits_to_mask(mask_logits: np.ndarray) -> np.ndarray:
@@ -60,10 +52,6 @@ def build_label_masks(labels: np.ndarray, max_objects: int | None = None) -> lis
     if max_objects is not None:
         pairs = pairs[: int(max_objects)]
     return [(obj_id, mask) for obj_id, mask, _ in pairs]
-
-
-def build_seed_objects(labels: np.ndarray, max_objects: int = SAM2_MAX_NUM_OBJECTS) -> list[tuple[int, np.ndarray]]:
-    return build_label_masks(labels, max_objects=max_objects)
 
 
 def load_frame_source(frame_source: Path | str | np.ndarray, image_size: int) -> tuple[torch.Tensor, int, int]:
@@ -114,9 +102,8 @@ class SAM2VideoTracker:
     def __init__(
         self,
         first_frame_source: Path | str | np.ndarray,
-        model_level: int,
-        tracker_config: SAM2TrackerConfig | None = None,
     ) -> None:
+        model_level = DEFAULT_SAM2_TRACK_MODEL_LEVEL
         if int(model_level) not in SAM2_LEVELS:
             raise ValueError(f"Unsupported SAM2.1 level {model_level}. Expected one of {sorted(SAM2_LEVELS)}.")
         checkpoint_name, config_path = SAM2_LEVELS[int(model_level)]
@@ -128,8 +115,7 @@ class SAM2VideoTracker:
         self.model_level = int(model_level)
         self.checkpoint_path = checkpoint_path
         self.config_path = config_path
-        self.tracker_config = tracker_config or SAM2TrackerConfig()
-        self.max_num_objects = int(self.tracker_config.max_num_objects)
+        self.max_num_objects = SAM2_MAX_NUM_OBJECTS
         from sam2.build_sam import build_sam2_video_predictor
 
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -137,9 +123,9 @@ class SAM2VideoTracker:
                 config_path,
                 str(checkpoint_path),
                 device=self.device,
-                mode=self.tracker_config.mode,
-                hydra_overrides_extra=list(self.tracker_config.hydra_overrides),
-                apply_postprocessing=self.tracker_config.apply_postprocessing,
+                mode=SAM2_MODE,
+                hydra_overrides_extra=list(SAM2_HYDRA_OVERRIDES),
+                apply_postprocessing=SAM2_APPLY_POSTPROCESSING,
             )
         self.images = None
         self.inference_state = None

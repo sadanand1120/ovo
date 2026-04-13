@@ -4,7 +4,6 @@ from pathlib import Path
 import shutil
 import tempfile
 import time
-from typing import Any
 
 import cv2  # Keep OpenCV loaded before torch in the container env.
 import numpy as np
@@ -15,38 +14,21 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from map_runtime import geometry
-from map_runtime.build_debug_videos import RGBMapDebugVideoWriter
-from map_runtime.ovo_style import (
-    OVO_FEATURE_FUSION,
-    OVO_PAPER_NMS_INNER_TH,
-    OVO_PAPER_NMS_IOU_TH,
-    OVO_PAPER_MATCH_DISTANCE_TH,
-    OVO_PAPER_NMS_SCORE_TH,
-    OVO_PAPER_SAM_MODEL_LEVEL,
-    OVO_PAPER_SAM_POINTS_PER_SIDE,
-    OVO_PAPER_SAM_PRED_IOU_THRESH,
-    OVO_PAPER_SAM_STABILITY_SCORE_THRESH,
-    OVOPaperSAMMaskExtractor,
-    OVO_SIGLIP_MODEL_CARD,
-    OVOOnlineInstanceManager,
-    OVOObjectFeatureBank,
-    OVORegionFeatureExtractor,
-    OVO_WEIGHTS_PREDICTOR_FUSION,
-    OVO_WEIGHTS_PREDICTOR_FUSION_CHOICES,
+from map_runtime.sam_masks import SAMMaskExtractor
+from map_runtime.sam2_tracking import (
+    SAM2_APPLY_POSTPROCESSING,
+    SAM2_HYDRA_OVERRIDES,
+    SAM2_MAX_NUM_OBJECTS,
+    SAM2_MODE,
+    DEFAULT_SAM2_TRACK_MODEL_LEVEL,
+    SAM2_LEVELS,
+    SAM2VideoTracker,
+    build_label_masks,
 )
-from map_runtime.sam_masks import (
-    DEFAULT_SAM_AMG_MODEL_LEVEL,
-    GTInstanceMaskExtractor,
-    SAMAutomaticMaskConfig,
-    SAM_AMG_LEVELS,
-    SAMMaskExtractor,
-)
-from map_runtime.sam2_tracking import SAM2_LEVELS, SAM2TrackerConfig, SAM2VideoTracker, build_label_masks
 from map_runtime.scene import (
     INPUT_DIR,
     canonical_dataset_name,
     get_tracked_pose,
-    load_dataset as load_scene_dataset,
     load_dataset_and_slam,
 )
 
@@ -54,7 +36,6 @@ from map_runtime.scene import (
 OUTPUT_DIR = Path("data/output/rgb_maps")
 TIMING_PATH = "timing.json"
 CLIP_FEATURE_FILE = "clip_feats.npy"
-DEBUG_VIDEO_DIR = "debug_videos"
 DEFAULT_MAP_EVERY = 8
 DEFAULT_DOWNSCALE_RES = 2
 DEFAULT_K_POOLING = 1
@@ -75,144 +56,14 @@ TRACK_MISS_MAX = 3
 CONFIRM_MIN_POINTS = 80
 CONFIRM_MIN_SEED_HITS = 2
 TENTATIVE_MAX_SEED_AGE = 2
-DEFAULT_SAM_AMG_CONFIG = SAMAutomaticMaskConfig()
-DEFAULT_SAM2_TRACKER_CONFIG = SAM2TrackerConfig()
-
-
-def add_sam_runtime_args(parser: argparse.ArgumentParser, *, include_textregion: bool = True) -> None:
-    parser.add_argument("--sam-model-level-inst", type=int, choices=sorted(SAM_AMG_LEVELS), default=DEFAULT_SAM_AMG_MODEL_LEVEL)
-    if include_textregion:
-        parser.add_argument("--sam-model-level-textregion", type=int, choices=sorted(SAM_AMG_LEVELS), default=DEFAULT_SAM_AMG_MODEL_LEVEL)
-    parser.add_argument("--sam2-model-level-track", type=int, choices=sorted(SAM2_LEVELS), default=24)
-    parser.add_argument("--ovo-online-tracking", action="store_true", help="Use the upstream OVO-style projective mask-to-instance association instead of SAM2 video propagation.")
-    parser.add_argument("--ovo-style-feature", action="store_true", help="Use upstream OVO-style per-instance SigLIP descriptors instead of dense CLIP+textregion features.")
-    parser.add_argument(
-        "--ovo-weights-predictor-fusion",
-        choices=OVO_WEIGHTS_PREDICTOR_FUSION_CHOICES,
-        default=OVO_WEIGHTS_PREDICTOR_FUSION,
-        help="OVO per-view feature fusion mode. Use 'learned' together with the two OVO flags to match the upstream OVO-paper feature setup.",
-    )
-    parser.add_argument("--sam-sort-mode", choices=["area", "predicted_iou", "stability", "score"], default=DEFAULT_SAM_AMG_CONFIG.sort_mode)
-    parser.add_argument("--sam-min-mask-area-perc", type=float, default=DEFAULT_SAM_AMG_CONFIG.min_mask_area_perc)
-    parser.add_argument("--sam-points-per-side", type=int, default=DEFAULT_SAM_AMG_CONFIG.points_per_side)
-    parser.add_argument("--sam-points-per-batch", type=int, default=DEFAULT_SAM_AMG_CONFIG.points_per_batch)
-    parser.add_argument("--sam-pred-iou-thresh", type=float, default=DEFAULT_SAM_AMG_CONFIG.pred_iou_thresh)
-    parser.add_argument("--sam-stability-score-thresh", type=float, default=DEFAULT_SAM_AMG_CONFIG.stability_score_thresh)
-    parser.add_argument("--sam-stability-score-offset", type=float, default=DEFAULT_SAM_AMG_CONFIG.stability_score_offset)
-    parser.add_argument("--sam-mask-threshold", type=float, default=DEFAULT_SAM_AMG_CONFIG.mask_threshold)
-    parser.add_argument("--sam-box-nms-thresh", type=float, default=DEFAULT_SAM_AMG_CONFIG.box_nms_thresh)
-    parser.add_argument("--sam-crop-n-layers", type=int, default=DEFAULT_SAM_AMG_CONFIG.crop_n_layers)
-    parser.add_argument("--sam-crop-nms-thresh", type=float, default=DEFAULT_SAM_AMG_CONFIG.crop_nms_thresh)
-    parser.add_argument("--sam-crop-overlap-ratio", type=float, default=DEFAULT_SAM_AMG_CONFIG.crop_overlap_ratio)
-    parser.add_argument("--sam-crop-n-points-downscale-factor", type=int, default=DEFAULT_SAM_AMG_CONFIG.crop_n_points_downscale_factor)
-    parser.add_argument("--sam-min-mask-region-area", type=int, default=DEFAULT_SAM_AMG_CONFIG.min_mask_region_area)
-    parser.add_argument("--sam-score-pred-iou-power", type=float, default=DEFAULT_SAM_AMG_CONFIG.score_pred_iou_power)
-    parser.add_argument("--sam-score-stability-power", type=float, default=DEFAULT_SAM_AMG_CONFIG.score_stability_power)
-    parser.add_argument("--sam-score-area-power", type=float, default=DEFAULT_SAM_AMG_CONFIG.score_area_power)
-    parser.add_argument("--mask-overlap-rescore-thresh", type=float, default=DEFAULT_SAM_AMG_CONFIG.mask_overlap_rescore_thresh)
-    parser.add_argument("--mask-overlap-rescore-power", type=float, default=DEFAULT_SAM_AMG_CONFIG.mask_overlap_rescore_power)
-    parser.add_argument("--mask-dedupe-iou-thresh", type=float, default=DEFAULT_SAM_AMG_CONFIG.mask_dedupe_iou_thresh)
-    parser.add_argument("--mask-containment-thresh", type=float, default=DEFAULT_SAM_AMG_CONFIG.mask_containment_thresh)
-    parser.add_argument("--sam-use-m2m", action="store_true")
-    parser.add_argument("--sam-disable-multimask-output", action="store_true")
-    parser.add_argument("--sam2-max-num-objects", type=int, default=DEFAULT_SAM2_TRACKER_CONFIG.max_num_objects)
-    parser.add_argument("--sam2-mode", type=str, default=DEFAULT_SAM2_TRACKER_CONFIG.mode)
-    parser.add_argument("--sam2-hydra-override", action="append", default=None)
-    parser.add_argument("--sam2-disable-postprocessing", action="store_true")
-
-
-def build_sam_amg_config(args: argparse.Namespace) -> SAMAutomaticMaskConfig:
-    return SAMAutomaticMaskConfig(
-        sort_mode=args.sam_sort_mode,
-        min_mask_area_perc=args.sam_min_mask_area_perc,
-        points_per_side=args.sam_points_per_side,
-        points_per_batch=args.sam_points_per_batch,
-        pred_iou_thresh=args.sam_pred_iou_thresh,
-        stability_score_thresh=args.sam_stability_score_thresh,
-        stability_score_offset=args.sam_stability_score_offset,
-        mask_threshold=args.sam_mask_threshold,
-        box_nms_thresh=args.sam_box_nms_thresh,
-        crop_n_layers=args.sam_crop_n_layers,
-        crop_nms_thresh=args.sam_crop_nms_thresh,
-        crop_overlap_ratio=args.sam_crop_overlap_ratio,
-        crop_n_points_downscale_factor=args.sam_crop_n_points_downscale_factor,
-        min_mask_region_area=args.sam_min_mask_region_area,
-        use_m2m=bool(args.sam_use_m2m),
-        multimask_output=not bool(args.sam_disable_multimask_output),
-        score_pred_iou_power=args.sam_score_pred_iou_power,
-        score_stability_power=args.sam_score_stability_power,
-        score_area_power=args.sam_score_area_power,
-        mask_overlap_rescore_thresh=args.mask_overlap_rescore_thresh,
-        mask_overlap_rescore_power=args.mask_overlap_rescore_power,
-        mask_dedupe_iou_thresh=args.mask_dedupe_iou_thresh,
-        mask_containment_thresh=args.mask_containment_thresh,
-    )
-
-
-def build_sam2_tracker_config(args: argparse.Namespace) -> SAM2TrackerConfig:
-    return SAM2TrackerConfig(
-        max_num_objects=args.sam2_max_num_objects,
-        mode=args.sam2_mode,
-        hydra_overrides=tuple(args.sam2_hydra_override or ()),
-        apply_postprocessing=not bool(args.sam2_disable_postprocessing),
-    )
 
 
 def build_instance_mask_extractors(
     *,
     device: str,
-    dataset_name: str,
-    scene_name: str,
-    use_inst_gt: bool,
-    sam_model_level_inst: int,
-    sam_model_level_textregion: int,
-    sam_amg_config: SAMAutomaticMaskConfig,
-    sam2_tracker_config: SAM2TrackerConfig,
-    use_ovo_paper_inst: bool = False,
-) -> tuple[Any, Any | None, bool]:
-    if use_inst_gt:
-        return GTInstanceMaskExtractor(dataset_name, scene_name), None, False
-    if use_ovo_paper_inst:
-        seed_mask_extractor = OVOPaperSAMMaskExtractor(device, model_level=OVO_PAPER_SAM_MODEL_LEVEL)
-    else:
-        seed_mask_extractor = SAMMaskExtractor(
-            device,
-            sam_model_level_inst,
-            amg_config=sam_amg_config,
-            sam2_mode=sam2_tracker_config.mode,
-            sam2_hydra_overrides=sam2_tracker_config.hydra_overrides,
-            sam2_apply_postprocessing=sam2_tracker_config.apply_postprocessing,
-        )
-    if not use_ovo_paper_inst and sam_model_level_textregion == sam_model_level_inst:
-        return seed_mask_extractor, seed_mask_extractor, True
-    textregion_mask_extractor = SAMMaskExtractor(
-        device,
-        sam_model_level_textregion,
-        amg_config=sam_amg_config,
-        sam2_mode=sam2_tracker_config.mode,
-        sam2_hydra_overrides=sam2_tracker_config.hydra_overrides,
-        sam2_apply_postprocessing=sam2_tracker_config.apply_postprocessing,
-    )
-    return seed_mask_extractor, textregion_mask_extractor, False
-
-
-def load_dataset(
-    dataset_name: str,
-    scene_name: str,
-    frame_limit: int | None,
-    config_path: str = "configs/ovo.yaml",
-    slam_module: str | None = None,
-    disable_loop_closure: bool = False,
-):
-    _, dataset = load_scene_dataset(
-        dataset_name=dataset_name,
-        scene_name=scene_name,
-        frame_limit=frame_limit,
-        config_path=config_path,
-        slam_module=slam_module,
-        disable_loop_closure=disable_loop_closure,
-    )
-    return dataset
+) -> tuple[SAMMaskExtractor, SAMMaskExtractor, bool]:
+    seed_mask_extractor = SAMMaskExtractor(device)
+    return seed_mask_extractor, seed_mask_extractor, True
 
 
 def as_int(value) -> int:
@@ -430,18 +281,10 @@ class DenseCLIPExtractor:
 class SAM2InstanceManager:
     def __init__(
         self,
-        use_inst_gt: bool,
-        sam2_model_level_track: int,
-        sam_amg_config: SAMAutomaticMaskConfig,
-        sam2_tracker_config: SAM2TrackerConfig,
         seed_mask_extractor,
         textregion_mask_extractor,
         shared_amg_extractor: bool,
     ) -> None:
-        self.use_inst_gt = bool(use_inst_gt)
-        self.sam2_model_level_track = int(sam2_model_level_track)
-        self.sam_amg_config = sam_amg_config
-        self.sam2_tracker_config = sam2_tracker_config
         self.seed_mask_extractor = seed_mask_extractor
         self.textregion_mask_extractor = textregion_mask_extractor
         self.shared_amg_extractor = bool(shared_amg_extractor)
@@ -498,6 +341,7 @@ class SAM2InstanceManager:
         self.cleanup_tentatives(frame_id, is_seed_frame=True)
 
     def cleanup_tentatives(self, frame_id: int, is_seed_frame: bool) -> None:
+        del frame_id
         for gid, state in list(self.instances.items()):
             if state["status"] != "tentative":
                 continue
@@ -509,9 +353,7 @@ class SAM2InstanceManager:
             if self.seed_frame_counter - state["birth_seed_counter"] >= TENTATIVE_MAX_SEED_AGE:
                 self._kill_instance(gid)
 
-    def extract_textregion_labels(self, image_np: np.ndarray, seed_labels_np: np.ndarray | None) -> np.ndarray:
-        if self.use_inst_gt and seed_labels_np is not None:
-            return seed_labels_np
+    def extract_textregion_labels(self, image_np: np.ndarray, seed_labels_np: np.ndarray) -> np.ndarray:
         if seed_labels_np is not None and self.textregion_mask_extractor is self.seed_mask_extractor:
             return seed_labels_np
         if self.textregion_mask_extractor is None:
@@ -587,8 +429,7 @@ class SAM2InstanceManager:
         return inst_img_full, seed_labels, inst_img_full
 
     def _extract_seed_labels(self, frame_id: int, image_np: np.ndarray) -> np.ndarray:
-        if self.use_inst_gt:
-            return self.seed_mask_extractor.extract_labels(frame_id, image_np.shape[:2])
+        del frame_id
         return self.seed_mask_extractor.extract_labels(image_np)
 
     def _track_frame(self, frame_id: int, image_np: np.ndarray, gid_img_full: torch.Tensor) -> dict[int, np.ndarray]:
@@ -663,7 +504,7 @@ class SAM2InstanceManager:
         return dominant_gid, frac, support
 
     def _reseed_tracker(self, image_np: np.ndarray, inst_img_full: np.ndarray) -> None:
-        final_masks = build_label_masks(inst_img_full, max_objects=self.sam2_tracker_config.max_num_objects)
+        final_masks = build_label_masks(inst_img_full, max_objects=SAM2_MAX_NUM_OBJECTS)
         visible_gids = {gid for gid, _ in final_masks}
         self.stats["sam2_seed_object_truncations"] += max(0, len(np.unique(inst_img_full[inst_img_full >= 0])) - len(final_masks))
         for gid in list(self.active_gids):
@@ -679,7 +520,7 @@ class SAM2InstanceManager:
             self.close()
             return
         if self.tracker is None:
-            self.tracker = SAM2VideoTracker(image_np, self.sam2_model_level_track, tracker_config=self.sam2_tracker_config)
+            self.tracker = SAM2VideoTracker(image_np)
             self.tracker.reset_and_seed_masks(final_masks)
         else:
             self.tracker.restart_and_seed_masks(image_np, final_masks)
@@ -696,79 +537,23 @@ class RGBMapper:
         k_pooling: int,
         max_frame_points: int,
         match_distance_th: float,
-        dataset_name: str,
-        scene_name: str,
-        use_inst_gt: bool,
-        sam_model_level_inst: int,
-        sam_model_level_textregion: int,
-        sam2_model_level_track: int,
-        sam_amg_config: SAMAutomaticMaskConfig,
-        sam2_tracker_config: SAM2TrackerConfig,
-        ovo_online_tracking: bool = False,
-        ovo_style_feature: bool = False,
-        ovo_weights_predictor_fusion: str = OVO_WEIGHTS_PREDICTOR_FUSION,
-        debug_video_writer: RGBMapDebugVideoWriter | None = None,
     ) -> None:
         self.device = device
         self.cam_intrinsics = torch.tensor(intrinsics.astype(np.float32), device=device)
         self.map_every = max(1, int(map_every))
         self.downscale_res = max(1, int(downscale_res))
         self.max_frame_points = as_int(max_frame_points)
-        self.ovo_online_tracking = bool(ovo_online_tracking)
-        self.ovo_style_feature = bool(ovo_style_feature)
-        if self.ovo_online_tracking and float(match_distance_th) == DEFAULT_MATCH_DISTANCE_TH:
-            self.match_distance_th = OVO_PAPER_MATCH_DISTANCE_TH
-        else:
-            self.match_distance_th = float(match_distance_th)
+        self.match_distance_th = float(match_distance_th)
         self.k_pooling = int(k_pooling)
-        self.ovo_weights_predictor_fusion = str(ovo_weights_predictor_fusion)
-        if self.ovo_weights_predictor_fusion != OVO_WEIGHTS_PREDICTOR_FUSION and not self.ovo_style_feature:
-            raise ValueError("--ovo-weights-predictor-fusion requires --ovo-style-feature.")
-        if self.ovo_style_feature:
-            self.clip_extractor = OVORegionFeatureExtractor(
-                device,
-                model_name=OVO_SIGLIP_MODEL_CARD,
-                weights_predictor_fusion=self.ovo_weights_predictor_fusion,
-            )
-            self.ovo_feature_bank = OVOObjectFeatureBank(self.clip_extractor, fusion=OVO_FEATURE_FUSION)
-        else:
-            self.clip_extractor = DenseCLIPExtractor(device)
-            self.ovo_feature_bank = None
-        self.use_inst_gt = bool(use_inst_gt)
-        self.sam_model_level_inst = int(sam_model_level_inst)
-        self.sam_model_level_textregion = int(sam_model_level_textregion)
-        self.sam2_model_level_track = int(sam2_model_level_track)
-        self.sam_amg_config = sam_amg_config
-        self.sam2_tracker_config = sam2_tracker_config
-        self.debug_video_writer = debug_video_writer
+        self.clip_extractor = DenseCLIPExtractor(device)
         seed_mask_extractor, textregion_mask_extractor, shared_amg_extractor = build_instance_mask_extractors(
             device=device,
-            dataset_name=dataset_name,
-            scene_name=scene_name,
-            use_inst_gt=use_inst_gt,
-            sam_model_level_inst=sam_model_level_inst,
-            sam_model_level_textregion=sam_model_level_textregion,
-            sam_amg_config=sam_amg_config,
-            sam2_tracker_config=sam2_tracker_config,
-            use_ovo_paper_inst=self.ovo_online_tracking or self.ovo_style_feature,
         )
-        if self.ovo_online_tracking:
-            self.instance_manager = OVOOnlineInstanceManager(
-                seed_mask_extractor=seed_mask_extractor,
-                textregion_mask_extractor=textregion_mask_extractor,
-                shared_amg_extractor=shared_amg_extractor,
-                use_inst_gt=use_inst_gt,
-            )
-        else:
-            self.instance_manager = SAM2InstanceManager(
-                use_inst_gt=use_inst_gt,
-                sam2_model_level_track=sam2_model_level_track,
-                sam_amg_config=sam_amg_config,
-                sam2_tracker_config=sam2_tracker_config,
-                seed_mask_extractor=seed_mask_extractor,
-                textregion_mask_extractor=textregion_mask_extractor,
-                shared_amg_extractor=shared_amg_extractor,
-            )
+        self.instance_manager = SAM2InstanceManager(
+            seed_mask_extractor=seed_mask_extractor,
+            textregion_mask_extractor=textregion_mask_extractor,
+            shared_amg_extractor=shared_amg_extractor,
+        )
         if k_pooling > 1 and k_pooling % 2 == 0:
             raise ValueError("k_pooling must be odd.")
 
@@ -779,14 +564,9 @@ class RGBMapper:
         self.color_sum = torch.empty((0, 3), device=device)
         self.normal_sum = torch.empty((0, 3), device=device)
         self.obs_count = torch.empty((0,), device=device)
-        if self.ovo_style_feature:
-            self.feature_tmpdir = None
-            self.feature_tmp_path = None
-            self.feature_tmp_file = None
-        else:
-            self.feature_tmpdir = Path(tempfile.mkdtemp(prefix="rgb_map_feats_"))
-            self.feature_tmp_path = self.feature_tmpdir / "clip_feats.bin"
-            self.feature_tmp_file = open(self.feature_tmp_path, "wb")
+        self.feature_tmpdir = Path(tempfile.mkdtemp(prefix="rgb_map_feats_"))
+        self.feature_tmp_path = self.feature_tmpdir / "clip_feats.bin"
+        self.feature_tmp_file = open(self.feature_tmp_path, "wb")
         self.n_features = 0
         self.point_labels_torch = torch.empty((0,), dtype=torch.int32, device=self.device)
         self.cached_depth_shape = None
@@ -864,8 +644,6 @@ class RGBMapper:
             torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0).cpu().numpy(),
             dtype=np.float16,
         )
-        if self.feature_tmp_file is None:
-            raise RuntimeError("Feature temp file was not initialized for dense feature storage.")
         feature_block.tofile(self.feature_tmp_file)
         self.n_features += int(features.shape[0])
 
@@ -893,14 +671,6 @@ class RGBMapper:
                 self.instance_manager.active_gids.clear()
             self.instance_manager.cleanup_tentatives(frame_id, is_seed_frame=is_seed_frame)
             self._refresh_point_label_cache()
-            if self.debug_video_writer is not None:
-                self.debug_video_writer.write_instance_frame(
-                    frame_id=frame_id,
-                    rgb=image_np,
-                    current_labels=None,
-                    global_labels=None,
-                    is_seed_frame=is_seed_frame,
-                )
             return
         if isinstance(c2w_np, torch.Tensor):
             c2w = c2w_np.to(self.device, dtype=torch.float32)
@@ -914,14 +684,6 @@ class RGBMapper:
                 self.instance_manager.active_gids.clear()
             self.instance_manager.cleanup_tentatives(frame_id, is_seed_frame=is_seed_frame)
             self._refresh_point_label_cache()
-            if self.debug_video_writer is not None:
-                self.debug_video_writer.write_instance_frame(
-                    frame_id=frame_id,
-                    rgb=image_np,
-                    current_labels=None,
-                    global_labels=None,
-                    is_seed_frame=is_seed_frame,
-                )
             return
 
         depth = torch.from_numpy(depth_np).to(self.device)
@@ -953,7 +715,7 @@ class RGBMapper:
                     mask[matches[:, 1], matches[:, 0]] = False
             mask = self.pooling(mask)
 
-        inst_img_full, seed_labels_np, current_labels_np = self.instance_manager.prepare_frame_labels(
+        inst_img_full, seed_labels_np, _ = self.instance_manager.prepare_frame_labels(
             frame_id=frame_id,
             is_seed_frame=is_seed_frame,
             image_np=image_np,
@@ -962,37 +724,15 @@ class RGBMapper:
             point_ids_full=point_ids_full,
             gid_img_full=gid_img_full,
         )
-        global_labels_np = gid_img_full.cpu().numpy().astype(np.int32, copy=True)
         self._refresh_point_label_cache()
-        if is_seed_frame and seed_labels_np is not None and self.debug_video_writer is not None:
-            self.debug_video_writer.update_latest_seed(
-                frame_id=frame_id,
-                rgb=image_np,
-                seed_labels=seed_labels_np,
-                seed_source="gt inst" if self.use_inst_gt else "sam inst",
-            )
         if not is_seed_frame:
-            if self.debug_video_writer is not None:
-                self.debug_video_writer.write_instance_frame(
-                    frame_id=frame_id,
-                    rgb=image_np,
-                    current_labels=current_labels_np,
-                    global_labels=global_labels_np,
-                    is_seed_frame=False,
-                )
             return
         if inst_img_full is None:
             return
 
-        if self.ovo_feature_bank is not None:
-            self.ovo_feature_bank.update(image_np, inst_img_full)
-
         instance_labels_full = torch.from_numpy(inst_img_full).to(self.device)
-        tr_labels_np = None
-        tr_labels_full = None
-        if not self.ovo_style_feature:
-            tr_labels_np = self.instance_manager.extract_textregion_labels(image_np, seed_labels_np)
-            tr_labels_full = torch.from_numpy(tr_labels_np).to(self.device)
+        tr_labels_np = self.instance_manager.extract_textregion_labels(image_np, seed_labels_np)
+        tr_labels_full = torch.from_numpy(tr_labels_np).to(self.device)
         depth = self.downscale(depth)
         mask = self.downscale(mask)
         image = self.downscale(image)
@@ -1023,11 +763,8 @@ class RGBMapper:
                 depth_keep, colors = depth_keep[keep], colors[keep]
                 normals_cam = normals_cam[keep]
 
-            dense_clip = None
-            features = None
-            if not self.ovo_style_feature:
-                dense_clip = self.clip_extractor.extract_dense(full_image, tr_labels_full)
-                features = dense_clip[y_keep, x_keep].half()
+            dense_clip = self.clip_extractor.extract_dense(full_image, tr_labels_full)
+            features = dense_clip[y_keep, x_keep].half()
             x_3d = (x_keep - self.cam_intrinsics[0, 2]) * depth_keep / self.cam_intrinsics[0, 0]
             y_3d = (y_keep - self.cam_intrinsics[1, 2]) * depth_keep / self.cam_intrinsics[1, 1]
             points = torch.stack((x_3d, y_3d, depth_keep, torch.ones_like(depth_keep)), dim=1)
@@ -1041,32 +778,9 @@ class RGBMapper:
             new_gids = instance_labels_ds[row_keep, col_keep].cpu().numpy().astype(np.int32, copy=False)
             self.instance_manager.assign_new_points(new_gids, frame_id)
             self._refresh_point_label_cache()
-            global_labels_np[y_keep.cpu().numpy(), x_keep.cpu().numpy()] = new_gids
-            if self.debug_video_writer is not None and dense_clip is not None:
-                raw_tr_labels = torch.full_like(tr_labels_full, -1)
-                dense_clip_raw = self.clip_extractor.extract_dense(full_image, raw_tr_labels)
-                self.debug_video_writer.write_textregion_frame(
-                    frame_id=frame_id,
-                    rgb=image_np,
-                    raw_clip_dense=dense_clip_raw,
-                    textregion_labels=tr_labels_np,
-                    textregion_clip_dense=dense_clip,
-                    mask_source="gt inst" if self.use_inst_gt else "sam textregion",
-                )
-                del dense_clip_raw
-        if self.debug_video_writer is not None:
-            self.debug_video_writer.write_instance_frame(
-                frame_id=frame_id,
-                rgb=image_np,
-                current_labels=current_labels_np,
-                global_labels=global_labels_np,
-                is_seed_frame=True,
-            )
 
     def save(self, output_dir: Path, stats: dict) -> dict:
         self.instance_manager.close()
-        if self.debug_video_writer is not None:
-            self.debug_video_writer.close()
         output_dir.mkdir(parents=True, exist_ok=True)
         save_start = time.perf_counter()
         progress = tqdm(total=4, desc=f"{output_dir.name} save", unit="stage", dynamic_ncols=True)
@@ -1093,25 +807,10 @@ class RGBMapper:
                         "shape": (self.n_points, self.clip_extractor.feature_dim),
                     },
                 )
-                if self.ovo_style_feature:
-                    descriptor_table = self.ovo_feature_bank.build_descriptor_table(self.instance_manager.next_gid) if self.ovo_feature_bank is not None else np.zeros((0, self.clip_extractor.feature_dim), dtype=np.float32)
-                    descriptor_table = np.ascontiguousarray(descriptor_table.astype(np.float16, copy=False))
-                    point_labels = self.instance_manager.point_labels
-                    for start in range(0, int(self.n_points), FEATURE_WRITE_CHUNK_SIZE):
-                        end = min(start + FEATURE_WRITE_CHUNK_SIZE, int(self.n_points))
-                        chunk_labels = point_labels[start:end]
-                        chunk = np.zeros((end - start, self.clip_extractor.feature_dim), dtype=np.float16)
-                        valid = (chunk_labels >= 0) & (chunk_labels < descriptor_table.shape[0])
-                        if valid.any():
-                            chunk[valid] = descriptor_table[chunk_labels[valid]]
-                        chunk.tofile(f)
-                else:
-                    if self.feature_tmp_file is None or self.feature_tmp_path is None:
-                        raise RuntimeError("Dense feature storage is not initialized.")
-                    self.feature_tmp_file.flush()
-                    self.feature_tmp_file.close()
-                    with open(self.feature_tmp_path, "rb") as src:
-                        shutil.copyfileobj(src, f, length=16 * 1024 * 1024)
+                self.feature_tmp_file.flush()
+                self.feature_tmp_file.close()
+                with open(self.feature_tmp_path, "rb") as src:
+                    shutil.copyfileobj(src, f, length=16 * 1024 * 1024)
             timings["store_clip_sec"] = time.perf_counter() - stage_start
             progress.update()
 
@@ -1123,104 +822,74 @@ class RGBMapper:
 
             progress.set_postfix_str("stats", refresh=True)
             stage_start = time.perf_counter()
+            sam_amg_config = self.instance_manager.seed_mask_extractor.amg_config
             stats = {
                 **stats,
-                "instance_supervision": "gt" if self.use_inst_gt else "sam",
+                "instance_supervision": "sam",
+                "textregion_supervision": "sam",
                 "instance_label_path": "instance_labels.npy",
                 "clip_feature_path": CLIP_FEATURE_FILE,
                 "clip_feature_storage": "npy",
                 "rgb_normal_point_fusion": True,
-                "clip_feature_mode": "ovo_instance_siglip" if self.ovo_style_feature else "clip_textregion",
-                "clip_feature_fusion": OVO_FEATURE_FUSION if self.ovo_style_feature else False,
-                "ovo_weights_predictor_fusion": self.clip_extractor.weights_predictor_fusion if self.ovo_style_feature else False,
-                "ovo_online_tracking": self.ovo_online_tracking,
-                "ovo_style_feature": self.ovo_style_feature,
-                "sam_sort_mode": self.sam_amg_config.sort_mode,
-                "sam_min_mask_area_perc": self.sam_amg_config.min_mask_area_perc,
-                "sam_points_per_side": self.sam_amg_config.points_per_side,
-                "sam_points_per_batch": self.sam_amg_config.points_per_batch,
-                "sam_pred_iou_thresh": self.sam_amg_config.pred_iou_thresh,
-                "sam_stability_score_thresh": self.sam_amg_config.stability_score_thresh,
-                "sam_stability_score_offset": self.sam_amg_config.stability_score_offset,
-                "sam_mask_threshold": self.sam_amg_config.mask_threshold,
-                "sam_box_nms_thresh": self.sam_amg_config.box_nms_thresh,
-                "sam_crop_n_layers": self.sam_amg_config.crop_n_layers,
-                "sam_crop_nms_thresh": self.sam_amg_config.crop_nms_thresh,
-                "sam_crop_overlap_ratio": self.sam_amg_config.crop_overlap_ratio,
-                "sam_crop_n_points_downscale_factor": self.sam_amg_config.crop_n_points_downscale_factor,
-                "sam_min_mask_region_area": self.sam_amg_config.min_mask_region_area,
-                "sam_output_mode": self.sam_amg_config.output_mode,
-                "sam_use_m2m": self.sam_amg_config.use_m2m,
-                "sam_multimask_output": self.sam_amg_config.multimask_output,
+                "clip_feature_mode": "clip_textregion",
+                "sam_sort_mode": sam_amg_config.sort_mode,
+                "sam_min_mask_area_perc": sam_amg_config.min_mask_area_perc,
+                "sam_points_per_side": sam_amg_config.points_per_side,
+                "sam_points_per_batch": sam_amg_config.points_per_batch,
+                "sam_pred_iou_thresh": sam_amg_config.pred_iou_thresh,
+                "sam_stability_score_thresh": sam_amg_config.stability_score_thresh,
+                "sam_stability_score_offset": sam_amg_config.stability_score_offset,
+                "sam_mask_threshold": sam_amg_config.mask_threshold,
+                "sam_box_nms_thresh": sam_amg_config.box_nms_thresh,
+                "sam_crop_n_layers": sam_amg_config.crop_n_layers,
+                "sam_crop_nms_thresh": sam_amg_config.crop_nms_thresh,
+                "sam_crop_overlap_ratio": sam_amg_config.crop_overlap_ratio,
+                "sam_crop_n_points_downscale_factor": sam_amg_config.crop_n_points_downscale_factor,
+                "sam_min_mask_region_area": sam_amg_config.min_mask_region_area,
+                "sam_output_mode": sam_amg_config.output_mode,
+                "sam_use_m2m": sam_amg_config.use_m2m,
+                "sam_multimask_output": sam_amg_config.multimask_output,
                 "sam_amg_extractors_shared": self.instance_manager.shared_amg_extractor,
                 **self.instance_manager.stats,
             }
-            if self.ovo_style_feature:
+            tracker = getattr(self.instance_manager, "tracker", None)
+            stats.update(
+                {
+                    "instance_tracking_backend": "sam2_seed_to_seed",
+                    "sam2_model_level_track": DEFAULT_SAM2_TRACK_MODEL_LEVEL,
+                    "sam2_checkpoint_path_track": str(tracker.checkpoint_path) if tracker is not None else str((INPUT_DIR / "sam_ckpts" / SAM2_LEVELS[DEFAULT_SAM2_TRACK_MODEL_LEVEL][0])),
+                    "sam2_config_track": tracker.config_path if tracker is not None else SAM2_LEVELS[DEFAULT_SAM2_TRACK_MODEL_LEVEL][1],
+                    "sam2_max_num_objects": SAM2_MAX_NUM_OBJECTS,
+                    "sam2_mode": SAM2_MODE,
+                    "sam2_hydra_overrides": list(SAM2_HYDRA_OVERRIDES),
+                    "sam2_apply_postprocessing": SAM2_APPLY_POSTPROCESSING,
+                    "track_support_min": TRACK_SUPPORT_MIN,
+                    "attach_frac_th": ATTACH_FRAC_TH,
+                    "birth_min_points": BIRTH_MIN_POINTS,
+                    "seed_explained_frac_th": SEED_EXPLAINED_FRAC_TH,
+                    "track_miss_max": TRACK_MISS_MAX,
+                    "confirm_min_points": CONFIRM_MIN_POINTS,
+                    "confirm_min_seed_hits": CONFIRM_MIN_SEED_HITS,
+                    "tentative_max_seed_age": TENTATIVE_MAX_SEED_AGE,
+                }
+            )
+            if self.instance_manager.textregion_mask_extractor is not None:
                 stats.update(
                     {
-                        "ovo_feature_model_name": self.clip_extractor.model_name,
-                        "ovo_feature_pretrained": self.clip_extractor.pretrained,
-                        "ovo_feature_mask_res": self.clip_extractor.mask_res,
-                        "ovo_feature_embed_type": self.clip_extractor.embed_type,
-                    }
-                )
-            else:
-                stats["textregion_supervision"] = "gt" if self.use_inst_gt else "sam"
-            if self.ovo_online_tracking or self.ovo_style_feature:
-                stats.update(
-                    {
-                        "ovo_paper_detector": True,
-                        "ovo_paper_sam_model_level_inst": OVO_PAPER_SAM_MODEL_LEVEL,
-                        "ovo_paper_sam_points_per_side": OVO_PAPER_SAM_POINTS_PER_SIDE,
-                        "ovo_paper_sam_pred_iou_thresh": OVO_PAPER_SAM_PRED_IOU_THRESH,
-                        "ovo_paper_sam_stability_score_thresh": OVO_PAPER_SAM_STABILITY_SCORE_THRESH,
-                        "ovo_paper_mask_nms_iou_th": OVO_PAPER_NMS_IOU_TH,
-                        "ovo_paper_mask_nms_score_th": OVO_PAPER_NMS_SCORE_TH,
-                        "ovo_paper_mask_nms_inner_th": OVO_PAPER_NMS_INNER_TH,
-                    }
-                )
-            if not self.ovo_online_tracking:
-                tracker = getattr(self.instance_manager, "tracker", None)
-                stats.update(
-                    {
-                        "instance_tracking_backend": "sam2_seed_to_seed",
-                        "sam2_model_level_track": self.sam2_model_level_track,
-                        "sam2_checkpoint_path_track": str(tracker.checkpoint_path) if tracker is not None else str((INPUT_DIR / "sam_ckpts" / SAM2_LEVELS[self.sam2_model_level_track][0])),
-                        "sam2_config_track": SAM2_LEVELS[self.sam2_model_level_track][1],
-                        "sam2_max_num_objects": self.sam2_tracker_config.max_num_objects,
-                        "sam2_mode": self.sam2_tracker_config.mode,
-                        "sam2_hydra_overrides": list(self.sam2_tracker_config.hydra_overrides),
-                        "sam2_apply_postprocessing": self.sam2_tracker_config.apply_postprocessing,
-                        "track_support_min": TRACK_SUPPORT_MIN,
-                        "attach_frac_th": ATTACH_FRAC_TH,
-                        "birth_min_points": BIRTH_MIN_POINTS,
-                        "seed_explained_frac_th": SEED_EXPLAINED_FRAC_TH,
-                        "track_miss_max": TRACK_MISS_MAX,
-                        "confirm_min_points": CONFIRM_MIN_POINTS,
-                        "confirm_min_seed_hits": CONFIRM_MIN_SEED_HITS,
-                        "tentative_max_seed_age": TENTATIVE_MAX_SEED_AGE,
-                    }
-                )
-            else:
-                stats["instance_tracking_backend"] = "ovo_online_projective"
-            if (not self.ovo_style_feature) and self.instance_manager.textregion_mask_extractor is not None:
-                stats.update(
-                    {
-                        "sam_model_level_textregion": self.sam_model_level_textregion,
+                        "sam_model_level_textregion": self.instance_manager.textregion_mask_extractor.model_level,
                         "sam_model_type_textregion": self.instance_manager.textregion_mask_extractor.model_type,
                         "sam_checkpoint_path_textregion": str(self.instance_manager.textregion_mask_extractor.checkpoint_path),
                         "sam_config_textregion": self.instance_manager.textregion_mask_extractor.config_path,
                     }
                 )
-            if not self.use_inst_gt:
-                stats.update(
-                    {
-                        "sam_model_level_inst": self.sam_model_level_inst,
-                        "sam_model_type_inst": self.instance_manager.seed_mask_extractor.model_type,
-                        "sam_checkpoint_path_inst": str(self.instance_manager.seed_mask_extractor.checkpoint_path),
-                        "sam_config_inst": self.instance_manager.seed_mask_extractor.config_path,
-                    }
-                )
+            stats.update(
+                {
+                    "sam_model_level_inst": self.instance_manager.seed_mask_extractor.model_level,
+                    "sam_model_type_inst": self.instance_manager.seed_mask_extractor.model_type,
+                    "sam_checkpoint_path_inst": str(self.instance_manager.seed_mask_extractor.checkpoint_path),
+                    "sam_config_inst": self.instance_manager.seed_mask_extractor.config_path,
+                }
+            )
             with open(output_dir / "stats.json", "w") as f:
                 json.dump(stats, f, indent=2)
             timings["stats_sec"] = time.perf_counter() - stage_start
@@ -1236,93 +905,122 @@ class RGBMapper:
         return timings
 
 
-def main(args):
+def build_run_stats(
+    *,
+    mapper: RGBMapper,
+    config: dict,
+    dataset_name: str,
+    scene_name: str,
+    device: str,
+    n_frames: int,
+    downscale_res: int,
+) -> dict:
+    return {
+        "dataset_name": canonical_dataset_name(dataset_name),
+        "scene_name": scene_name,
+        "n_frames": n_frames,
+        "n_points": mapper.n_points,
+        "has_normals": True,
+        "device": device,
+        "slam_module": config["slam"].get("slam_module", "vanilla"),
+        "slam_close_loops": bool(config["slam"].get("close_loops", True)),
+        "map_every": mapper.map_every,
+        "downscale_res": downscale_res,
+        "k_pooling": mapper.k_pooling,
+        "max_frame_points": mapper.max_frame_points,
+        "match_distance_th": mapper.match_distance_th,
+        "clip_model_name": CLIP_MODEL_NAME,
+        "clip_pretrained": CLIP_PRETRAINED,
+        "clip_load_size": CLIP_LOAD_SIZE,
+        "clip_skip_center_crop": True,
+        "clip_feature_dim": mapper.clip_extractor.feature_dim,
+        "clip_feature_dtype": "float16",
+        "clip_feature_path": CLIP_FEATURE_FILE,
+        "clip_feature_bytes": mapper.n_points * mapper.clip_extractor.feature_dim * 2,
+        "clip_feature_gib": mapper.n_points * mapper.clip_extractor.feature_dim * 2 / 1024**3,
+        "rgb_normal_point_fusion": True,
+        "clip_feature_mode": "clip_textregion",
+        "clip_feature_fusion": False,
+    }
+
+
+def run_scene_build(
+    *,
+    dataset_name: str,
+    scene_name: str,
+    output_root: str | Path,
+    frame_limit: int | None,
+    slam_module: str | None,
+    disable_loop_closure: bool,
+    config_path: str,
+    map_every: int,
+    downscale_res: int,
+    k_pooling: int,
+    max_frame_points: int,
+    match_distance_th: float,
+    extra_stats: dict | None = None,
+    snapshot_hook=None,
+) -> tuple[Path, dict, dict]:
     run_start = time.perf_counter()
-    dataset_name = args.dataset_name
-    output_dir = Path(args.output_root) / canonical_dataset_name(dataset_name) / args.scene_name
-    debug_video_writer = None
-    if args.debug_videos:
-        debug_video_writer = RGBMapDebugVideoWriter(output_dir / DEBUG_VIDEO_DIR, fps=args.debug_video_fps)
+    output_dir = Path(output_root) / canonical_dataset_name(dataset_name) / scene_name
     dataset_load_start = time.perf_counter()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     config, dataset, slam_backbone = load_dataset_and_slam(
         dataset_name=dataset_name,
-        scene_name=args.scene_name,
+        scene_name=scene_name,
         device=device,
-        frame_limit=args.frame_limit,
-        config_path=args.config_path,
-        slam_module=args.slam_module,
-        disable_loop_closure=args.disable_loop_closure,
+        frame_limit=frame_limit,
+        config_path=config_path,
+        slam_module=slam_module,
+        disable_loop_closure=disable_loop_closure,
     )
     dataset_load_sec = time.perf_counter() - dataset_load_start
-    sam_amg_config = build_sam_amg_config(args)
-    sam2_tracker_config = build_sam2_tracker_config(args)
+    sample_image = dataset[0][1]
+    source_height, source_width = sample_image.shape[:2]
     mapper = RGBMapper(
         intrinsics=dataset.intrinsics,
         device=device,
-        map_every=args.map_every,
-        downscale_res=args.downscale_res,
-        k_pooling=args.k_pooling,
-        max_frame_points=args.max_frame_points,
-        match_distance_th=args.match_distance_th,
-        dataset_name=dataset_name,
-        scene_name=args.scene_name,
-        use_inst_gt=args.use_inst_gt,
-        sam_model_level_inst=args.sam_model_level_inst,
-        sam_model_level_textregion=args.sam_model_level_textregion,
-        sam2_model_level_track=args.sam2_model_level_track,
-        sam_amg_config=sam_amg_config,
-        sam2_tracker_config=sam2_tracker_config,
-        ovo_online_tracking=args.ovo_online_tracking,
-        ovo_style_feature=args.ovo_style_feature,
-        ovo_weights_predictor_fusion=args.ovo_weights_predictor_fusion,
-        debug_video_writer=debug_video_writer,
+        map_every=map_every,
+        downscale_res=downscale_res,
+        k_pooling=k_pooling,
+        max_frame_points=max_frame_points,
+        match_distance_th=match_distance_th,
     )
 
-    progress = tqdm(range(len(dataset)), desc=args.scene_name, unit="frame")
+    progress = tqdm(range(len(dataset)), desc=scene_name, unit="frame")
     frame_loop_start = time.perf_counter()
-    for frame_id in progress:
-        frame_data = dataset[frame_id]
-        estimated_c2w = get_tracked_pose(slam_backbone, frame_data)
-        mapper.add_frame(frame_data, c2w_override=estimated_c2w)
-        progress.set_postfix(
-            points=mapper.n_points,
-            active=mapper.instance_manager.num_active_instances(),
-            objs=mapper.instance_manager.num_existing_instances(),
-            refresh=False,
-        )
+    try:
+        for frame_id in progress:
+            frame_data = dataset[frame_id]
+            prev_n = mapper.n_points
+            estimated_c2w = get_tracked_pose(slam_backbone, frame_data)
+            mapper.add_frame(frame_data, c2w_override=estimated_c2w)
+            if snapshot_hook is not None:
+                snapshot_hook(frame_id, prev_n, mapper.n_points, estimated_c2w)
+            progress.set_postfix(
+                points=mapper.n_points,
+                active=mapper.instance_manager.num_active_instances(),
+                objs=mapper.instance_manager.num_existing_instances(),
+                refresh=False,
+            )
+    finally:
+        progress.close()
     frame_loop_sec = time.perf_counter() - frame_loop_start
 
+    stats = build_run_stats(
+        mapper=mapper,
+        config=config,
+        dataset_name=dataset_name,
+        scene_name=scene_name,
+        device=device,
+        n_frames=len(dataset),
+        downscale_res=downscale_res,
+    )
+    if extra_stats:
+        stats.update(extra_stats)
     save_timings = mapper.save(
         output_dir,
-        {
-            "dataset_name": canonical_dataset_name(dataset_name),
-            "scene_name": args.scene_name,
-            "n_frames": len(dataset),
-            "n_points": mapper.n_points,
-            "has_normals": True,
-            "device": device,
-            "slam_module": config["slam"].get("slam_module", "vanilla"),
-            "slam_close_loops": bool(config["slam"].get("close_loops", True)),
-            "map_every": mapper.map_every,
-            "downscale_res": args.downscale_res,
-            "k_pooling": mapper.k_pooling,
-            "max_frame_points": mapper.max_frame_points,
-            "match_distance_th": mapper.match_distance_th,
-            "clip_model_name": mapper.clip_extractor.model_name if mapper.ovo_style_feature else CLIP_MODEL_NAME,
-            "clip_pretrained": mapper.clip_extractor.pretrained if mapper.ovo_style_feature else CLIP_PRETRAINED,
-            "clip_load_size": mapper.clip_extractor.mask_res if mapper.ovo_style_feature else CLIP_LOAD_SIZE,
-            "clip_skip_center_crop": True,
-            "clip_feature_dim": mapper.clip_extractor.feature_dim,
-            "clip_feature_dtype": "float16",
-            "clip_feature_path": CLIP_FEATURE_FILE,
-            "clip_feature_bytes": mapper.n_points * mapper.clip_extractor.feature_dim * 2,
-            "clip_feature_gib": mapper.n_points * mapper.clip_extractor.feature_dim * 2 / 1024**3,
-            "rgb_normal_point_fusion": True,
-            "clip_feature_mode": "ovo_instance_siglip" if mapper.ovo_style_feature else "clip_textregion",
-            "clip_feature_fusion": OVO_FEATURE_FUSION if mapper.ovo_style_feature else False,
-            "ovo_weights_predictor_fusion": mapper.clip_extractor.weights_predictor_fusion if mapper.ovo_style_feature else False,
-        },
+        stats,
     )
     timing_summary = {
         "dataset_load_sec": dataset_load_sec,
@@ -1333,6 +1031,41 @@ def main(args):
     with open(output_dir / TIMING_PATH, "w") as f:
         json.dump(timing_summary, f, indent=2)
     del slam_backbone
+    return output_dir, timing_summary, {
+        "dataset_intrinsics": dataset.intrinsics.astype(np.float32, copy=True),
+        "source_width": int(source_width),
+        "source_height": int(source_height),
+    }
+
+
+def add_build_args(parser: argparse.ArgumentParser, *, default_output_root: str | Path, default_map_every: int) -> None:
+    parser.add_argument("--output_root", default=str(default_output_root))
+    parser.add_argument("--frame_limit", type=int, default=None)
+    parser.add_argument("--slam_module", type=str, default=None, help="Override slam backend, e.g. vanilla, orbslam, or cuvslam.")
+    parser.add_argument("--disable_loop_closure", action="store_true", help="Disable ORB-SLAM loop closure/global BA updates by forcing slam.close_loops=false.")
+    parser.add_argument("--config_path", type=str, default="configs/ovo.yaml", help="Base runtime config file to load.")
+    parser.add_argument("--map_every", type=int, default=default_map_every)
+    parser.add_argument("--downscale_res", type=int, default=DEFAULT_DOWNSCALE_RES)
+    parser.add_argument("--k_pooling", type=int, default=DEFAULT_K_POOLING)
+    parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
+    parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
+
+
+def main(args):
+    output_dir, timing_summary, _ = run_scene_build(
+        dataset_name=args.dataset_name,
+        scene_name=args.scene_name,
+        output_root=args.output_root,
+        frame_limit=args.frame_limit,
+        slam_module=args.slam_module,
+        disable_loop_closure=args.disable_loop_closure,
+        config_path=args.config_path,
+        map_every=args.map_every,
+        downscale_res=args.downscale_res,
+        k_pooling=args.k_pooling,
+        max_frame_points=args.max_frame_points,
+        match_distance_th=args.match_distance_th,
+    )
     print(json.dumps({"timing": timing_summary}, indent=2))
     print(output_dir / "rgb_map.ply")
 
@@ -1341,19 +1074,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build a standalone RGB pointcloud map from RGB-D using the selected SLAM pose backend.")
     parser.add_argument("--dataset_name", required=True, choices=["Replica", "ScanNet"])
     parser.add_argument("--scene_name", required=True)
-    parser.add_argument("--output_root", default=str(OUTPUT_DIR))
-    parser.add_argument("--frame_limit", type=int, default=None)
-    parser.add_argument("--slam_module", type=str, default=None, help="Override slam backend, e.g. vanilla, orbslam, or cuvslam.")
-    parser.add_argument("--disable_loop_closure", action="store_true", help="Disable ORB-SLAM loop closure/global BA updates by forcing slam.close_loops=false.")
-    parser.add_argument("--config_path", type=str, default="configs/ovo.yaml", help="Base runtime config file to load.")
-    parser.add_argument("--map_every", type=int, default=DEFAULT_MAP_EVERY)
-    parser.add_argument("--downscale_res", type=int, default=DEFAULT_DOWNSCALE_RES)
-    parser.add_argument("--k_pooling", type=int, default=DEFAULT_K_POOLING)
-    parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
-    parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
-    add_sam_runtime_args(parser, include_textregion=True)
-    parser.add_argument("--use-inst-gt", action="store_true", help="Use decoded instance-filt masks instead of SAM for instance supervision.")
-    parser.add_argument("--debug-videos", action="store_true", help="Dump per-frame debug videos for instance/tracking and text-region CLIP flow.")
-    parser.add_argument("--debug-video-fps", type=int, default=4)
+    add_build_args(parser, default_output_root=OUTPUT_DIR, default_map_every=DEFAULT_MAP_EVERY)
     parsed = parser.parse_args()
     main(parsed)

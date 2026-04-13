@@ -35,21 +35,13 @@ def save_view(vis: o3d.visualization.Visualizer, view_path: Path) -> None:
     print(f"Saved view to {view_path}")
 
 
-def load_feature_model_spec(map_dir: Path) -> tuple[str, str]:
-    stats_path = map_dir / "stats.json"
-    if not stats_path.exists():
-        return CLIP_MODEL_NAME, CLIP_PRETRAINED
-    stats = json.loads(stats_path.read_text())
-    return str(stats.get("clip_model_name", CLIP_MODEL_NAME)), str(stats.get("clip_pretrained", CLIP_PRETRAINED))
-
-
-def load_openclip_text_model(device: str, model_name: str, pretrained: str):
-    if pretrained.startswith("hf-hub:"):
-        model = open_clip.create_model_from_pretrained(pretrained)[0].eval().to(device)
-        tokenize = open_clip.get_tokenizer(pretrained)
+def load_openclip_text_model(device: str):
+    if CLIP_PRETRAINED.startswith("hf-hub:"):
+        model = open_clip.create_model_from_pretrained(CLIP_PRETRAINED)[0].eval().to(device)
+        tokenize = open_clip.get_tokenizer(CLIP_PRETRAINED)
     else:
-        model = open_clip.create_model_and_transforms(model_name, pretrained=pretrained, device=device)[0].eval()
-        tokenize = open_clip.get_tokenizer(model_name)
+        model = open_clip.create_model_and_transforms(CLIP_MODEL_NAME, pretrained=CLIP_PRETRAINED, device=device)[0].eval()
+        tokenize = open_clip.get_tokenizer(CLIP_MODEL_NAME)
     return model, tokenize
 
 
@@ -188,11 +180,8 @@ def encode_text_queries(
     device: str,
     positives: list[str],
     negatives: list[str],
-    *,
-    model_name: str,
-    pretrained: str,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    model, tokenize = load_openclip_text_model(device, model_name, pretrained)
+    model, tokenize = load_openclip_text_model(device)
 
     pos_tokens = tokenize(positives).to(device)
     pos_embed = model.encode_text(pos_tokens).float()
@@ -225,8 +214,7 @@ def main(args):
         negatives = parse_texts(args.negative)
         feats = np.load(ply_path.with_name(CLIP_FEATURE_FILE), mmap_mode="r")
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model_name, pretrained = load_feature_model_spec(ply_path.parent)
-        pos_embed, neg_embed = encode_text_queries(device, positives, negatives, model_name=model_name, pretrained=pretrained)
+        pos_embed, neg_embed = encode_text_queries(device, positives, negatives)
         scores = torch.from_numpy(
             compute_similarity_scores_chunked(feats, pos_embed, neg_embed, args.softmax_temp, device, args.chunk_size)
         )

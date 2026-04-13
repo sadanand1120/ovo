@@ -6,7 +6,6 @@ import contextlib
 import io
 import sys
 
-import cv2
 import numpy as np
 import torch
 
@@ -16,7 +15,6 @@ from map_runtime.sam2_tracking import SAM2_APPLY_POSTPROCESSING, SAM2_HYDRA_OVER
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "thirdParty" / "segment-anything-2"))
 
 INPUT_DIR = Path("data/input")
-DATASET_DIRS = {"Replica": "Replica", "ScanNet": "ScanNet"}
 SAM_SORT_MODE = "score"
 SAM_MIN_MASK_AREA_PERC = 0.001
 SAM_POINTS_PER_SIDE = 24
@@ -74,11 +72,6 @@ class SAMAutomaticMaskConfig:
     mask_overlap_rescore_power: float = MASK_OVERLAP_RESCORE_POWER
     mask_dedupe_iou_thresh: float = MASK_DEDUPE_IOU_THRESH
     mask_containment_thresh: float = MASK_CONTAINMENT_THRESH
-
-
-def canonical_dataset_name(dataset_name: str) -> str:
-    return DATASET_DIRS[dataset_name]
-
 
 def mask_score(
     mask: dict,
@@ -246,29 +239,17 @@ def flatten_masks(masks: list[dict], image_shape: tuple[int, int, int], amg_conf
 
 
 class SAMMaskExtractor:
-    def __init__(
-        self,
-        device: str,
-        model_level: int,
-        amg_config: SAMAutomaticMaskConfig | None = None,
-        *,
-        sam2_mode: str = SAM2_MODE,
-        sam2_hydra_overrides: tuple[str, ...] = SAM2_HYDRA_OVERRIDES,
-        sam2_apply_postprocessing: bool = SAM2_APPLY_POSTPROCESSING,
-    ) -> None:
+    def __init__(self, device: str) -> None:
         self.device = device if device == "cpu" or torch.cuda.is_available() else "cpu"
-        self.model_level = int(model_level)
+        self.model_level = DEFAULT_SAM_AMG_MODEL_LEVEL
         self.config_path = None
-        self.amg_config = amg_config or SAMAutomaticMaskConfig()
-        self.sam2_mode = sam2_mode
-        self.sam2_hydra_overrides = tuple(sam2_hydra_overrides)
-        self.sam2_apply_postprocessing = bool(sam2_apply_postprocessing)
+        self.amg_config = SAMAutomaticMaskConfig()
         if self.model_level in SAM1_LEVELS:
             self._build_sam1_generator()
         elif self.model_level in SAM2_LEVELS:
             self._build_sam2_generator()
         else:
-            raise ValueError(f"Unsupported AMG level {model_level}. Expected one of {sorted(SAM_AMG_LEVELS)}.")
+            raise ValueError(f"Unsupported AMG level {self.model_level}. Expected one of {sorted(SAM_AMG_LEVELS)}.")
 
     def _build_sam1_generator(self) -> None:
         from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
@@ -312,9 +293,9 @@ class SAMMaskExtractor:
                 config_path,
                 str(checkpoint_path),
                 device=self.device,
-                mode=self.sam2_mode,
-                hydra_overrides_extra=list(self.sam2_hydra_overrides),
-                apply_postprocessing=self.sam2_apply_postprocessing,
+                mode=SAM2_MODE,
+                hydra_overrides_extra=list(SAM2_HYDRA_OVERRIDES),
+                apply_postprocessing=SAM2_APPLY_POSTPROCESSING,
             )
         self.mask_generator = SAM2AutomaticMaskGenerator(
             sam2,
@@ -350,27 +331,3 @@ class SAMMaskExtractor:
     def extract_labels(self, image: np.ndarray) -> np.ndarray:
         masks = self.mask_generator.generate(image)
         return flatten_masks(masks, image.shape, self.amg_config)
-
-
-class GTInstanceMaskExtractor:
-    def __init__(self, dataset_name: str, scene_name: str) -> None:
-        self.mask_dir = INPUT_DIR / canonical_dataset_name(dataset_name) / scene_name / "instance-filt"
-        if not self.mask_dir.exists():
-            raise FileNotFoundError(
-                f"Missing decoded GT instance masks at {self.mask_dir}."
-            )
-
-    def extract_labels(self, frame_id: int, image_shape: tuple[int, int]) -> np.ndarray:
-        path = self.mask_dir / f"{frame_id}.png"
-        labels = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-        if labels is None:
-            raise FileNotFoundError(f"Missing GT instance mask {path}")
-        if labels.shape[:2] != image_shape:
-            labels = cv2.resize(labels, (image_shape[1], image_shape[0]), interpolation=cv2.INTER_NEAREST)
-        labels = labels.astype(np.int32, copy=False)
-        labels[labels == 0] = -1
-        valid = labels >= 0
-        if valid.any():
-            _, local = np.unique(labels[valid], return_inverse=True)
-            labels[valid] = local.astype(np.int32, copy=False)
-        return labels

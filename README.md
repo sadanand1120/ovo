@@ -5,6 +5,7 @@ This repo is built around:
 - `build_rgb_map.py`
 - `topdown_vis.py`
 - `visualize_rgb_map.py`
+- `visualize_gt.py`
 - `get_metrics_map.py`
 - `get_ovo_style_eval.py`
 
@@ -88,8 +89,6 @@ cd ../..
 ```
 
 `download_ckpts.sh` fetches the SAM1 and SAM2 checkpoints used by the pipeline.
-It also downloads the upstream OVO weights-predictor checkpoint to `data/input/weights_predictor/model.pt`.
-The matching `data/input/weights_predictor/hparams.yaml` is tracked in this repo.
 
 ## Backends
 
@@ -317,24 +316,6 @@ The output scene directory contains:
 - `stats.json`
 - `timing.json`
 
-OVO-compatible switches:
-
-- `--ovo-online-tracking`: use the upstream OVO-style projective online instance association instead of the current SAM2 video tracker.
-- `--ovo-style-feature`: switch from dense CLIP+TextRegion features to OVO-style instance-level SigLIP descriptors.
-- `--ovo-weights-predictor-fusion {none,learned,fixed_weights,hovsg,adaptive_weights,concept_fusion}`: select the OVO per-view fusion mode. `learned` matches the upstream OVO-paper setup when used together with the two OVO flags above. `none` keeps the lighter masked-region-only SigLIP variant.
-
-Upstream OVO-paper instance+feature setup:
-
-```bash
-python build_rgb_map.py \
-  --dataset_name ScanNet \
-  --scene_name scene0011_00 \
-  --slam_module vanilla \
-  --ovo-online-tracking \
-  --ovo-style-feature \
-  --ovo-weights-predictor-fusion learned
-```
-
 ### Render top-down incremental videos
 
 ```bash
@@ -344,8 +325,6 @@ python topdown_vis.py \
   --load-view top_view_scene11.json
 ```
 
-`topdown_vis.py` and `get_ovo_style_eval.py` accept the same OVO flags as `build_rgb_map.py`.
-
 ### Visualize a built map
 
 ```bash
@@ -353,6 +332,16 @@ python visualize_rgb_map.py data/output/rgb_maps/ScanNet/scene0011_00 --mode rgb
 python visualize_rgb_map.py data/output/rgb_maps/ScanNet/scene0011_00 --mode normals
 python visualize_rgb_map.py data/output/rgb_maps/ScanNet/scene0011_00 --mode feat
 python visualize_rgb_map.py data/output/rgb_maps/ScanNet/scene0011_00 --mode instances
+```
+
+### Visualize GT assets
+
+```bash
+python visualize_gt.py --dataset_name ScanNet scene0011_00 \
+  --scannet_raw_root /path/to/scannet_v2/scans --mode semantics
+
+python visualize_gt.py --dataset_name Replica office0 \
+  --replica_root data/input/Replica --mode ovo-semantics
 ```
 
 ### Compute metrics
@@ -373,7 +362,7 @@ python get_metrics_map.py data/output/rgb_maps/Replica/office0 \
 
 ### ScanNet HVS report
 
-`get_ovo_style_eval.py` is for the ScanNet HVS report:
+Use `get_ovo_style_eval.py` for the ScanNet/Replica dataset-level OVO-style report:
 
 ```bash
 python get_ovo_style_eval.py \

@@ -3,6 +3,7 @@ import json
 import math
 from pathlib import Path
 
+import cv2  # Keep OpenCV loaded before torch in this env.
 import numpy as np
 import open3d as o3d
 import open_clip
@@ -73,21 +74,13 @@ def resolve_ply_path(input_path: str) -> Path:
     return path if path.suffix == ".ply" else path / "rgb_map.ply"
 
 
-def load_feature_model_spec(map_dir: Path) -> tuple[str, str]:
-    stats_path = map_dir / STATS_PATH
-    if not stats_path.exists():
-        return CLIP_MODEL_NAME, CLIP_PRETRAINED
-    stats = json.loads(stats_path.read_text())
-    return str(stats.get("clip_model_name", CLIP_MODEL_NAME)), str(stats.get("clip_pretrained", CLIP_PRETRAINED))
-
-
-def load_openclip_text_model(device: str, model_name: str, pretrained: str):
-    if pretrained.startswith("hf-hub:"):
-        model = open_clip.create_model_from_pretrained(pretrained)[0].eval().to(device)
-        tokenizer = open_clip.get_tokenizer(pretrained)
+def load_openclip_text_model(device: str):
+    if CLIP_PRETRAINED.startswith("hf-hub:"):
+        model = open_clip.create_model_from_pretrained(CLIP_PRETRAINED)[0].eval().to(device)
+        tokenizer = open_clip.get_tokenizer(CLIP_PRETRAINED)
     else:
-        model = open_clip.create_model_and_transforms(model_name, pretrained=pretrained, device=device)[0].eval()
-        tokenizer = open_clip.get_tokenizer(model_name)
+        model = open_clip.create_model_and_transforms(CLIP_MODEL_NAME, pretrained=CLIP_PRETRAINED, device=device)[0].eval()
+        tokenizer = open_clip.get_tokenizer(CLIP_MODEL_NAME)
     return model, tokenizer
 
 
@@ -376,11 +369,8 @@ def encode_class_texts(
     class_names: list[str],
     device: str,
     template: str = FEATURE_TEXT_TEMPLATE,
-    *,
-    model_name: str = CLIP_MODEL_NAME,
-    pretrained: str = CLIP_PRETRAINED,
 ) -> torch.Tensor:
-    model, tokenizer = load_openclip_text_model(device, model_name, pretrained)
+    model, tokenizer = load_openclip_text_model(device)
     phrases = [template.format(name) for name in class_names]
     text = model.encode_text(tokenizer(phrases).to(device)).float()
     text = text / text.norm(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -838,7 +828,7 @@ def print_compare_report(current_summary: dict, current_run_dir: Path, baseline_
         print(render_compare_table("timing", timing_rows, current_timing, baseline_timing))
 
 
-def main(args: argparse.Namespace) -> None:
+def run_single_scene_metrics(args: argparse.Namespace) -> None:
     ply_path = resolve_ply_path(args.input_path)
     dataset_name, scene_name = infer_scene_info_from_path(ply_path)
     progress = tqdm(total=6, desc=scene_name, unit="stage", dynamic_ncols=True)
@@ -865,9 +855,8 @@ def main(args: argparse.Namespace) -> None:
         gt_semantic = map_gt_labels_to_eval_ids(gt["semantic_raw"], dataset_info)
         class_names = dataset_info.get("class_names_reduced", dataset_info.get("class_names"))
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        feature_model_name, feature_pretrained = load_feature_model_spec(ply_path.parent)
-        text_embeds = encode_class_texts(class_names, device, model_name=feature_model_name, pretrained=feature_pretrained)
-        ovo_text_embeds = encode_class_texts(class_names, device, template=OVO_TEXT_TEMPLATE, model_name=feature_model_name, pretrained=feature_pretrained)
+        text_embeds = encode_class_texts(class_names, device)
+        ovo_text_embeds = encode_class_texts(class_names, device, template=OVO_TEXT_TEMPLATE)
         background_idx = class_names.index("background") if "background" in class_names else None
         from visualize_rgb_map import resolve_instance_labels
 
@@ -984,6 +973,12 @@ def main(args: argparse.Namespace) -> None:
         print(out_path)
     if args.compare:
         print_compare_report(summary, ply_path.parent, args.compare)
+
+
+def main(args: argparse.Namespace) -> None:
+    if not args.input_path:
+        raise ValueError("input_path is required.")
+    run_single_scene_metrics(args)
 
 
 if __name__ == "__main__":

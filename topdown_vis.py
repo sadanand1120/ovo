@@ -4,27 +4,14 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
-from tqdm.auto import tqdm
 
 from build_rgb_map import (
-    CLIP_FEATURE_FILE,
-    CLIP_LOAD_SIZE,
-    CLIP_MODEL_NAME,
-    CLIP_PRETRAINED,
-    add_sam_runtime_args,
-    build_sam_amg_config,
-    build_sam2_tracker_config,
-    DEFAULT_DOWNSCALE_RES,
-    DEFAULT_K_POOLING,
     DEFAULT_MAP_EVERY,
-    DEFAULT_MATCH_DISTANCE_TH,
-    DEFAULT_MAX_FRAME_POINTS,
-    RGBMapper,
+    add_build_args,
     canonical_dataset_name,
-    get_tracked_pose,
-    load_dataset_and_slam,
+    run_scene_build,
 )
+from get_metrics_map import load_pred_map
 from visualize_rgb_map import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_PCA_SAMPLE_SIZE,
@@ -232,96 +219,47 @@ def main(args: argparse.Namespace) -> None:
     dataset_name = args.dataset_name
     scene_name = args.scene_name
     output_dir = Path(args.output_root) / canonical_dataset_name(dataset_name) / scene_name
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    config, dataset, slam_backbone = load_dataset_and_slam(
+    intrinsic, extrinsic, width, height = load_view(Path(args.load_view))
+
+    snapshot_counts: list[int] = []
+    snapshot_frame_ids: list[int] = []
+    snapshot_c2w: list[np.ndarray] = []
+    def snapshot_hook(frame_id: int, prev_n: int, cur_n: int, estimated_c2w) -> None:
+        if cur_n <= prev_n or estimated_c2w is None:
+            return
+        snapshot_counts.append(int(cur_n))
+        snapshot_frame_ids.append(int(frame_id))
+        pose_np = np.asarray(estimated_c2w.detach().cpu().numpy() if hasattr(estimated_c2w, "detach") else estimated_c2w, dtype=np.float32)
+        snapshot_c2w.append(pose_np.astype(np.float32, copy=True))
+
+    output_dir, timing_summary, build_meta = run_scene_build(
         dataset_name=dataset_name,
         scene_name=scene_name,
-        device=device,
+        output_root=args.output_root,
         frame_limit=args.frame_limit,
-        config_path=args.config_path,
         slam_module=args.slam_module,
         disable_loop_closure=args.disable_loop_closure,
-    )
-    intrinsic, extrinsic, width, height = load_view(Path(args.load_view))
-    sam_amg_config = build_sam_amg_config(args)
-    sam2_tracker_config = build_sam2_tracker_config(args)
-
-    mapper = RGBMapper(
-        intrinsics=dataset.intrinsics,
-        device=device,
+        config_path=args.config_path,
         map_every=args.map_every,
         downscale_res=args.downscale_res,
         k_pooling=args.k_pooling,
         max_frame_points=args.max_frame_points,
         match_distance_th=args.match_distance_th,
-        dataset_name=dataset_name,
-        scene_name=scene_name,
-        use_inst_gt=args.use_inst_gt,
-        sam_model_level_inst=args.sam_model_level_inst,
-        sam_model_level_textregion=args.sam_model_level_textregion,
-        sam2_model_level_track=args.sam2_model_level_track,
-        sam_amg_config=sam_amg_config,
-        sam2_tracker_config=sam2_tracker_config,
-        ovo_online_tracking=args.ovo_online_tracking,
-        ovo_style_feature=args.ovo_style_feature,
-        ovo_weights_predictor_fusion=args.ovo_weights_predictor_fusion,
+        snapshot_hook=snapshot_hook,
     )
+    stats_path = output_dir / "stats.json"
+    stats = json.loads(stats_path.read_text())
+    stats["snapshot_counts"] = snapshot_counts
+    stats["snapshot_frame_ids"] = snapshot_frame_ids
+    stats_path.write_text(json.dumps(stats, indent=2))
 
-    snapshot_counts: list[int] = []
-    snapshot_frame_ids: list[int] = []
-    snapshot_c2w: list[np.ndarray] = []
-    sample_image = dataset[0][1]
-    source_height, source_width = sample_image.shape[:2]
-    progress = tqdm(range(len(dataset)), desc=scene_name, unit="frame")
-    for frame_id in progress:
-        frame_data = dataset[frame_id]
-        prev_n = mapper.n_points
-        estimated_c2w = get_tracked_pose(slam_backbone, frame_data)
-        mapper.add_frame(frame_data, c2w_override=estimated_c2w)
-        cur_n = mapper.n_points
-        progress.set_postfix(points=cur_n, refresh=False)
-        if cur_n > prev_n and estimated_c2w is not None:
-            snapshot_counts.append(cur_n)
-            snapshot_frame_ids.append(frame_id)
-            pose_np = estimated_c2w.detach().cpu().numpy() if isinstance(estimated_c2w, torch.Tensor) else np.asarray(estimated_c2w, dtype=np.float32)
-            snapshot_c2w.append(pose_np.astype(np.float32, copy=True))
-
-    mapper.save(
-        output_dir,
-        {
-            "dataset_name": canonical_dataset_name(dataset_name),
-            "scene_name": scene_name,
-            "n_frames": len(dataset),
-            "n_points": mapper.n_points,
-            "has_normals": True,
-            "device": mapper.device,
-            "slam_module": config["slam"].get("slam_module", "vanilla"),
-            "slam_close_loops": bool(config["slam"].get("close_loops", True)),
-            "map_every": mapper.map_every,
-            "downscale_res": args.downscale_res,
-            "k_pooling": args.k_pooling,
-            "max_frame_points": mapper.max_frame_points,
-            "match_distance_th": mapper.match_distance_th,
-            "clip_model_name": CLIP_MODEL_NAME,
-            "clip_pretrained": CLIP_PRETRAINED,
-            "clip_load_size": CLIP_LOAD_SIZE,
-            "clip_skip_center_crop": True,
-            "clip_feature_dim": mapper.clip_extractor.feature_dim,
-            "clip_feature_dtype": "float16",
-            "clip_feature_path": CLIP_FEATURE_FILE,
-            "clip_feature_bytes": mapper.n_points * mapper.clip_extractor.feature_dim * 2,
-            "clip_feature_gib": mapper.n_points * mapper.clip_extractor.feature_dim * 2 / 1024**3,
-            "snapshot_counts": snapshot_counts,
-            "snapshot_frame_ids": snapshot_frame_ids,
-        },
-    )
-
-    points = mapper.points[: mapper.n_points].cpu().numpy()
-    rgb_colors = mapper.colors[: mapper.n_points].cpu().numpy()
-    normal_colors = np.clip((mapper.normals[: mapper.n_points].cpu().numpy() + 1.0) * 127.5, 0.0, 255.0).astype(np.uint8)
+    pred = load_pred_map(output_dir / "rgb_map.ply")
+    points = pred["points"]
+    rgb_colors = pred["colors"]
+    normal_colors = np.clip((pred["normals"] + 1.0) * 127.5, 0.0, 255.0).astype(np.uint8)
     feat_colors = (
         apply_pca_colormap_chunked(
-            np.load(output_dir / CLIP_FEATURE_FILE, mmap_mode="r"),
+            pred["clip_features"],
             args.pca_sample_size,
             args.chunk_size,
         )
@@ -330,12 +268,15 @@ def main(args: argparse.Namespace) -> None:
     instance_colors = (colorize_instance_labels(resolve_instance_labels(output_dir, points.shape[0], args.min_component_size)) * 255.0).astype(np.uint8)
 
     video_dir = output_dir / VIDEO_DIR_NAME
-    render_incremental_video(video_dir / "rgb.mp4", "RGB", points, rgb_colors, snapshot_counts, snapshot_frame_ids, snapshot_c2w, dataset.intrinsics.astype(np.float32), source_width, source_height, intrinsic, extrinsic, width, height, args.fps, args.dilate)
-    render_incremental_video(video_dir / "normals.mp4", "Normals", points, normal_colors, snapshot_counts, snapshot_frame_ids, snapshot_c2w, dataset.intrinsics.astype(np.float32), source_width, source_height, intrinsic, extrinsic, width, height, args.fps, args.dilate)
-    render_incremental_video(video_dir / "feat_pca.mp4", "Feature PCA", points, feat_colors, snapshot_counts, snapshot_frame_ids, snapshot_c2w, dataset.intrinsics.astype(np.float32), source_width, source_height, intrinsic, extrinsic, width, height, args.fps, args.dilate)
-    instance_title = "GT Instances" if args.use_inst_gt else "SAM Instances"
-    instance_name = "gt_instances.mp4" if args.use_inst_gt else "sam_instances.mp4"
-    render_incremental_video(video_dir / instance_name, instance_title, points, instance_colors, snapshot_counts, snapshot_frame_ids, snapshot_c2w, dataset.intrinsics.astype(np.float32), source_width, source_height, intrinsic, extrinsic, width, height, args.fps, args.dilate)
+    source_intrinsic = build_meta["dataset_intrinsics"]
+    source_width = build_meta["source_width"]
+    source_height = build_meta["source_height"]
+    render_incremental_video(video_dir / "rgb.mp4", "RGB", points, rgb_colors, snapshot_counts, snapshot_frame_ids, snapshot_c2w, source_intrinsic, source_width, source_height, intrinsic, extrinsic, width, height, args.fps, args.dilate)
+    render_incremental_video(video_dir / "normals.mp4", "Normals", points, normal_colors, snapshot_counts, snapshot_frame_ids, snapshot_c2w, source_intrinsic, source_width, source_height, intrinsic, extrinsic, width, height, args.fps, args.dilate)
+    render_incremental_video(video_dir / "feat_pca.mp4", "Feature PCA", points, feat_colors, snapshot_counts, snapshot_frame_ids, snapshot_c2w, source_intrinsic, source_width, source_height, intrinsic, extrinsic, width, height, args.fps, args.dilate)
+    instance_title = "SAM Instances"
+    instance_name = "sam_instances.mp4"
+    render_incremental_video(video_dir / instance_name, instance_title, points, instance_colors, snapshot_counts, snapshot_frame_ids, snapshot_c2w, source_intrinsic, source_width, source_height, intrinsic, extrinsic, width, height, args.fps, args.dilate)
 
     summary = {
         "output_dir": str(output_dir),
@@ -347,8 +288,8 @@ def main(args: argparse.Namespace) -> None:
         },
         "n_snapshots": len(snapshot_counts),
         "n_points": int(points.shape[0]),
+        "timing": timing_summary,
     }
-    del slam_backbone
     print(json.dumps(summary, indent=2))
 
 
@@ -356,19 +297,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build RGB+normal+CLIP maps and render incremental view videos.")
     parser.add_argument("--dataset_name", required=True, choices=["Replica", "ScanNet"])
     parser.add_argument("--scene_name", required=True)
-    parser.add_argument("--output_root", default="data/output/topdown_vis")
     parser.add_argument("--load-view", required=True, help="Path to a saved view JSON dumped from visualize_rgb_map.py.")
-    parser.add_argument("--frame_limit", type=int, default=None)
-    parser.add_argument("--slam_module", type=str, default=None, help="Override slam backend, e.g. vanilla, orbslam, or cuvslam.")
-    parser.add_argument("--disable_loop_closure", action="store_true", help="Disable ORB-SLAM loop closure/global BA updates by forcing slam.close_loops=false.")
-    parser.add_argument("--config_path", type=str, default="configs/ovo.yaml", help="Base runtime config file to load.")
-    parser.add_argument("--map_every", type=int, default=DEFAULT_MAP_EVERY)
-    parser.add_argument("--downscale_res", type=int, default=DEFAULT_DOWNSCALE_RES)
-    parser.add_argument("--k_pooling", type=int, default=DEFAULT_K_POOLING)
-    parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
-    parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
-    add_sam_runtime_args(parser, include_textregion=True)
-    parser.add_argument("--use-inst-gt", action="store_true")
+    add_build_args(parser, default_output_root="data/output/topdown_vis", default_map_every=DEFAULT_MAP_EVERY)
     parser.add_argument("--fps", type=int, default=VIDEO_FPS)
     parser.add_argument("--dilate", type=int, default=POINT_DILATE)
     parser.add_argument("--min_component_size", type=int, default=2000)

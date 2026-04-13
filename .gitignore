@@ -2,6 +2,8 @@ ovoslam/submodules/segment-anything-langsplat
 __pycache__/
 *.py[cod]
 *.ipynb
+.vscode/
+.cursor/
 
 data/masks/
 data/output/
@@ -9,8 +11,6 @@ data/output/
 data/input/ScanNet/
 data/input/sam_ckpts/
 
-data/input/weights_predictor/*
-!data/input/weights_predictor/hparams.yaml
 
 data/input/Replica/*
 !data/input/Replica/semantic_gt/
