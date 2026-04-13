@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from map_runtime import geometry
+from map_runtime.build_debug_videos import RGBMapDebugVideoWriter
 from map_runtime.instance_pipeline import (
     SAMInstancePipeline,
 )
@@ -27,6 +28,7 @@ from map_runtime.scene import (
 OUTPUT_DIR = Path("data/output/rgb_maps")
 TIMING_PATH = "timing.json"
 CLIP_FEATURE_FILE = "clip_feats.npy"
+DEBUG_VIDEO_DIR = "debug_videos"
 DEFAULT_MAP_EVERY = 8
 DEFAULT_POINT_SAMPLE_STRIDE = 2
 DEFAULT_MAX_FRAME_POINTS = 5_000_000
@@ -179,7 +181,7 @@ class DenseCLIPExtractor:
         self.last_resblock = self.visual.transformer.resblocks[-1]
 
     @torch.inference_mode()
-    def extract_dense(self, image: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def extract_dense(self, image: torch.Tensor, labels: torch.Tensor, *, return_raw: bool = False):
         image = image.permute(2, 0, 1).float().div_(255.0)
         orig_h, orig_w = image.shape[-2:]
         resized_h, resized_w = resolve_resized_hw(orig_w, orig_h, CLIP_LOAD_SIZE)
@@ -228,6 +230,7 @@ class DenseCLIPExtractor:
             labels = F.interpolate(labels[None, None].float(), size=(orig_h, orig_w), mode="nearest")[0, 0].long()
         mask_weights = labels_to_patch_weights(labels, grid_h, grid_w, image.shape[-2], image.shape[-1])
         mask_weights = remove_global_patches(mask_weights, baseline.reshape(-1, baseline.shape[-1]), CLIP_GLOBAL_PATCH_THRESHOLD)
+        raw_dense = baseline.reshape(1, grid_h, grid_w, -1).permute(0, 3, 1, 2)
         if mask_weights.shape[0] > 0:
             num_heads = self.last_resblock.attn.num_heads
             embed_dim = v.shape[-1]
@@ -249,13 +252,19 @@ class DenseCLIPExtractor:
             region_dense[use_baseline] = baseline.reshape(-1, baseline.shape[-1])[use_baseline]
             x = region_dense.reshape(1, grid_h, grid_w, -1).permute(0, 3, 1, 2)
         else:
-            x = baseline.reshape(1, grid_h, grid_w, -1).permute(0, 3, 1, 2)
+            x = raw_dense
 
-        x = x.float()
-        x = F.interpolate(x, size=(resized_h, resized_w), mode="bilinear", align_corners=False)
-        if (resized_h, resized_w) != (orig_h, orig_w):
-            x = F.interpolate(x, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
-        return x[0].permute(1, 2, 0).contiguous()
+        def upsample_dense_map(dense_map: torch.Tensor) -> torch.Tensor:
+            dense_map = dense_map.float()
+            dense_map = F.interpolate(dense_map, size=(resized_h, resized_w), mode="bilinear", align_corners=False)
+            if (resized_h, resized_w) != (orig_h, orig_w):
+                dense_map = F.interpolate(dense_map, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+            return dense_map[0].permute(1, 2, 0).contiguous()
+
+        dense_clip = upsample_dense_map(x)
+        if not return_raw:
+            return dense_clip
+        return dense_clip, upsample_dense_map(raw_dense)
 
 
 class RGBMapper:
@@ -268,6 +277,7 @@ class RGBMapper:
         point_sample_stride: int,
         max_frame_points: int,
         match_distance_th: float,
+        debug_video_writer: RGBMapDebugVideoWriter | None = None,
     ) -> None:
         self.device = device
         self.cam_intrinsics = torch.tensor(intrinsics.astype(np.float32), device=device)
@@ -277,6 +287,7 @@ class RGBMapper:
         self.match_distance_th = float(match_distance_th)
         self.clip_extractor = DenseCLIPExtractor(device)
         self.instance_manager = SAMInstancePipeline(device=device, total_num_frames=total_num_frames)
+        self.debug_video_writer = debug_video_writer
 
         self.n_points = 0
         self.points = torch.empty((0, 3), device=device)
@@ -373,6 +384,14 @@ class RGBMapper:
         c2w_np = frame_data[3] if c2w_override is None else c2w_override
         if c2w_np is None:
             self.instance_manager.maybe_prune(int(frame_id))
+            if self.debug_video_writer is not None:
+                self.debug_video_writer.write_instance_frame(
+                    frame_id=int(frame_id),
+                    rgb=image_np,
+                    current_labels=None,
+                    global_labels=None,
+                    is_seed_frame=bool(is_seed_frame),
+                )
             return
         if isinstance(c2w_np, torch.Tensor):
             c2w = c2w_np.to(self.device, dtype=torch.float32)
@@ -382,6 +401,14 @@ class RGBMapper:
             c2w = torch.from_numpy(c2w_np).to(self.device)
         if np.isinf(c2w_np).any() or np.isnan(c2w_np).any():
             self.instance_manager.maybe_prune(int(frame_id))
+            if self.debug_video_writer is not None:
+                self.debug_video_writer.write_instance_frame(
+                    frame_id=int(frame_id),
+                    rgb=image_np,
+                    current_labels=None,
+                    global_labels=None,
+                    is_seed_frame=bool(is_seed_frame),
+                )
             return
 
         depth = torch.from_numpy(depth_np).to(self.device)
@@ -415,18 +442,34 @@ class RGBMapper:
                     point_ids_full[matches[:, 1], matches[:, 0]] = global_ids.to(point_ids_full.dtype)
                     mask[matches[:, 1], matches[:, 0]] = False
 
+        point_ids_full_np = point_ids_full.detach().cpu().numpy()
         if not is_seed_frame:
-            self.instance_manager.process_nonseed_frame(
+            current_labels_np = self.instance_manager.process_nonseed_frame(
                 int(frame_id),
                 image_np,
-                point_ids_full.detach().cpu().numpy(),
+                point_ids_full_np,
             )
+            if self.debug_video_writer is not None:
+                self.debug_video_writer.write_instance_frame(
+                    frame_id=int(frame_id),
+                    rgb=image_np,
+                    current_labels=current_labels_np,
+                    global_labels=self.instance_manager.project_primary_labels(point_ids_full_np),
+                    is_seed_frame=False,
+                )
             return
 
         depth = self.sample_seed_grid(depth)
         mask = self.sample_seed_grid(mask)
         image = self.sample_seed_grid(image)
         point_ids_sampled = self.sample_seed_grid(point_ids_full)
+        if self.debug_video_writer is not None:
+            self.debug_video_writer.update_latest_seed(
+                frame_id=int(frame_id),
+                rgb=image_np,
+                seed_labels=seed_labels_np,
+                seed_source="sam inst",
+            )
         normals_cam, normal_valid = compute_normals_from_depth(x, y, depth, self.cam_intrinsics)
         visible_existing = (point_ids_sampled >= 0) & normal_valid
         if visible_existing.any():
@@ -437,6 +480,19 @@ class RGBMapper:
             visible_normals = visible_normals / torch.linalg.norm(visible_normals, dim=1, keepdim=True).clamp_min(1e-8)
             self._update_observed_points(visible_ids, visible_colors, visible_normals)
         mask = mask & normal_valid
+        need_clip_debug = self.debug_video_writer is not None
+        has_new_points = bool(mask.any().item())
+        dense_clip = dense_clip_raw = None
+        if has_new_points or need_clip_debug:
+            clip_output = self.clip_extractor.extract_dense(
+                full_image,
+                tr_labels_full,
+                return_raw=need_clip_debug,
+            )
+            if need_clip_debug:
+                dense_clip, dense_clip_raw = clip_output
+            else:
+                dense_clip = clip_output
         if mask.any():
             x_keep = x[mask]
             y_keep = y[mask]
@@ -452,7 +508,6 @@ class RGBMapper:
                 depth_keep, colors = depth_keep[keep], colors[keep]
                 normals_cam = normals_cam[keep]
 
-            dense_clip = self.clip_extractor.extract_dense(full_image, tr_labels_full)
             features = dense_clip[y_keep, x_keep].half()
             x_3d = (x_keep - self.cam_intrinsics[0, 2]) * depth_keep / self.cam_intrinsics[0, 0]
             y_3d = (y_keep - self.cam_intrinsics[1, 2]) * depth_keep / self.cam_intrinsics[1, 1]
@@ -465,12 +520,38 @@ class RGBMapper:
             self._append_points(points, colors, normals, features)
             self.instance_manager.extend_for_new_points(int(points.shape[0]))
             point_ids_sampled[row_keep, col_keep] = new_ids
-        self.instance_manager.process_seed_frame(
+            new_ids_np = new_ids.detach().cpu().numpy()
+            new_y_np = y_keep.detach().cpu().numpy()
+            new_x_np = x_keep.detach().cpu().numpy()
+        else:
+            new_ids_np = None
+            new_y_np = None
+            new_x_np = None
+        current_labels_np = self.instance_manager.process_seed_frame(
             int(frame_id),
             image_np,
-            point_ids_full.detach().cpu().numpy(),
+            point_ids_full_np,
             seed_labels_np,
         )
+        if self.debug_video_writer is not None:
+            global_labels_np = self.instance_manager.project_primary_labels(point_ids_full_np)
+            if new_ids_np is not None:
+                global_labels_np[new_y_np, new_x_np] = self.instance_manager.primary_labels_for_point_ids(new_ids_np)
+            self.debug_video_writer.write_instance_frame(
+                frame_id=int(frame_id),
+                rgb=image_np,
+                current_labels=current_labels_np,
+                global_labels=global_labels_np,
+                is_seed_frame=True,
+            )
+            self.debug_video_writer.write_textregion_frame(
+                frame_id=int(frame_id),
+                rgb=image_np,
+                raw_clip_dense=dense_clip_raw,
+                textregion_labels=tr_labels_np,
+                textregion_clip_dense=dense_clip,
+                mask_source="sam textregion",
+            )
 
     def save(self, output_dir: Path, stats: dict) -> dict:
         self.instance_manager.close()
@@ -572,6 +653,8 @@ class RGBMapper:
                 self.feature_tmp_file.close()
             if self.feature_tmpdir is not None:
                 shutil.rmtree(self.feature_tmpdir, ignore_errors=True)
+            if self.debug_video_writer is not None:
+                self.debug_video_writer.close()
         timings["save_total_sec"] = time.perf_counter() - save_start
         return timings
 
@@ -627,11 +710,14 @@ def run_scene_build(
     point_sample_stride: int,
     max_frame_points: int,
     match_distance_th: float,
+    debug_videos: bool = False,
+    debug_video_fps: int = 4,
     extra_stats: dict | None = None,
     snapshot_hook=None,
 ) -> tuple[Path, dict, dict]:
     run_start = time.perf_counter()
     output_dir = Path(output_root) / canonical_dataset_name(dataset_name) / scene_name
+    debug_video_writer = RGBMapDebugVideoWriter(output_dir / DEBUG_VIDEO_DIR, fps=debug_video_fps) if debug_videos else None
     dataset_load_start = time.perf_counter()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     config, dataset, slam_backbone = load_dataset_and_slam(
@@ -654,6 +740,7 @@ def run_scene_build(
         point_sample_stride=point_sample_stride,
         max_frame_points=max_frame_points,
         match_distance_th=match_distance_th,
+        debug_video_writer=debug_video_writer,
     )
 
     progress = tqdm(range(len(dataset)), desc=scene_name, unit="frame")
@@ -717,6 +804,8 @@ def add_build_args(parser: argparse.ArgumentParser, *, default_output_root: str 
     parser.add_argument("--point_sample_stride", type=int, default=DEFAULT_POINT_SAMPLE_STRIDE, help="Seed-frame point-sampling stride used for geometry/normal/label sampling before point fusion.")
     parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
+    parser.add_argument("--debug-videos", dest="debug_videos", action="store_true", help="Dump per-frame debug videos for instance/tracking and text-region CLIP flow.")
+    parser.add_argument("--debug-video-fps", dest="debug_video_fps", type=int, default=4)
 
 
 def main(args):
@@ -732,6 +821,8 @@ def main(args):
         point_sample_stride=args.point_sample_stride,
         max_frame_points=args.max_frame_points,
         match_distance_th=args.match_distance_th,
+        debug_videos=args.debug_videos,
+        debug_video_fps=args.debug_video_fps,
     )
     print(json.dumps({"timing": timing_summary}, indent=2))
     print(output_dir / "rgb_map.ply")

@@ -124,10 +124,12 @@ class SAMInstancePipeline:
         self.stats["instance_pruned_points"] += points_drop
         self._drop_gids(np.asarray(to_drop, dtype=np.int32))
 
-    def process_nonseed_frame(self, frame_id: int, image_np: np.ndarray, point_ids_full: np.ndarray) -> None:
+    def process_nonseed_frame(self, frame_id: int, image_np: np.ndarray, point_ids_full: np.ndarray) -> np.ndarray:
         self._supported_gids_in_frame.clear()
         tracked_masks = self._track_frame(image_np)
+        tracked_labels = np.full(point_ids_full.shape, -1, dtype=np.int32)
         for gid, mask in tracked_masks.items():
+            tracked_labels[mask] = int(gid)
             point_ids = self._mask_point_ids(point_ids_full, mask)
             if point_ids.size < INSTANCE_TRACK_MIN_VISIBLE_POINTS:
                 continue
@@ -135,6 +137,11 @@ class SAMInstancePipeline:
             self._record_support(int(gid), int(frame_id))
             self.stats["instance_nonseed_supported_masks"] += 1
         self.maybe_prune(int(frame_id))
+        if self.buckets:
+            tracked_labels[~np.isin(tracked_labels, np.asarray(sorted(self.buckets), dtype=np.int32))] = -1
+        else:
+            tracked_labels.fill(-1)
+        return tracked_labels
 
     def process_seed_frame(
         self,
@@ -142,7 +149,7 @@ class SAMInstancePipeline:
         image_np: np.ndarray,
         point_ids_full: np.ndarray,
         seed_labels: np.ndarray,
-    ) -> None:
+    ) -> np.ndarray:
         self._supported_gids_in_frame.clear()
         self.stats["instance_seed_frames"] += 1
         visible_point_ids = np.unique(point_ids_full[point_ids_full >= 0])
@@ -163,7 +170,12 @@ class SAMInstancePipeline:
             self._record_support(gid, int(frame_id))
             inst_img_full[seed_mask] = int(gid)
         self.maybe_prune(int(frame_id))
+        if self.buckets:
+            inst_img_full[~np.isin(inst_img_full, np.asarray(sorted(self.buckets), dtype=np.int32))] = -1
+        else:
+            inst_img_full.fill(-1)
         self._reseed_tracker(image_np, inst_img_full)
+        return inst_img_full
 
     def build_diagnostic_state(self) -> dict:
         gids = np.asarray(sorted(self.buckets), dtype=np.int32)
@@ -179,44 +191,22 @@ class SAMInstancePipeline:
         }
 
     def collapse_public_labels(self) -> np.ndarray:
-        n_points = self.point_multi_labels.shape[0]
-        public_labels = np.full((n_points,), -1, dtype=np.int32)
-        if n_points == 0 or not self.buckets:
-            return public_labels
+        return self._collapse_rows(self.point_multi_labels)
 
-        max_gid = max(max(self.buckets) + 1, self.next_gid)
-        support_arr = np.full((max_gid,), -1, dtype=np.int32)
-        num_points_arr = np.full((max_gid,), -1, dtype=np.int32)
-        last_frame_arr = np.full((max_gid,), -1, dtype=np.int32)
-        for gid, bucket in self.buckets.items():
-            support_arr[int(gid)] = int(bucket["support_frames"])
-            num_points_arr[int(gid)] = int(bucket["num_points"])
-            last_frame_arr[int(gid)] = int(bucket["last_support_frame"])
+    def primary_labels_for_point_ids(self, point_ids: np.ndarray) -> np.ndarray:
+        point_ids = np.asarray(point_ids, dtype=np.int64)
+        if point_ids.size == 0:
+            return np.empty((0,), dtype=np.int32)
+        return self._collapse_rows(self.point_multi_labels[point_ids])
 
-        best_support = np.full((n_points,), -1, dtype=np.int32)
-        best_points = np.full((n_points,), -1, dtype=np.int32)
-        best_last = np.full((n_points,), -1, dtype=np.int32)
-        for slot in range(INSTANCE_LABEL_SLOTS):
-            gids = self.point_multi_labels[:, slot]
-            valid = gids >= 0
-            if not valid.any():
-                continue
-            support = np.full((n_points,), -1, dtype=np.int32)
-            points = np.full((n_points,), -1, dtype=np.int32)
-            last = np.full((n_points,), -1, dtype=np.int32)
-            support[valid] = support_arr[gids[valid]]
-            points[valid] = num_points_arr[gids[valid]]
-            last[valid] = last_frame_arr[gids[valid]]
-            better = valid & (
-                (support > best_support)
-                | ((support == best_support) & (points > best_points))
-                | ((support == best_support) & (points == best_points) & (last > best_last))
-            )
-            public_labels[better] = gids[better]
-            best_support[better] = support[better]
-            best_points[better] = points[better]
-            best_last[better] = last[better]
-        return public_labels
+    def project_primary_labels(self, point_ids_full: np.ndarray) -> np.ndarray:
+        point_ids_full = np.asarray(point_ids_full, dtype=np.int64)
+        labels = np.full(point_ids_full.shape, -1, dtype=np.int32)
+        valid = point_ids_full >= 0
+        if not valid.any():
+            return labels
+        labels[valid] = self.primary_labels_for_point_ids(point_ids_full[valid])
+        return labels
 
     def _create_gid(self) -> int:
         gid = int(self.next_gid)
@@ -375,3 +365,43 @@ class SAMInstancePipeline:
             "instance_final_gid_count": len(self.buckets),
             **self.stats,
         }
+
+    def _collapse_rows(self, rows: np.ndarray) -> np.ndarray:
+        rows = np.asarray(rows, dtype=np.int32)
+        public_labels = np.full((rows.shape[0],), -1, dtype=np.int32)
+        if rows.size == 0 or not self.buckets:
+            return public_labels
+
+        max_gid = max(max(self.buckets) + 1, self.next_gid)
+        support_arr = np.full((max_gid,), -1, dtype=np.int32)
+        num_points_arr = np.full((max_gid,), -1, dtype=np.int32)
+        last_frame_arr = np.full((max_gid,), -1, dtype=np.int32)
+        for gid, bucket in self.buckets.items():
+            support_arr[int(gid)] = int(bucket["support_frames"])
+            num_points_arr[int(gid)] = int(bucket["num_points"])
+            last_frame_arr[int(gid)] = int(bucket["last_support_frame"])
+
+        best_support = np.full((rows.shape[0],), -1, dtype=np.int32)
+        best_points = np.full((rows.shape[0],), -1, dtype=np.int32)
+        best_last = np.full((rows.shape[0],), -1, dtype=np.int32)
+        for slot in range(INSTANCE_LABEL_SLOTS):
+            gids = rows[:, slot]
+            valid = gids >= 0
+            if not valid.any():
+                continue
+            support = np.full((rows.shape[0],), -1, dtype=np.int32)
+            points = np.full((rows.shape[0],), -1, dtype=np.int32)
+            last = np.full((rows.shape[0],), -1, dtype=np.int32)
+            support[valid] = support_arr[gids[valid]]
+            points[valid] = num_points_arr[gids[valid]]
+            last[valid] = last_frame_arr[gids[valid]]
+            better = valid & (
+                (support > best_support)
+                | ((support == best_support) & (points > best_points))
+                | ((support == best_support) & (points == best_points) & (last > best_last))
+            )
+            public_labels[better] = gids[better]
+            best_support[better] = support[better]
+            best_points[better] = points[better]
+            best_last[better] = last[better]
+        return public_labels
