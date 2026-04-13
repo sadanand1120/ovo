@@ -48,7 +48,8 @@ One structural fact controls everything below:
 
 - only **seed frames** mutate the stored 3D map
 - a seed frame is any frame with `frame_id % 8 == 0`
-- non-seed frames only update SAM2 tracking state; they do **not** append points, do **not** update RGB, do **not** update normals, do **not** update CLIP features, and do **not** append point-level instance labels
+- non-seed frames do **not** append points, do **not** update RGB, do **not** update normals, and do **not** update CLIP features
+- non-seed frames **do** use the tracker to propagate already-existing gids onto visible existing points
 
 Also, the three saved point-aligned outputs use the same point ordering:
 
@@ -402,133 +403,92 @@ So the dense CLIP feature for point `i` is simply:
 
 ## (e) Global instance IDs
 
-### What is stored
+### What is stored during mapping
 
-The point-level instance storage is:
+The runtime now keeps two instance representations:
 
-- `self.instance_manager.point_labels[i]`
+1. per-point multi-instance storage
+   - `self.instance_manager.point_multi_labels[i, j]`
+   - fixed width `K = 10`
+   - each slot is either a global instance id `gid` or `-1`
+2. a global bucket per surviving `gid`
+   - `support_frames`
+   - `num_points`
+   - `last_support_frame`
 
-This is a 1D array parallel to the point cloud:
+This means a point can belong to multiple gids during mapping.
 
-- `>= 0` means a global instance ID
-- `-1` means unlabeled / background / invalidated
+### What is saved
 
-It is saved as `instance_labels.npy`.
+Two files are written:
 
-### The two different per-frame label images
+- `instance_labels.npy`
+  - the public single-label view consumed by the existing viewer / metrics scripts
+  - one final gid per point, or `-1`
+- `instance_state.npy`
+  - the diagnostic dump of the full multi-label table plus bucket state
 
-For understanding the pipeline, separate these two image-space maps:
+### Seed-frame logic
 
-1. `gid_img_full`
-   - built by projecting **existing map points**
-   - tells you which already-mapped global instance IDs are visible at current pixels
+Seed frames are the only frames that decide instance identity.
 
-2. `inst_img_full`
-   - built on seed frames
-   - this is the current frame’s final per-pixel **global** instance label image after SAM seeding plus tracker/attachment logic
+For each local SAM mask on a seed frame:
 
-Only `point_labels` is persistent point-level storage.
+1. Projected existing map points provide `point_ids_full`, so the mask can see which 3D points it covers.
+2. Split those covered points into:
+   - labeled points already carrying one or more gids
+   - background points whose row is still all `-1`
+3. Try to match the mask to an existing gid using the current low-level thresholds:
+   - high in-mask coverage among labeled points
+   - low outside-mask leakage among other visible labeled points
+   - enough in-mask support points
+4. If an existing gid is accepted:
+   - only the background / unlabeled points under that seed mask are filled with that gid
+   - already-labeled points are left as they are
+5. If no existing gid is accepted:
+   - a brand-new gid is created
+   - that new gid is added to all visible 3D points under the seed mask
+6. In both cases:
+   - the gid gets one frame of support
+   - the seed-frame per-pixel gid image is updated for tracker reseeding
 
-### How existing map points provide image-space global IDs
+### Non-seed logic
 
-Before any new instance decision is made on a frame:
+Non-seed frames do not birth new gids.
 
-1. existing map points are projected into the current image
-2. depth-consistent matches fill:
-   - `point_ids_full[v, u] = point_index`
-   - `gid_img_full[v, u] = point_labels[point_index]`
+They only:
 
-So `gid_img_full` is the current frame’s projection of already stored point-level global IDs.
+1. run SAM2 tracking from the latest seed-frame reseed
+2. obtain gid-keyed tracked masks
+3. for each tracked gid, add that gid onto visible 3D points under the tracked mask if those points do not already contain it
+4. record one frame of support for that gid
 
-### What happens on non-seed frames
+So non-seed frames can update existing point-instance memberships, but they never create new 3D points or new gids.
 
-On non-seed frames, the mapper does **not** change point-level labels.
+### Pruning
 
-What does happen:
+Pruning is support-driven, not tracker-state-driven.
 
-1. SAM2 propagates masks from the latest seeded frame into the current frame.
-2. For each active global ID `gid`, the tracked mask is accepted only if the dominant projected old ID under that mask is the same `gid`, with:
-   - support at least `3` pixels
-   - dominant fraction at least `0.4`
-3. Accepted masks become the current frame label image.
-4. Failed tracks increase a miss counter.
-5. If misses exceed `3`:
-   - tentative instances are killed
-   - confirmed instances become inactive
+A gid is removed if it becomes stale or too weak according to the low-level constants in `map_runtime/instance_pipeline.py`.
 
-This updates tracker state only. It does **not** append or rewrite point-level labels.
+When a gid is dropped:
 
-### What happens on seed frames
+- it is removed from the global bucket
+- it is removed from every point’s 10-slot row
+- rows are compacted so `-1` values move to the right
 
-Seed frames are where global IDs are created or attached and where new points receive point-level labels.
+### Final public collapse
 
-The seed-frame logic is:
+The public `instance_labels.npy` is produced only at save time.
 
-1. First, run the same SAM2 propagation step described above to get `current_labels`.
-2. Run SAM AMG instance extraction on the current RGB image to get `seed_labels`.
-   - this produces compact local labels `0, 1, 2, ...` for this frame only
-3. Convert `seed_labels` into binary masks.
-4. Initialize `inst_img_full` from the tracked current labels.
+For each point:
 
-Then each seed mask is processed independently:
-
-5. Look under that seed mask in `gid_img_full`.
-6. If one old global ID dominates that mask with:
-   - support at least `3`
-   - fraction at least `0.4`
-   then the seed mask is attached to that existing global ID.
-7. Otherwise, count how many pixels in that seed mask are both:
-   - valid depth
-   - not already explained by an existing map point
-8. If that count is at least `80`, create a brand-new global ID for that seed mask.
-   - new instances start as `tentative`
-9. Write the chosen global ID into `inst_img_full` for all pixels of that seed mask.
-
-After that:
-
-10. visible instances get seed-hit bookkeeping
-11. SAM2 is reseeded from `inst_img_full`
-12. tentative instances are confirmed only once both are true:
-    - they have accumulated at least `80` mapped points
-    - they have been seen on at least `2` seed frames
-
-### How point-level instance labels are actually assigned
-
-Point-level labels are assigned only when **new 3D points** are appended on a seed frame.
-
-After new geometry insertion, the mapper does:
-
-1. look up the seed frame’s final global label image at the kept new-point pixels
-2. collect:
-
-```text
-new_gids = instance_labels_sampled[row_keep, col_keep]
-```
-
-3. append those values into `point_labels`
-
-So point `i` gets the global instance ID that was present at its birth pixel on its birth seed frame.
-
-If `new_gids[j] == -1`, that new 3D point is still inserted into the map, but its point-level instance label is stored as `-1`.
-
-### What changes later, and what does not
-
-What does change later:
-
-- tracker state (`active`, `inactive`, `tentative`, `dead`)
-- whether a tentative instance gets confirmed
-- if a tentative instance is killed, all points carrying that gid are reset to `-1`
-
-What does **not** happen:
-
-- existing points are not relabeled just because a later frame prefers a different instance mask
-- there is no per-point majority vote over time
-- there is no retroactive global relabeling pass over the full map
-
-So point-level global instance IDs are effectively:
-
-- append-only at point birth
-- with one exception: tentative-instance death can invalidate them to `-1`
+1. look at all valid gids remaining in its 10-slot row
+2. keep the gid with:
+   - highest `support_frames`
+   - then highest `num_points`
+   - then most recent `last_support_frame`
+3. if the row is empty, save `-1`
 
 ## Short summary by saved output
 
@@ -537,4 +497,6 @@ So point-level global instance IDs are effectively:
 - `clip_feats.npy`
   - stores one dense CLIP feature per point, sampled once at point birth
 - `instance_labels.npy`
-  - stores one global instance ID per point, assigned once at point birth, unless later invalidated to `-1`
+  - stores the final single-label public collapse of the multi-instance state
+- `instance_state.npy`
+  - stores the full multi-instance diagnostic state
