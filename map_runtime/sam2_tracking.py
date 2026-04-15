@@ -102,8 +102,11 @@ class SAM2VideoTracker:
     def __init__(
         self,
         first_frame_source: Path | str | np.ndarray,
+        *,
+        model_level: int | None = None,
+        max_num_objects: int | None = None,
     ) -> None:
-        model_level = DEFAULT_SAM2_TRACK_MODEL_LEVEL
+        model_level = DEFAULT_SAM2_TRACK_MODEL_LEVEL if model_level is None else int(model_level)
         if int(model_level) not in SAM2_LEVELS:
             raise ValueError(f"Unsupported SAM2.1 level {model_level}. Expected one of {sorted(SAM2_LEVELS)}.")
         checkpoint_name, config_path = SAM2_LEVELS[int(model_level)]
@@ -115,7 +118,7 @@ class SAM2VideoTracker:
         self.model_level = int(model_level)
         self.checkpoint_path = checkpoint_path
         self.config_path = config_path
-        self.max_num_objects = SAM2_MAX_NUM_OBJECTS
+        self.max_num_objects = SAM2_MAX_NUM_OBJECTS if max_num_objects is None else int(max_num_objects)
         from sam2.build_sam import build_sam2_video_predictor
 
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):

@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "thirdParty" / "
 
 INPUT_DIR = Path("data/input")
 SAM_SORT_MODE = "score"
-SAM_MIN_MASK_AREA_PERC = 0.001
+SAM_MIN_MASK_AREA_PERC = 0.01
 SAM_POINTS_PER_SIDE = 24
 SAM_POINTS_PER_BATCH = 128
 SAM_PRED_IOU_THRESH = 0.88
@@ -72,6 +72,7 @@ class SAMAutomaticMaskConfig:
     mask_overlap_rescore_power: float = MASK_OVERLAP_RESCORE_POWER
     mask_dedupe_iou_thresh: float = MASK_DEDUPE_IOU_THRESH
     mask_containment_thresh: float = MASK_CONTAINMENT_THRESH
+
 
 def mask_score(
     mask: dict,
@@ -239,11 +240,17 @@ def flatten_masks(masks: list[dict], image_shape: tuple[int, int, int], amg_conf
 
 
 class SAMMaskExtractor:
-    def __init__(self, device: str) -> None:
+    def __init__(
+        self,
+        device: str,
+        *,
+        model_level: int | None = None,
+        amg_config: SAMAutomaticMaskConfig | None = None,
+    ) -> None:
         self.device = device if device == "cpu" or torch.cuda.is_available() else "cpu"
-        self.model_level = DEFAULT_SAM_AMG_MODEL_LEVEL
+        self.model_level = int(DEFAULT_SAM_AMG_MODEL_LEVEL if model_level is None else model_level)
         self.config_path = None
-        self.amg_config = SAMAutomaticMaskConfig()
+        self.amg_config = SAMAutomaticMaskConfig() if amg_config is None else amg_config
         if self.model_level in SAM1_LEVELS:
             self._build_sam1_generator()
         elif self.model_level in SAM2_LEVELS:

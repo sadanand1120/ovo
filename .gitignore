@@ -1,7 +1,4 @@
-ovoslam/submodules/segment-anything-langsplat
 __pycache__/
-*.py[cod]
-*.ipynb
 .vscode/
 .cursor/
 
@@ -10,7 +7,6 @@ data/output/
 
 data/input/ScanNet/
 data/input/sam_ckpts/
-
 
 data/input/Replica/*
 !data/input/Replica/semantic_gt/
