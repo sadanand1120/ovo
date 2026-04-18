@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from dataclasses import dataclass
 import io
 import logging
 from collections import OrderedDict
@@ -15,18 +16,22 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "thirdParty" / "segment-anything-2"))
 
 
-INPUT_DIR = Path("data/input")
-SAM2_MAX_NUM_OBJECTS = 16
-DEFAULT_SAM2_TRACK_MODEL_LEVEL = 24
-SAM2_LEVELS = {
+_input_dir = Path("data/input")
+_sam2_levels = {
     21: ("sam2.1_hiera_tiny.pt", "configs/sam2.1/sam2.1_hiera_t.yaml"),
     22: ("sam2.1_hiera_small.pt", "configs/sam2.1/sam2.1_hiera_s.yaml"),
     23: ("sam2.1_hiera_base_plus.pt", "configs/sam2.1/sam2.1_hiera_b+.yaml"),
     24: ("sam2.1_hiera_large.pt", "configs/sam2.1/sam2.1_hiera_l.yaml"),
 }
-SAM2_MODE = "eval"
-SAM2_HYDRA_OVERRIDES: tuple[str, ...] = ()
-SAM2_APPLY_POSTPROCESSING = True
+_sam2_mode = "eval"
+_sam2_hydra_overrides: tuple[str, ...] = ()
+_sam2_apply_postprocessing = True
+
+
+@dataclass(frozen=True)
+class SAMTrackerConfig:
+    model_level: int = 24
+    max_num_objects: int = 16
 
 
 def logits_to_mask(mask_logits: np.ndarray) -> np.ndarray:
@@ -103,22 +108,23 @@ class SAM2VideoTracker:
         self,
         first_frame_source: Path | str | np.ndarray,
         *,
-        model_level: int | None = None,
-        max_num_objects: int | None = None,
+        config: SAMTrackerConfig,
     ) -> None:
-        model_level = DEFAULT_SAM2_TRACK_MODEL_LEVEL if model_level is None else int(model_level)
-        if int(model_level) not in SAM2_LEVELS:
-            raise ValueError(f"Unsupported SAM2.1 level {model_level}. Expected one of {sorted(SAM2_LEVELS)}.")
-        checkpoint_name, config_path = SAM2_LEVELS[int(model_level)]
-        checkpoint_path = INPUT_DIR / "sam_ckpts" / checkpoint_name
+        self.config = config
+        if int(self.config.model_level) not in _sam2_levels:
+            raise ValueError(
+                f"Unsupported SAM2.1 level {self.config.model_level}. Expected one of {sorted(_sam2_levels)}."
+            )
+        checkpoint_name, config_path = _sam2_levels[int(self.config.model_level)]
+        checkpoint_path = _input_dir / "sam_ckpts" / checkpoint_name
         if not checkpoint_path.exists():
             raise FileNotFoundError(checkpoint_path)
         logging.getLogger("sam2").setLevel(logging.ERROR)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model_level = int(model_level)
+        self.model_level = int(self.config.model_level)
         self.checkpoint_path = checkpoint_path
         self.config_path = config_path
-        self.max_num_objects = SAM2_MAX_NUM_OBJECTS if max_num_objects is None else int(max_num_objects)
+        self.max_num_objects = int(self.config.max_num_objects)
         from sam2.build_sam import build_sam2_video_predictor
 
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -126,9 +132,9 @@ class SAM2VideoTracker:
                 config_path,
                 str(checkpoint_path),
                 device=self.device,
-                mode=SAM2_MODE,
-                hydra_overrides_extra=list(SAM2_HYDRA_OVERRIDES),
-                apply_postprocessing=SAM2_APPLY_POSTPROCESSING,
+                mode=_sam2_mode,
+                hydra_overrides_extra=list(_sam2_hydra_overrides),
+                apply_postprocessing=_sam2_apply_postprocessing,
             )
         self.images = None
         self.inference_state = None

@@ -586,7 +586,7 @@ def classify_instance_features_ovo_style(
             "mean_points_per_instance": 0.0,
             "mean_max_score": float("nan"),
             "score_th": float(score_th),
-            "text_template": OVO_TEXT_TEMPLATE,
+            "text_template": ovo_text_template(bool(use_optimal_text_matching)),
             "agg_mode": ovo_feature_agg_name(bool(use_optimal_text_matching)),
             "use_optimal_text_matching": bool(use_optimal_text_matching),
         }
@@ -649,7 +649,7 @@ def classify_instance_features_ovo_style(
         "mean_points_per_instance": float(feature_count[valid].mean()) if valid.any() else 0.0,
         "mean_max_score": float(instance_max_score.mean()) if instance_max_score.size > 0 else float("nan"),
         "score_th": float(score_th),
-        "text_template": OVO_TEXT_TEMPLATE,
+        "text_template": ovo_text_template(bool(use_optimal_text_matching)),
         "agg_mode": ovo_feature_agg_name(bool(use_optimal_text_matching)),
         "use_optimal_text_matching": bool(use_optimal_text_matching),
     }
@@ -1112,8 +1112,11 @@ def compute_single_scene_summary(
                 **semantic_ovo_diag_1,
                 **semantic_ovo_diag_2,
             },
+            "use_optimal_text_matching": bool(args.use_optimal_text_matching),
+            "ovo_score_th": float(args.ovo_score_th),
             "feature_text_template": FEATURE_TEXT_TEMPLATE,
-            "ovo_text_template": OVO_TEXT_TEMPLATE,
+            "ovo_text_template": ovo_text_template(bool(args.use_optimal_text_matching)),
+            "ovo_feature_agg": ovo_feature_agg_name(bool(args.use_optimal_text_matching)),
             "instance_video_label_source": "metric_point_instance_labels",
             "instance": None if instance_diag is None else {
                 **instance_diag,

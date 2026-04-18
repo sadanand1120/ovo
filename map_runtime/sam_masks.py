@@ -9,71 +9,51 @@ import sys
 import numpy as np
 import torch
 
-from map_runtime.sam2_tracking import SAM2_APPLY_POSTPROCESSING, SAM2_HYDRA_OVERRIDES, SAM2_LEVELS, SAM2_MODE
+from map_runtime.sam2_tracking import _sam2_apply_postprocessing, _sam2_hydra_overrides, _sam2_levels, _sam2_mode
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "thirdParty" / "segment-anything-2"))
 
-INPUT_DIR = Path("data/input")
-SAM_SORT_MODE = "score"
-SAM_MIN_MASK_AREA_PERC = 0.001  # THIS IS EXTREME IMPACTING PERFORMANCE, should be configured carefully
-SAM_POINTS_PER_SIDE = 24
-SAM_POINTS_PER_BATCH = 128
-SAM_PRED_IOU_THRESH = 0.88
-SAM_STABILITY_SCORE_THRESH = 0.92
-SAM_STABILITY_SCORE_OFFSET = 1.0
-SAM_BOX_NMS_THRESH = 0.7
-SAM_CROP_N_LAYERS = 0
-SAM_CROP_NMS_THRESH = 0.7
-SAM_CROP_OVERLAP_RATIO = 0.6
-SAM_CROP_N_POINTS_DOWNSCALE_FACTOR = 1
-SAM_MIN_MASK_REGION_AREA = 0
-SAM_OUTPUT_MODE = "binary_mask"
-SAM_SCORE_PRED_IOU_POWER = 2.0
-SAM_SCORE_STABILITY_POWER = 1.0
-SAM_SCORE_AREA_POWER = 0.0
-MASK_OVERLAP_RESCORE_THRESH = 0.0
-MASK_OVERLAP_RESCORE_POWER = 1.0
-MASK_DEDUPE_IOU_THRESH = 0.85
-MASK_CONTAINMENT_THRESH = 0.0
-DEFAULT_SAM_AMG_MODEL_LEVEL = 24
-SAM1_LEVELS = {
-    11: ("vit_b", INPUT_DIR / "sam_ckpts" / "sam_vit_b_01ec64.pth"),
-    12: ("vit_l", INPUT_DIR / "sam_ckpts" / "sam_vit_l_0b3195.pth"),
-    13: ("vit_h", INPUT_DIR / "sam_ckpts" / "sam_vit_h_4b8939.pth"),
+_input_dir = Path("data/input")
+_sam1_levels = {
+    11: ("vit_b", _input_dir / "sam_ckpts" / "sam_vit_b_01ec64.pth"),
+    12: ("vit_l", _input_dir / "sam_ckpts" / "sam_vit_l_0b3195.pth"),
+    13: ("vit_h", _input_dir / "sam_ckpts" / "sam_vit_h_4b8939.pth"),
 }
-SAM_AMG_LEVELS = {**SAM1_LEVELS, **SAM2_LEVELS}
+_sam_amg_levels = {**_sam1_levels, **_sam2_levels}
 
 
 @dataclass(frozen=True)
-class SAMAutomaticMaskConfig:
-    sort_mode: str = SAM_SORT_MODE
-    min_mask_area_perc: float = SAM_MIN_MASK_AREA_PERC
-    points_per_side: int = SAM_POINTS_PER_SIDE
-    points_per_batch: int = SAM_POINTS_PER_BATCH
-    pred_iou_thresh: float = SAM_PRED_IOU_THRESH
-    stability_score_thresh: float = SAM_STABILITY_SCORE_THRESH
-    stability_score_offset: float = SAM_STABILITY_SCORE_OFFSET
+class SAMMaskExtractorConfig:
+    model_level: int = 13
+    sort_mode: str = "area"
+    min_mask_area_perc: float = 0.01
+    points_per_side: int = 24
+    points_per_batch: int = 128
+    pred_iou_thresh: float = 0.88
+    stability_score_thresh: float = 0.92
+    stability_score_offset: float = 1.0
     mask_threshold: float = 0.0
-    box_nms_thresh: float = SAM_BOX_NMS_THRESH
-    crop_n_layers: int = SAM_CROP_N_LAYERS
-    crop_nms_thresh: float = SAM_CROP_NMS_THRESH
-    crop_overlap_ratio: float = SAM_CROP_OVERLAP_RATIO
-    crop_n_points_downscale_factor: int = SAM_CROP_N_POINTS_DOWNSCALE_FACTOR
+    box_nms_thresh: float = 0.7
+    crop_n_layers: int = 0
+    crop_nms_thresh: float = 0.7
+    crop_overlap_ratio: float = 0.6
+    crop_n_points_downscale_factor: int = 1
     point_grids: list[np.ndarray] | None = None
-    min_mask_region_area: int = SAM_MIN_MASK_REGION_AREA
-    output_mode: str = SAM_OUTPUT_MODE
+    min_mask_region_area: int = 0
+    output_mode: str = "binary_mask"
     use_m2m: bool = False
     multimask_output: bool = True
-    score_pred_iou_power: float = SAM_SCORE_PRED_IOU_POWER
-    score_stability_power: float = SAM_SCORE_STABILITY_POWER
-    score_area_power: float = SAM_SCORE_AREA_POWER
-    mask_overlap_rescore_thresh: float = MASK_OVERLAP_RESCORE_THRESH
-    mask_overlap_rescore_power: float = MASK_OVERLAP_RESCORE_POWER
-    mask_dedupe_iou_thresh: float = MASK_DEDUPE_IOU_THRESH
-    mask_containment_thresh: float = MASK_CONTAINMENT_THRESH
+    score_pred_iou_power: float = 2.0
+    score_stability_power: float = 1.0
+    score_area_power: float = 0.0
+    mask_overlap_rescore_thresh: float = 0.0
+    mask_overlap_rescore_power: float = 1.0
+    mask_dedupe_iou_thresh: float = 0.85
+    mask_containment_thresh: float = 0.0
 
 
+# TODO: check if all this is even needed
 def mask_score(
     mask: dict,
     sort_mode: str,
@@ -170,12 +150,12 @@ def suppress_redundant_masks(
 def processed_masks_and_scores(
     masks: list[dict],
     image_shape: tuple[int, int, int],
-    amg_config: SAMAutomaticMaskConfig,
+    mask_config: SAMMaskExtractorConfig,
     *,
     max_mask_area_perc: float = 0.0,
 ) -> tuple[list[np.ndarray], np.ndarray]:
     height, width = image_shape[:2]
-    min_mask_area = float(amg_config.min_mask_area_perc) * height * width
+    min_mask_area = float(mask_config.min_mask_area_perc) * height * width
     max_mask_area = None if max_mask_area_perc <= 0 else float(max_mask_area_perc) * height * width
     filtered_masks = [
         mask
@@ -190,10 +170,10 @@ def processed_masks_and_scores(
         [
             mask_score(
                 mask,
-                amg_config.sort_mode,
-                amg_config.score_pred_iou_power,
-                amg_config.score_stability_power,
-                amg_config.score_area_power,
+                mask_config.sort_mode,
+                mask_config.score_pred_iou_power,
+                mask_config.score_stability_power,
+                mask_config.score_area_power,
             )
             for mask in filtered_masks
         ],
@@ -202,22 +182,22 @@ def processed_masks_and_scores(
     scores = rescore_masks_by_redundancy(
         segmentations,
         scores,
-        amg_config.mask_overlap_rescore_thresh,
-        amg_config.mask_overlap_rescore_power,
+        mask_config.mask_overlap_rescore_thresh,
+        mask_config.mask_overlap_rescore_power,
     )
     segmentations, scores = suppress_redundant_masks(
         segmentations,
         scores,
-        amg_config.mask_dedupe_iou_thresh,
-        amg_config.mask_containment_thresh,
+        mask_config.mask_dedupe_iou_thresh,
+        mask_config.mask_containment_thresh,
     )
     return segmentations, scores
 
 
-def flatten_masks(masks: list[dict], image_shape: tuple[int, int, int], amg_config: SAMAutomaticMaskConfig) -> np.ndarray:
+def flatten_masks(masks: list[dict], image_shape: tuple[int, int, int], mask_config: SAMMaskExtractorConfig) -> np.ndarray:
     height, width = image_shape[:2]
-    min_mask_area = float(amg_config.min_mask_area_perc) * height * width
-    segmentations, scores = processed_masks_and_scores(masks, image_shape, amg_config)
+    min_mask_area = float(mask_config.min_mask_area_perc) * height * width
+    segmentations, scores = processed_masks_and_scores(masks, image_shape, mask_config)
     if len(segmentations) == 0:
         return np.full((height, width), -1, dtype=np.int32)
     order = np.argsort(scores)[::-1]
@@ -244,24 +224,23 @@ class SAMMaskExtractor:
         self,
         device: str,
         *,
-        model_level: int | None = None,
-        amg_config: SAMAutomaticMaskConfig | None = None,
+        config: "SAMMaskExtractorConfig",
     ) -> None:
         self.device = device if device == "cpu" or torch.cuda.is_available() else "cpu"
-        self.model_level = int(DEFAULT_SAM_AMG_MODEL_LEVEL if model_level is None else model_level)
+        self.config = config
+        self.model_level = int(self.config.model_level)
         self.config_path = None
-        self.amg_config = SAMAutomaticMaskConfig() if amg_config is None else amg_config
-        if self.model_level in SAM1_LEVELS:
+        if self.model_level in _sam1_levels:
             self._build_sam1_generator()
-        elif self.model_level in SAM2_LEVELS:
+        elif self.model_level in _sam2_levels:
             self._build_sam2_generator()
         else:
-            raise ValueError(f"Unsupported AMG level {self.model_level}. Expected one of {sorted(SAM_AMG_LEVELS)}.")
+            raise ValueError(f"Unsupported AMG level {self.model_level}. Expected one of {sorted(_sam_amg_levels)}.")
 
     def _build_sam1_generator(self) -> None:
         from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
 
-        model_type, checkpoint_path = SAM1_LEVELS[self.model_level]
+        model_type, checkpoint_path = _sam1_levels[self.model_level]
         if not checkpoint_path.exists():
             raise FileNotFoundError(checkpoint_path)
         self.model_type = model_type
@@ -269,27 +248,27 @@ class SAMMaskExtractor:
         sam = sam_model_registry[model_type](checkpoint=str(checkpoint_path)).to(self.device).eval()
         self.mask_generator = SamAutomaticMaskGenerator(
             sam,
-            points_per_side=self.amg_config.points_per_side,
-            points_per_batch=self.amg_config.points_per_batch,
-            pred_iou_thresh=self.amg_config.pred_iou_thresh,
-            stability_score_thresh=self.amg_config.stability_score_thresh,
-            stability_score_offset=self.amg_config.stability_score_offset,
-            box_nms_thresh=self.amg_config.box_nms_thresh,
-            crop_n_layers=self.amg_config.crop_n_layers,
-            crop_nms_thresh=self.amg_config.crop_nms_thresh,
-            crop_overlap_ratio=self.amg_config.crop_overlap_ratio,
-            crop_n_points_downscale_factor=self.amg_config.crop_n_points_downscale_factor,
-            point_grids=self.amg_config.point_grids,
-            min_mask_region_area=self.amg_config.min_mask_region_area,
-            output_mode=self.amg_config.output_mode,
+            points_per_side=self.config.points_per_side,
+            points_per_batch=self.config.points_per_batch,
+            pred_iou_thresh=self.config.pred_iou_thresh,
+            stability_score_thresh=self.config.stability_score_thresh,
+            stability_score_offset=self.config.stability_score_offset,
+            box_nms_thresh=self.config.box_nms_thresh,
+            crop_n_layers=self.config.crop_n_layers,
+            crop_nms_thresh=self.config.crop_nms_thresh,
+            crop_overlap_ratio=self.config.crop_overlap_ratio,
+            crop_n_points_downscale_factor=self.config.crop_n_points_downscale_factor,
+            point_grids=self.config.point_grids,
+            min_mask_region_area=self.config.min_mask_region_area,
+            output_mode=self.config.output_mode,
         )
 
     def _build_sam2_generator(self) -> None:
         from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
         from sam2.build_sam import build_sam2
 
-        checkpoint_name, config_path = SAM2_LEVELS[self.model_level]
-        checkpoint_path = INPUT_DIR / "sam_ckpts" / checkpoint_name
+        checkpoint_name, config_path = _sam2_levels[self.model_level]
+        checkpoint_path = _input_dir / "sam_ckpts" / checkpoint_name
         if not checkpoint_path.exists():
             raise FileNotFoundError(checkpoint_path)
         self.model_type = Path(config_path).stem
@@ -300,28 +279,28 @@ class SAMMaskExtractor:
                 config_path,
                 str(checkpoint_path),
                 device=self.device,
-                mode=SAM2_MODE,
-                hydra_overrides_extra=list(SAM2_HYDRA_OVERRIDES),
-                apply_postprocessing=SAM2_APPLY_POSTPROCESSING,
+                mode=_sam2_mode,
+                hydra_overrides_extra=list(_sam2_hydra_overrides),
+                apply_postprocessing=_sam2_apply_postprocessing,
             )
         self.mask_generator = SAM2AutomaticMaskGenerator(
             sam2,
-            points_per_side=self.amg_config.points_per_side,
-            points_per_batch=self.amg_config.points_per_batch,
-            pred_iou_thresh=self.amg_config.pred_iou_thresh,
-            stability_score_thresh=self.amg_config.stability_score_thresh,
-            stability_score_offset=self.amg_config.stability_score_offset,
-            mask_threshold=self.amg_config.mask_threshold,
-            box_nms_thresh=self.amg_config.box_nms_thresh,
-            crop_n_layers=self.amg_config.crop_n_layers,
-            crop_nms_thresh=self.amg_config.crop_nms_thresh,
-            crop_overlap_ratio=self.amg_config.crop_overlap_ratio,
-            crop_n_points_downscale_factor=self.amg_config.crop_n_points_downscale_factor,
-            point_grids=self.amg_config.point_grids,
-            min_mask_region_area=self.amg_config.min_mask_region_area,
-            output_mode=self.amg_config.output_mode,
-            use_m2m=self.amg_config.use_m2m,
-            multimask_output=self.amg_config.multimask_output,
+            points_per_side=self.config.points_per_side,
+            points_per_batch=self.config.points_per_batch,
+            pred_iou_thresh=self.config.pred_iou_thresh,
+            stability_score_thresh=self.config.stability_score_thresh,
+            stability_score_offset=self.config.stability_score_offset,
+            mask_threshold=self.config.mask_threshold,
+            box_nms_thresh=self.config.box_nms_thresh,
+            crop_n_layers=self.config.crop_n_layers,
+            crop_nms_thresh=self.config.crop_nms_thresh,
+            crop_overlap_ratio=self.config.crop_overlap_ratio,
+            crop_n_points_downscale_factor=self.config.crop_n_points_downscale_factor,
+            point_grids=self.config.point_grids,
+            min_mask_region_area=self.config.min_mask_region_area,
+            output_mode=self.config.output_mode,
+            use_m2m=self.config.use_m2m,
+            multimask_output=self.config.multimask_output,
         )
 
     @torch.inference_mode()
@@ -330,11 +309,11 @@ class SAMMaskExtractor:
         return processed_masks_and_scores(
             masks,
             image.shape,
-            self.amg_config,
+            self.config,
             max_mask_area_perc=max_mask_area_perc,
         )
 
     @torch.inference_mode()
     def extract_labels(self, image: np.ndarray) -> np.ndarray:
         masks = self.mask_generator.generate(image)
-        return flatten_masks(masks, image.shape, self.amg_config)
+        return flatten_masks(masks, image.shape, self.config)

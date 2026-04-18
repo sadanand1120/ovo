@@ -1,9 +1,12 @@
 # Standalone SAM Instance Debugger Algorithm
 
 ## Scope
-This document describes the current implementation in [map_runtime/sam_instance_debug.py](/robodata/smodak/repos/ovo/map_runtime/sam_instance_debug.py). It is about the debugger's instance state update logic on top of the cached geometry from `build_rgb_cache.py`.
+This document describes the shared SAM instance runtime in [map_runtime/sam_instance_runtime.py](/robodata/smodak/repos/ovo/map_runtime/sam_instance_runtime.py).
 
-The debugger never changes geometry. It only reads cached frame data and updates instance state.
+- `build_rgb_map.py` uses that runtime directly on the live RGBMapper scene build.
+- [map_runtime/sam_instance_debug.py](/robodata/smodak/repos/ovo/map_runtime/sam_instance_debug.py) subclasses that same runtime and adds cache stepping, visualization, and notebook controls on top of cached geometry from `build_rgb_cache.py`.
+
+The runtime never changes geometry. It only consumes `point_ids_after` and updates instance state.
 
 ## Core State
 - `point_gids`: shape `(n_points, point_gid_slots)`, dtype `int32`, initialized to `-1`.

@@ -21,7 +21,7 @@ from map_runtime.rgb_map_utils import (
     invert_rigid_transform,
     stride_sample_2d,
 )
-from map_runtime.sam_masks import SAMMaskExtractor
+from map_runtime.sam_masks import SAMMaskExtractor, SAMMaskExtractorConfig
 from map_runtime.scene import canonical_dataset_name, get_tracked_pose, load_dataset_and_slam
 
 
@@ -55,7 +55,10 @@ class RGBSceneCacheBuilder:
         self.max_frame_points = as_int(max_frame_points)
         self.match_distance_th = float(match_distance_th)
         self.clip_extractor = DenseCLIPExtractor(device)
-        self.textregion_mask_extractor = SAMMaskExtractor(device)
+        self.textregion_mask_extractor = SAMMaskExtractor(
+            device,
+            config=SAMMaskExtractorConfig(),
+        )
 
         self.n_points = 0
         self.points = torch.empty((0, 3), device=device)
