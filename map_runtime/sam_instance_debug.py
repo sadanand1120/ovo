@@ -5,13 +5,18 @@ import html
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import cv2
 import numpy as np
+from plyfile import PlyData
+import torch
+from tqdm.auto import tqdm
 
 from map_runtime.debug_panels import color_for_id, compose_instance_debug_grid, overlay_header, render_sorted_label_map
-from map_runtime.rgb_scene_cache import CACHE_MANIFEST_FILE, FRAME_CACHE_DIR
+from map_runtime.instance_label_video import write_instance_label_video_from_cache
+from map_runtime.rgb_scene_cache import CACHE_MANIFEST_FILE, CLIP_FEATURE_FILE, FRAME_CACHE_DIR
 from map_runtime.sam_masks import SAMAutomaticMaskConfig, SAMMaskExtractor
 from map_runtime.sam2_tracking import SAM2VideoTracker, build_label_masks
 
@@ -257,6 +262,139 @@ class CachedSAMInstanceDebugger:
         gid_rows[valid_mask] = self.point_gids[point_ids]
         return gid_rows
 
+    def _project_gid_membership(self, point_ids_image: np.ndarray, gid: int) -> np.ndarray:
+        mask = np.zeros(point_ids_image.shape, dtype=bool)
+        valid_mask = point_ids_image >= 0
+        if not valid_mask.any():
+            return mask
+        point_ids = point_ids_image[valid_mask].astype(np.int64, copy=False)
+        mask[valid_mask] = np.any(self.point_gids[point_ids] == int(gid), axis=1)
+        return mask
+
+    def _collapse_point_gid_labels(self) -> np.ndarray:
+        labels = np.full((self.point_gids.shape[0],), -1, dtype=np.int32)
+        valid_rows = self.point_gids >= 0
+        if not valid_rows.any():
+            return labels
+        clipped = self.point_gids.clip(min=0)
+        scores = np.where(valid_rows, self._gid_scores[clipped], -1)
+        best_idx = np.argmax(scores, axis=1)
+        best_gid = self.point_gids[np.arange(self.point_gids.shape[0]), best_idx].astype(np.int32, copy=True)
+        best_gid[~np.any(valid_rows, axis=1)] = -1
+        return best_gid
+
+    def _num_seed_frames_processed(self) -> int:
+        if self.current_frame_id < 0:
+            return 0
+        return 1 + (int(self.current_frame_id) // int(self.cache.map_every))
+
+    def _raw_instance_support_scores(self) -> np.ndarray:
+        num_seed_frames = int(self._num_seed_frames_processed())
+        if self.next_gid <= 0 or num_seed_frames <= 0:
+            return np.zeros((max(0, int(self.next_gid)),), dtype=np.float32)
+        scores = np.zeros((int(self.next_gid),), dtype=np.float32)
+        for gid, bucket in self.buckets.items():
+            scores[int(gid)] = float(bucket.support_frames) / float(num_seed_frames)
+        return scores
+
+    def _finalize_metric_instance_labels(self, labels: np.ndarray, min_component_size: int) -> np.ndarray:
+        labels = np.asarray(labels, dtype=np.int32).copy()
+        valid = labels >= 0
+        if valid.any() and int(min_component_size) > 1:
+            uniq, counts = np.unique(labels[valid], return_counts=True)
+            keep = uniq[counts >= int(min_component_size)]
+            labels[~np.isin(labels, keep)] = -1
+            valid = labels >= 0
+        if valid.any():
+            _, relabeled = np.unique(labels[valid], return_inverse=True)
+            labels[valid] = relabeled.astype(np.int32, copy=False)
+        return labels
+
+    def _resolve_optimal_metric_instance_labels(
+        self,
+        pred_to_gt_idx: np.ndarray,
+        gt_instance_labels: np.ndarray,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        usual_collapse_labels = self._collapse_point_gid_labels()
+        pred_to_gt_idx = np.asarray(pred_to_gt_idx, dtype=np.int64)
+        gt_instance_labels = np.asarray(gt_instance_labels, dtype=np.int32)
+        pred_gt_instances = gt_instance_labels[pred_to_gt_idx]
+        gid_rows = self.point_gids
+        valid_rows = gid_rows >= 0
+        unique_gids = np.unique(gid_rows[valid_rows]) if valid_rows.any() else np.empty((0,), dtype=np.int32)
+        canonical_gid_by_gt: dict[int, int] = {}
+        canonical_rank_by_gt: dict[int, tuple[int, float, int, int, int]] = {}
+
+        for gid in unique_gids.tolist():
+            member_mask = np.any(gid_rows == int(gid), axis=1)
+            if not member_mask.any():
+                continue
+            member_gt_instances = pred_gt_instances[member_mask]
+            member_gt_instances = member_gt_instances[member_gt_instances >= 0]
+            if member_gt_instances.size == 0:
+                continue
+            gt_ids, gt_counts = np.unique(member_gt_instances, return_counts=True)
+            best_idx = int(np.argmax(gt_counts))
+            target_gt_instance = int(gt_ids[best_idx])
+            intersection = int(gt_counts[best_idx])
+            purity = float(intersection / float(member_mask.sum()))
+            bucket = self.buckets.get(int(gid))
+            support_frames = int(bucket.support_frames) if bucket is not None else 0
+            point_count = int(bucket.point_count) if bucket is not None else int(member_mask.sum())
+            rank = (intersection, purity, support_frames, point_count, -int(gid))
+            current_rank = canonical_rank_by_gt.get(target_gt_instance)
+            if current_rank is None or rank > current_rank:
+                canonical_rank_by_gt[target_gt_instance] = rank
+                canonical_gid_by_gt[target_gt_instance] = int(gid)
+
+        labels = np.full((gid_rows.shape[0],), -1, dtype=np.int32)
+        matched_canonical_points = 0
+        optimized_points = 0
+        for point_idx in range(gid_rows.shape[0]):
+            gt_instance = int(pred_gt_instances[point_idx])
+            if gt_instance < 0:
+                continue
+            canonical_gid = canonical_gid_by_gt.get(gt_instance)
+            if canonical_gid is None:
+                continue
+            if np.any(gid_rows[point_idx] == canonical_gid):
+                matched_canonical_points += 1
+                if usual_collapse_labels[point_idx] != canonical_gid:
+                    optimized_points += 1
+                labels[point_idx] = int(canonical_gid)
+
+        diagnostics = {
+            "optimal_collapse_gt_instances": int(len(canonical_gid_by_gt)),
+            "optimal_collapse_points_matched_canonical": int(matched_canonical_points),
+            "optimal_collapse_points_overridden": int(optimized_points),
+        }
+        unique_final = np.unique(labels[labels >= 0])
+        if unique_final.size > len(canonical_gid_by_gt):
+            raise RuntimeError(
+                f"Optimal collapse produced {unique_final.size} unique labels from only {len(canonical_gid_by_gt)} canonical gids."
+            )
+        return labels, diagnostics
+
+    def _resolve_metric_instance_gid_labels(
+        self,
+        *,
+        use_optimal_collapse: bool = False,
+        pred_to_gt_idx: np.ndarray | None = None,
+        gt_instance_labels: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        if use_optimal_collapse:
+            if pred_to_gt_idx is None or gt_instance_labels is None:
+                raise ValueError("Optimal collapse requires pred_to_gt_idx and gt_instance_labels.")
+            labels, diagnostics = self._resolve_optimal_metric_instance_labels(pred_to_gt_idx, gt_instance_labels)
+        else:
+            labels = self._collapse_point_gid_labels()
+            diagnostics = {}
+        diagnostics = {
+            **diagnostics,
+            "use_optimal_collapse": bool(use_optimal_collapse),
+        }
+        return labels, diagnostics
+
     def _bucket_snapshot(self) -> list[dict[str, Any]]:
         buckets = sorted(
             self.buckets.values(),
@@ -338,8 +476,6 @@ class CachedSAMInstanceDebugger:
             point_ids = frame["point_ids_after"][np.asarray(mask, dtype=bool)]
             point_ids = np.unique(point_ids[point_ids >= 0])
             added, overflow = self._add_gid_to_points(point_ids, int(gid), background_only=False)
-            if point_ids.size >= int(self.config.min_track_visible_points):
-                self._record_support(int(gid), int(frame["frame_id"]))
             decisions.append(
                 MaskDecision(
                     frame_id=int(frame["frame_id"]),
@@ -796,6 +932,184 @@ class CachedSAMInstanceDebugger:
             pass
         return output_path
 
+    def get_metrics(
+        self,
+        *,
+        scannet_raw_root: str | Path | None = None,
+        replica_root: str | Path | None = None,
+        min_component_size: int = 1,
+        ovo_score_th: float = 0.0,
+        chunk_size: int = 100_000,
+        use_optimal_collapse: bool = False,
+        use_optimal_text_matching: bool = False,
+        save_json: bool = False,
+    ) -> dict[str, Any]:
+        if self.current_frame_id < 0:
+            raise RuntimeError("Run step() or seek() before calling get_metrics().")
+
+        from get_metrics_map import (
+            classify_instance_features_ovo_style,
+            compute_instance_metrics,
+            compute_nn_associations,
+            encode_class_texts,
+            finalize_instance_labels_and_scores,
+            load_dataset_info,
+            load_gt,
+            map_gt_labels_to_eval_ids,
+            ovo_text_template,
+            transfer_instance_labels_ovo_style,
+        )
+
+        dataset_name = str(self.cache.manifest["dataset_name"])
+        scene_name = str(self.cache.manifest["scene_name"])
+        eval_args = SimpleNamespace(
+            scannet_raw_root=None if scannet_raw_root is None else str(scannet_raw_root),
+            replica_root=None if replica_root is None else str(replica_root),
+        )
+        total_stages = 7
+        progress = tqdm(total=total_stages, desc=f"{scene_name} debugger metrics", unit="stage", dynamic_ncols=True)
+        try:
+            progress.set_postfix_str("load gt", refresh=True)
+            gt = load_gt(dataset_name, scene_name, eval_args)
+            dataset_info = load_dataset_info(dataset_name)
+            progress.update()
+
+            progress.set_postfix_str("load map", refresh=True)
+            ply_path = self.cache.cache_dir / "rgb_map.ply"
+            if not ply_path.exists():
+                raise FileNotFoundError(ply_path)
+            vertex = PlyData.read(str(ply_path))["vertex"].data
+            pred_points = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=1).astype(np.float32)
+            if pred_points.shape[0] != self.point_gids.shape[0]:
+                raise ValueError(
+                    f"Point-count mismatch between debugger state and rgb_map.ply: {self.point_gids.shape[0]} vs {pred_points.shape[0]}"
+                )
+            clip_path = self.cache.cache_dir / CLIP_FEATURE_FILE
+            if not clip_path.exists():
+                raise FileNotFoundError(clip_path)
+            clip_features = np.load(clip_path, mmap_mode="r")
+            if int(clip_features.shape[0]) != pred_points.shape[0]:
+                raise ValueError(
+                    f"Point-count mismatch between clip_feats and rgb_map.ply: {clip_features.shape[0]} vs {pred_points.shape[0]}"
+                )
+            progress.update()
+
+            progress.set_postfix_str("resolve instances", refresh=True)
+            assoc = compute_nn_associations(gt["points"], pred_points)
+            pred_to_gt_idx = assoc["pred_to_gt_idx"]
+            if use_optimal_collapse:
+                progress.set_postfix_str("resolve instances (optimal)", refresh=True)
+            metric_gid_labels, collapse_diag = self._resolve_metric_instance_gid_labels(
+                use_optimal_collapse=bool(use_optimal_collapse),
+                pred_to_gt_idx=pred_to_gt_idx if use_optimal_collapse else None,
+                gt_instance_labels=gt["instance_labels"],
+            )
+            metric_point_instance_labels, metric_instance_scores = finalize_instance_labels_and_scores(
+                metric_gid_labels,
+                self._raw_instance_support_scores(),
+                int(min_component_size),
+            )
+            gt_point_instance_labels = np.full((pred_points.shape[0],), -1, dtype=np.int32)
+            if gt["instance_labels"] is not None:
+                gt_point_instance_labels = np.asarray(gt["instance_labels"], dtype=np.int32)[pred_to_gt_idx]
+            gt_semantic = map_gt_labels_to_eval_ids(gt["semantic_raw"], dataset_info)
+            progress.update()
+
+            progress.set_postfix_str("encode text", refresh=True)
+            class_names = dataset_info.get("class_names_reduced", dataset_info.get("class_names"))
+            device = "cuda" if self.device != "cpu" and torch.cuda.is_available() else "cpu"
+            ovo_text_embeds = encode_class_texts(
+                class_names,
+                device,
+                template=ovo_text_template(bool(use_optimal_text_matching)),
+            )
+            progress.update()
+
+            progress.set_postfix_str("classify instances", refresh=True)
+            instance_classes, _semantic_instance_scores, semantic_ovo_diag = classify_instance_features_ovo_style(
+                clip_features,
+                metric_point_instance_labels,
+                ovo_text_embeds,
+                float(ovo_score_th),
+                int(chunk_size),
+                progress_desc="ovo instance pooling",
+                use_optimal_text_matching=bool(use_optimal_text_matching),
+            )
+            progress.update()
+
+            progress.set_postfix_str("transfer + ap", refresh=True)
+            transferred_instance_labels, instance_transfer_diag = transfer_instance_labels_ovo_style(
+                pred_points,
+                metric_point_instance_labels,
+                gt["points"],
+            )
+            if gt["instance_labels"] is None:
+                instance_metrics, instance_diag = None, None
+            else:
+                instance_metrics, instance_diag = compute_instance_metrics(
+                    gt["instance_labels"],
+                    gt_semantic,
+                    transferred_instance_labels,
+                    instance_classes,
+                    metric_instance_scores,
+                    dataset_info,
+                )
+                instance_diag = {
+                    **instance_diag,
+                    **instance_transfer_diag,
+                }
+            progress.update()
+
+            progress.set_postfix_str("write label video", refresh=True)
+            output_dir = self.cache.cache_dir / "debug_videos"
+            mode_tag = "optimal" if use_optimal_collapse else "normal"
+            output_name = (
+                f"{mode_tag}_collapse_frame_{int(self.current_frame_id):06d}"
+                f"_mincomp_{int(min_component_size)}.mp4"
+            )
+            instance_video_path = write_instance_label_video_from_cache(
+                self.cache.cache_dir,
+                metric_point_instance_labels,
+                gt_point_labels=gt_point_instance_labels,
+                output_path=output_dir / output_name,
+                title="Instance Labels",
+                subtitle_prefix="projected",
+                upto_frame=int(self.current_frame_id),
+            )
+            progress.update()
+        finally:
+            progress.close()
+
+        summary = {
+            "frame_id": int(self.current_frame_id),
+            "dataset_name": dataset_name,
+            "scene_name": scene_name,
+            "metrics": {
+                "instance": instance_metrics,
+            },
+            "diagnostics": {
+                "instance": instance_diag,
+                "semantic_ovo_style": semantic_ovo_diag,
+                "pred_instance_count": int(
+                    np.sum(np.unique(metric_point_instance_labels[metric_point_instance_labels >= 0]) >= 0)
+                ),
+                "min_component_size": int(min_component_size),
+                "ovo_score_th": float(ovo_score_th),
+                "use_optimal_text_matching": bool(use_optimal_text_matching),
+                "chunk_size": int(chunk_size),
+                "instance_video_label_source": "metric_point_instance_labels",
+                "instance_score_source": "seed_support_ratio",
+                **collapse_diag,
+            },
+        }
+        summary["instance_video_path"] = str(instance_video_path)
+        if save_json:
+            out_path = self.cache.cache_dir / f"debugger_metrics_frame_{int(self.current_frame_id):06d}.json"
+            with open(out_path, "w") as handle:
+                json.dump(summary, handle, indent=2)
+            summary["saved_path"] = str(out_path)
+        return summary
+
     @staticmethod
     def _annotate_mask_ids(image: np.ndarray, labels: np.ndarray) -> np.ndarray:
         canvas = np.asarray(image, dtype=np.uint8).copy()
@@ -884,10 +1198,12 @@ class CachedSAMInstanceDebugger:
                 raise ValueError(f"local_id={local_label} is not present in the current seed masks.")
         if gid is not None:
             gid_label = int(gid)
-            gid_labels = np.asarray(self.current_view["projected_after"], dtype=np.int32)
-            gid_mask = np.asarray(gid_labels == gid_label, dtype=bool)
+            gid_mask = self._project_gid_membership(
+                np.asarray(self.current_view["point_ids_after"], dtype=np.int64),
+                gid_label,
+            )
             if not gid_mask.any():
-                raise ValueError(f"gid={gid_label} is not present in the current projected map state.")
+                raise ValueError(f"gid={gid_label} is not present in the current visible raw gid memberships.")
 
         mask_shape = None
         if local_mask is not None:
@@ -1155,6 +1471,7 @@ def create_debugger_widget(debugger: CachedSAMInstanceDebugger):
     text_out = widgets.Output()
     frame_target = widgets.IntText(value=max(0, debugger.current_frame_id), description="frame")
     run_to_btn = widgets.Button(description="Run To")
+    run_all_btn = widgets.Button(description="Run All")
     step_btn = widgets.Button(description="Step")
     next_seed_btn = widgets.Button(description="Next Seed")
     reset_btn = widgets.Button(description="Reset")
@@ -1185,6 +1502,7 @@ def create_debugger_widget(debugger: CachedSAMInstanceDebugger):
 
     def set_busy(is_busy: bool, *, description: str = "Idle", value: int = 0, maximum: int = 1) -> None:
         run_to_btn.disabled = is_busy
+        run_all_btn.disabled = is_busy
         step_btn.disabled = is_busy
         next_seed_btn.disabled = is_busy
         reset_btn.disabled = is_busy
@@ -1231,6 +1549,14 @@ def create_debugger_widget(debugger: CachedSAMInstanceDebugger):
                 text_out.clear_output(wait=True)
                 display(HTML(f"<pre>{html.escape(str(exc))}</pre>"))
 
+    def on_run_all(_):
+        try:
+            run_to_target(debugger.total_frames - 1, description="Run All")
+        except Exception as exc:  # noqa: BLE001
+            with text_out:
+                text_out.clear_output(wait=True)
+                display(HTML(f"<pre>{html.escape(str(exc))}</pre>"))
+
     def on_next_seed(_):
         try:
             target = debugger.current_frame_id + 1
@@ -1252,12 +1578,13 @@ def create_debugger_widget(debugger: CachedSAMInstanceDebugger):
 
     step_btn.on_click(on_step)
     run_to_btn.on_click(on_run_to)
+    run_all_btn.on_click(on_run_all)
     next_seed_btn.on_click(on_next_seed)
     reset_btn.on_click(on_reset)
     for toggle in panel_toggles.values():
         toggle.observe(lambda change: refresh() if change["name"] == "value" else None, names="value")
 
-    controls = widgets.HBox([reset_btn, step_btn, next_seed_btn, frame_target, run_to_btn, progress])
+    controls = widgets.HBox([reset_btn, step_btn, next_seed_btn, frame_target, run_to_btn, run_all_btn, progress])
     toggles_row_1 = widgets.HBox([panel_toggles[key] for key, _ in panel_keys[:4]])
     toggles_row_2 = widgets.HBox([panel_toggles[key] for key, _ in panel_keys[4:]])
     panel = widgets.VBox([controls, status, toggles_row_1, toggles_row_2, image_out, text_out])

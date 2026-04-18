@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "thirdParty" / "
 
 INPUT_DIR = Path("data/input")
 SAM_SORT_MODE = "score"
-SAM_MIN_MASK_AREA_PERC = 0.01
+SAM_MIN_MASK_AREA_PERC = 0.001  # THIS IS EXTREME IMPACTING PERFORMANCE, should be configured carefully
 SAM_POINTS_PER_SIDE = 24
 SAM_POINTS_PER_BATCH = 128
 SAM_PRED_IOU_THRESH = 0.88

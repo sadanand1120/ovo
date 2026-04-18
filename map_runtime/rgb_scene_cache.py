@@ -9,6 +9,7 @@ import time
 import numpy as np
 import open3d as o3d
 import torch
+from tqdm.auto import tqdm
 
 from map_runtime import geometry
 from map_runtime.rgb_map_utils import (
@@ -460,12 +461,20 @@ def run_scene_cache_build(
         match_distance_th=match_distance_th,
     )
 
+    progress = tqdm(range(len(dataset)), desc=scene_name, unit="frame")
     frame_loop_start = time.perf_counter()
-    for frame_id in range(len(dataset)):
-        frame_data = dataset[frame_id]
-        estimated_c2w = get_tracked_pose(slam_backbone, frame_data)
-        frame_cache = builder.add_frame(frame_data, c2w_override=estimated_c2w)
-        write_frame_cache(output_dir, frame_cache)
+    try:
+        for frame_id in progress:
+            frame_data = dataset[frame_id]
+            estimated_c2w = get_tracked_pose(slam_backbone, frame_data)
+            frame_cache = builder.add_frame(frame_data, c2w_override=estimated_c2w)
+            write_frame_cache(output_dir, frame_cache)
+            progress.set_postfix(
+                points=builder.n_points,
+                refresh=False,
+            )
+    finally:
+        progress.close()
     frame_loop_sec = time.perf_counter() - frame_loop_start
 
     stats = build_run_stats(

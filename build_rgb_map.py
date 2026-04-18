@@ -43,6 +43,7 @@ from map_runtime.scene import (
 OUTPUT_DIR = Path("data/output/rgb_maps")
 TIMING_PATH = "timing.json"
 CLIP_FEATURE_FILE = "clip_feats.npy"
+INSTANCE_SUPPORT_FILE = "instance_seed_hits.npy"
 DEFAULT_MAP_EVERY = 8
 DEFAULT_POINT_SAMPLE_STRIDE = 2
 DEFAULT_MAX_FRAME_POINTS = 5_000_000
@@ -113,6 +114,12 @@ class SAM2InstanceManager:
 
     def num_existing_instances(self) -> int:
         return sum(1 for state in self.instances.values() if state["status"] != "dead")
+
+    def export_seed_hits(self) -> np.ndarray:
+        seed_hits = np.zeros((int(self.next_gid),), dtype=np.int32)
+        for gid, state in self.instances.items():
+            seed_hits[int(gid)] = int(state["seed_hits"])
+        return seed_hits
 
     def assign_new_points(self, gids: np.ndarray, frame_id: int) -> None:
         if gids.size == 0:
@@ -599,6 +606,7 @@ class RGBMapper:
             progress.set_postfix_str("instance labels", refresh=True)
             stage_start = time.perf_counter()
             np.save(output_dir / "instance_labels.npy", self.instance_manager.point_labels)
+            np.save(output_dir / INSTANCE_SUPPORT_FILE, self.instance_manager.export_seed_hits())
             timings["instance_labels_sec"] = time.perf_counter() - stage_start
             progress.update()
 
@@ -610,6 +618,7 @@ class RGBMapper:
                 "instance_supervision": "sam",
                 "textregion_supervision": "sam",
                 "instance_label_path": "instance_labels.npy",
+                "instance_support_path": INSTANCE_SUPPORT_FILE,
                 "clip_feature_path": CLIP_FEATURE_FILE,
                 "clip_feature_storage": "npy",
                 "rgb_normal_point_fusion": True,

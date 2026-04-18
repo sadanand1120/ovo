@@ -70,12 +70,47 @@ def average_precision_from_ranked_matches(tp: np.ndarray, fp: np.ndarray, num_gt
     return float(np.sum((recall[1:] - recall[:-1]) * precision[1:]))
 
 
+def finalize_instance_labels_and_scores(
+    raw_labels: np.ndarray,
+    raw_instance_scores: np.ndarray,
+    min_component_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    labels = np.asarray(raw_labels, dtype=np.int32).copy()
+    raw_instance_scores = np.asarray(raw_instance_scores, dtype=np.float32)
+    valid = labels >= 0
+    if valid.any() and int(min_component_size) > 1:
+        uniq, counts = np.unique(labels[valid], return_counts=True)
+        keep = uniq[counts >= int(min_component_size)]
+        labels[~np.isin(labels, keep)] = -1
+        valid = labels >= 0
+    if not valid.any():
+        return labels, np.empty((0,), dtype=np.float32)
+    unique_labels = np.unique(labels[valid]).astype(np.int64, copy=False)
+    if unique_labels[-1] >= raw_instance_scores.shape[0]:
+        raise ValueError(
+            f"raw_instance_scores has length {raw_instance_scores.shape[0]}, but labels contain id {int(unique_labels[-1])}."
+        )
+    relabeled_scores = raw_instance_scores[unique_labels].astype(np.float32, copy=False)
+    _, relabeled = np.unique(labels[valid], return_inverse=True)
+    labels[valid] = relabeled.astype(np.int32, copy=False)
+    return labels, relabeled_scores
+
+
 def compute_instance_ap_dataset(
     entries: list[dict],
     class_ids: np.ndarray,
     iou_thresholds: tuple[float, ...],
+    mean_ap_thresholds: tuple[float, ...] | None = None,
 ) -> tuple[dict, dict]:
     class_ids = np.asarray(class_ids, dtype=np.int32)
+    iou_thresholds = tuple(float(th) for th in iou_thresholds)
+    if mean_ap_thresholds is None:
+        mean_ap_thresholds = iou_thresholds
+    else:
+        mean_ap_thresholds = tuple(float(th) for th in mean_ap_thresholds)
+    missing_mean_thresholds = sorted(set(mean_ap_thresholds) - set(iou_thresholds))
+    if missing_mean_thresholds:
+        raise ValueError(f"mean_ap_thresholds must be a subset of iou_thresholds; missing={missing_mean_thresholds}")
     if class_ids.size == 0:
         metrics = {"ap": float("nan")}
         diagnostics = {"num_eval_classes": 0, "num_eval_entries": int(len(entries))}
@@ -134,7 +169,10 @@ def compute_instance_ap_dataset(
     for threshold in iou_thresholds:
         values = np.asarray(ap_by_threshold[float(threshold)], dtype=np.float64)
         metrics[f"ap_{int(round(threshold * 100)):02d}"] = float(values.mean()) if values.size > 0 else float("nan")
-    threshold_values = np.asarray(list(metrics.values()), dtype=np.float64)
+    threshold_values = np.asarray(
+        [metrics[f"ap_{int(round(threshold * 100)):02d}"] for threshold in mean_ap_thresholds],
+        dtype=np.float64,
+    )
     metrics["ap"] = float(np.nanmean(threshold_values)) if threshold_values.size > 0 else float("nan")
     diagnostics = {
         "num_eval_classes": int(len(num_gt_by_class)),

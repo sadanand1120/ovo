@@ -19,7 +19,6 @@ from get_metrics_map import (
     FEATURE_TEXT_TEMPLATE,
     INPUT_DIR,
     OVO_FEATURE_AGG,
-    OVO_TEXT_TEMPLATE,
     build_confusion,
     canonical_dataset_name,
     classify_instance_features_ovo_style,
@@ -29,6 +28,8 @@ from get_metrics_map import (
     load_gt,
     load_pred_map,
     map_gt_labels_to_eval_ids,
+    ovo_feature_agg_name,
+    ovo_text_template,
     round_for_print,
     transfer_semantic_labels_ovo_style,
 )
@@ -104,6 +105,7 @@ def evaluate_scene_ovo_style(
     ovo_score_th: float,
     chunk_size: int,
     min_component_size: int,
+    use_optimal_text_matching: bool,
     args: argparse.Namespace,
 ) -> tuple[dict, np.ndarray, dict]:
     from visualize_rgb_map import resolve_instance_labels
@@ -118,6 +120,7 @@ def evaluate_scene_ovo_style(
         text_embeds,
         ovo_score_th,
         chunk_size,
+        use_optimal_text_matching=bool(use_optimal_text_matching),
     )
     pred_semantic_labels, diag_2 = transfer_semantic_labels_ovo_style(
         pred["points"],
@@ -137,7 +140,11 @@ def run_dataset_ovo_style_eval(args: argparse.Namespace) -> None:
         dataset_info["ignore"] = dataset_info.get("ignore", []).copy() + dataset_info.get("background_reduced_ids", [])
     class_names = dataset_info.get("class_names_reduced", dataset_info.get("class_names"))
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    text_embeds = encode_class_texts(class_names, device, template=OVO_TEXT_TEMPLATE)
+    text_embeds = encode_class_texts(
+        class_names,
+        device,
+        template=ovo_text_template(bool(args.use_optimal_text_matching)),
+    )
     scenes = args.scenes or dataset_info["scenes"]
     per_scene_rows = []
     confusion_sum = np.zeros((dataset_info["num_classes"], dataset_info["num_classes"]), dtype=np.ulonglong)
@@ -166,6 +173,7 @@ def run_dataset_ovo_style_eval(args: argparse.Namespace) -> None:
             args.ovo_score_th,
             args.chunk_size,
             args.min_component_size,
+            bool(args.use_optimal_text_matching),
             args,
         )
         confusion_sum += confusion
@@ -192,9 +200,10 @@ def run_dataset_ovo_style_eval(args: argparse.Namespace) -> None:
         "dataset_name": canonical_dataset_name(dataset_name),
         "scenes": scenes,
         "ovo_score_th": float(args.ovo_score_th),
+        "use_optimal_text_matching": bool(args.use_optimal_text_matching),
         "feature_text_template": FEATURE_TEXT_TEMPLATE,
-        "ovo_text_template": OVO_TEXT_TEMPLATE,
-        "ovo_feature_agg": OVO_FEATURE_AGG,
+        "ovo_text_template": ovo_text_template(bool(args.use_optimal_text_matching)),
+        "ovo_feature_agg": ovo_feature_agg_name(bool(args.use_optimal_text_matching)),
         "min_component_size": int(args.min_component_size),
         "metrics_per_scene": per_scene_rows,
         "metrics_all": total_metrics,
@@ -236,6 +245,11 @@ def main() -> None:
     parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
     parser.add_argument("--ovo_score_th", type=float, default=DEFAULT_OVO_SCORE_TH)
+    parser.add_argument(
+        "--use_optimal_text_matching",
+        action="store_true",
+        help="For semantic OVO instance scoring, score each L2-normalized point against text first and then pool per-class scores over the instance.",
+    )
     parser.add_argument("--min_component_size", type=int, default=2000)
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--ignore_background", action="store_true")
