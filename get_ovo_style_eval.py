@@ -7,18 +7,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from build_rgb_map import (
-    DEFAULT_MAX_FRAME_POINTS,
-    DEFAULT_POINT_SAMPLE_STRIDE,
-    run_scene_build,
-)
+from build_rgb_map import run_scene_build
 from get_metrics_map import (
-    DEFAULT_CHUNK_SIZE,
-    DEFAULT_MATCH_DISTANCE_TH,
-    DEFAULT_OVO_SCORE_TH,
-    FEATURE_TEXT_TEMPLATE,
-    INPUT_DIR,
-    OVO_FEATURE_AGG,
     build_confusion,
     canonical_dataset_name,
     classify_instance_features_ovo_style,
@@ -33,9 +23,19 @@ from get_metrics_map import (
     round_for_print,
     transfer_semantic_labels_ovo_style,
 )
-
-OVO_EVAL_OUTPUT_DIR = Path("data/output/ovo_style_eval")
-PAPER_MAP_EVERY = 10
+from map_runtime.defaults import (
+    DEFAULT_CONFIG_PATH,
+    DEFAULT_EVAL_CHUNK_SIZE,
+    DEFAULT_MAP_EVERY,
+    DEFAULT_MATCH_DISTANCE_TH,
+    DEFAULT_MAX_TOTAL_POINTS,
+    DEFAULT_MIN_COMPONENT_SIZE,
+    DEFAULT_OVO_EVAL_OUTPUT_ROOT,
+    DEFAULT_OVO_SCORE_TH,
+    FEATURE_TEXT_TEMPLATE,
+    INPUT_DIR,
+    OVO_FEATURE_AGG,
+)
 
 
 def format_percent(value: float) -> str:
@@ -160,8 +160,7 @@ def run_dataset_ovo_style_eval(args: argparse.Namespace) -> None:
             disable_loop_closure=args.disable_loop_closure,
             config_path=args.config_path,
             map_every=args.map_every,
-            point_sample_stride=args.point_sample_stride,
-            max_frame_points=args.max_frame_points,
+            max_total_points=args.max_total_points,
             match_distance_th=args.match_distance_th,
         )
         metrics, confusion, diag = evaluate_scene_ovo_style(
@@ -232,17 +231,16 @@ def run_dataset_ovo_style_eval(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build scenes and report dataset-level OVO-style semantic metrics.")
     parser.add_argument("--dataset_name", required=True, choices=["Replica", "ScanNet"])
-    parser.add_argument("--output_root", default=str(OVO_EVAL_OUTPUT_DIR))
+    parser.add_argument("--output_root", default=str(DEFAULT_OVO_EVAL_OUTPUT_ROOT))
     parser.add_argument("--scannet_raw_root", default=None, help="ScanNet raw scans root containing aggregation and segs files.")
     parser.add_argument("--replica_root", default=None, help="Replica root containing semantic_gt/ and *_mesh.ply files. Defaults to data/input/Replica.")
     parser.add_argument("--frame_limit", type=int, default=None)
     parser.add_argument("--slam_module", type=str, default=None, help="Override slam backend, e.g. vanilla, orbslam, or cuvslam.")
     parser.add_argument("--disable_loop_closure", action="store_true", help="Disable ORB-SLAM loop closure/global BA updates by forcing slam.close_loops=false.")
-    parser.add_argument("--config_path", type=str, default="configs/ovo.yaml", help="Base runtime config file to load.")
+    parser.add_argument("--config_path", type=str, default=str(DEFAULT_CONFIG_PATH), help="Base runtime config file to load.")
     parser.add_argument("--scenes", nargs="*", default=None, help="Optional dataset-eval scene override. Defaults to the dataset scenes from the eval config.")
-    parser.add_argument("--map_every", type=int, default=PAPER_MAP_EVERY)
-    parser.add_argument("--point_sample_stride", type=int, default=DEFAULT_POINT_SAMPLE_STRIDE, help="Seed-frame point-sampling stride used during map construction.")
-    parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
+    parser.add_argument("--map_every", type=int, default=DEFAULT_MAP_EVERY)
+    parser.add_argument("--max_total_points", type=int, default=DEFAULT_MAX_TOTAL_POINTS)
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
     parser.add_argument("--ovo_score_th", type=float, default=DEFAULT_OVO_SCORE_TH)
     parser.add_argument(
@@ -250,8 +248,8 @@ def main() -> None:
         action="store_true",
         help="For semantic OVO instance scoring, score each L2-normalized point against text first and then pool per-class scores over the instance.",
     )
-    parser.add_argument("--min_component_size", type=int, default=2000)
-    parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
+    parser.add_argument("--min_component_size", type=int, default=DEFAULT_MIN_COMPONENT_SIZE)
+    parser.add_argument("--chunk_size", type=int, default=DEFAULT_EVAL_CHUNK_SIZE)
     parser.add_argument("--ignore_background", action="store_true")
     parser.add_argument("--save_json", action="store_true")
     run_dataset_ovo_style_eval(parser.parse_args())

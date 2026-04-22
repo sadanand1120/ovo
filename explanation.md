@@ -15,7 +15,7 @@ Important: this explanation is for the current cleaned repo state:
 
 The effective defaults come from three places:
 
-- map-build knobs such as `map_every`, `point_sample_stride`, `match_distance_th`, and `max_frame_points` come from the CLI defaults in `build_rgb_map.py`
+- map-build knobs such as `map_every`, `match_distance_th`, and `max_total_points` come from the CLI defaults in `build_rgb_map.py`
 - pose-backend defaults come from `configs/ovo.yaml`
 - SAM/SAM2 defaults live down in the runtime wrappers:
   - `map_runtime/sam_masks.py`
@@ -25,17 +25,15 @@ So for your command, the effective defaults are:
 
 - pose backend: `vanilla`
 - `map_every = 8`
-- `point_sample_stride = 2`
 - `match_distance_th = 0.03` meters
-- `max_frame_points = 5_000_000`
+- `max_total_points = 10_000_000`
 - seed instance extractor: SAM/SAM2 AMG at level `24`
 - textregion extractor: same level `24`
 - SAM2 tracker level: `24`
 
 Important semantic point:
 
-- `point_sample_stride` does **not** resize the dataset stream, the SAM input, or the CLIP input globally
-- it only stride-samples the seed-frame geometry/fusion tensors right before normal estimation, RGB fusion, new-point insertion, and point-level instance attachment
+- the mapper uses the full-resolution seed-frame geometry/fusion tensors right before normal estimation, RGB fusion, new-point insertion, and point-level instance attachment
 
 Under the default `ScanNet` + `vanilla` path:
 
@@ -177,15 +175,14 @@ When a new point is appended on a seed frame:
 
 ### How existing point colors are updated
 
-Existing point colors are updated **only on seed frames**, and only for stride-sampled matched pixels whose normals are valid.
+Existing point colors are updated **only on seed frames**, and only for matched pixels whose normals are valid.
 
 The relevant set is:
 
 - `visible_existing = (point_ids_sampled >= 0) & normal_valid`
 
-So even if a point matched geometrically at full resolution, it only contributes to RGB fusion if:
+So even if a point matched geometrically, it only contributes to RGB fusion if:
 
-- that match survives the `point_sample_stride = 2` sampling
 - a valid normal could be computed there
 
 For every such visible sampled point:
@@ -347,7 +344,7 @@ So by default, the dense CLIP regions are derived from the **same SAM segmentati
 
 This happens only on seed frames.
 
-`point_sample_stride` does not change the CLIP extractor resolution. CLIP still runs on the full mapper RGB frame and only the final point birth pixels are stride-sampled.
+CLIP still runs on the full mapper RGB frame, and the final point birth pixels come from the full-resolution kept geometry mask.
 
 Given the current mapper RGB image:
 

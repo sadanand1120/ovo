@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict
 import html
 import json
+import pickle
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -14,10 +15,10 @@ import torch
 from tqdm.auto import tqdm
 
 from map_runtime.debug_panels import color_for_id, compose_instance_debug_grid, overlay_header, render_sorted_label_map
+from map_runtime.defaults import CACHE_MANIFEST_FILE, CLIP_FEATURE_FILE, FRAME_CACHE_DIR, POINT_BIRTH_FRAME_FILE
 from map_runtime.instance_label_video import write_instance_label_video_from_cache
-from map_runtime.rgb_scene_cache import CACHE_MANIFEST_FILE, CLIP_FEATURE_FILE, FRAME_CACHE_DIR
 from map_runtime.sam2_tracking import SAM2VideoTracker, build_label_masks
-from map_runtime.sam_instance_runtime import SAMInstanceRuntime, SAMInstanceRuntimeConfig
+from map_runtime.sam_instance_runtime import InstanceBucket, SAMInstanceRuntime, SAMInstanceRuntimeConfig
 
 
 class SceneCache:
@@ -29,6 +30,8 @@ class SceneCache:
         self.n_points = int(self.manifest["n_points"])
         self.map_every = int(self.manifest["map_every"])
         self.frame_cache_dir = self.cache_dir / self.manifest.get("frame_cache_dir", FRAME_CACHE_DIR)
+        point_birth_frame_path = self.cache_dir / self.manifest.get("point_birth_frame_path", POINT_BIRTH_FRAME_FILE)
+        self.point_birth_frame = np.load(point_birth_frame_path, mmap_mode="r")
 
     def load_frame(self, frame_id: int) -> dict[str, Any]:
         cache_path = self.frame_cache_dir / f"{int(frame_id):06d}.npz"
@@ -43,7 +46,46 @@ class SceneCache:
                 "point_ids_before": np.array(data["point_ids_before"], copy=True),
                 "point_ids_after": np.array(data["point_ids_after"], copy=True),
                 "new_point_mask": np.array(data["new_point_mask"], copy=True),
+                "filter_depth_mask": np.array(data["filter_depth_mask"], copy=True),
+                "filter_unmatched_mask": np.array(data["filter_unmatched_mask"], copy=True),
+                "filter_normal_mask": np.array(data["filter_normal_mask"], copy=True),
             }
+
+
+DEBUG_INSTANCE_CACHE_DIR = "cache_instances"
+DEBUG_INSTANCE_CACHE_FILE = "full_state.pkl"
+
+
+def _debug_render_matplotlib_figure(fig) -> np.ndarray:
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    width, height = canvas.get_width_height()
+    buffer = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8).reshape(height, width, 4)
+    return np.ascontiguousarray(buffer[:, :, :3])
+
+
+def _debug_write_video_frames(frames: list[np.ndarray], output_path: Path, fps: float) -> Path:
+    if not frames:
+        raise ValueError("No frames were provided for debug video export.")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        output_path.unlink()
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (int(frames[0].shape[1]), int(frames[0].shape[0])),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open video writer for {output_path}")
+    try:
+        for frame in frames:
+            writer.write(cv2.cvtColor(np.asarray(frame, dtype=np.uint8), cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+    return output_path
 
 
 class CachedSAMInstanceDebugger(SAMInstanceRuntime):
@@ -66,10 +108,20 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
 
     def reset(self, *, n_points: int | None = None) -> None:
         super().reset(n_points=self.cache.n_points if n_points is None else int(n_points))
+        if not hasattr(self, "_debug_map_xyz"):
+            self._debug_map_xyz: np.ndarray | None = None
+        if not hasattr(self, "_debug_map_rgb"):
+            self._debug_map_rgb: np.ndarray | None = None
         self.last_seed_labels: np.ndarray | None = None
         self.last_seed_frame_id = -1
         self.current_view: dict[str, Any] | None = None
         self.history: list[dict[str, Any]] = []
+        self.debug_timeline_snapshots: list[dict[str, Any]] = []
+        self.debug_gid_stats: dict[int, dict[str, Any]] = {}
+        self.debug_last_gt_selection_summary: dict[str, Any] | None = None
+        self.debug_last_plots_videos_summary: dict[str, Any] | None = None
+        self.debug_last_learned_collapse_summary: dict[str, Any] | None = None
+        self.debug_last_learned_fit_frame_id: int | None = None
 
     def _summarize_frame(self, view: dict[str, Any]) -> None:
         self.history.append(
@@ -83,6 +135,123 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
                 "decision_count": int(len(view["decisions"])),
             }
         )
+
+    def _debug_instance_cache_dir(self) -> Path:
+        return self.cache.cache_dir / DEBUG_INSTANCE_CACHE_DIR
+
+    def _debug_instance_cache_path(self) -> Path:
+        return self._debug_instance_cache_dir() / DEBUG_INSTANCE_CACHE_FILE
+
+    def _debug_optimal_metric_gid_labels_path(self, *, frame_id: int | None = None, min_component_size: int) -> Path:
+        target_frame = int(self.current_frame_id if frame_id is None else frame_id)
+        return (
+            self._debug_instance_cache_dir()
+            / f"debug_optimal_metric_gid_labels_frame_{target_frame:06d}_mincomp_{int(min_component_size)}.npy"
+        )
+
+    def _debug_collect_timeline_snapshot(self) -> dict[str, Any]:
+        frame_id = int(self.current_frame_id)
+        num_seed_frames = int(self._num_seed_frames_processed())
+        current_map_points = int(self._debug_current_map_points(frame_id))
+        bucket_ids = sorted(int(gid) for gid in self.buckets)
+        if current_map_points > 0:
+            point_perc = np.asarray(
+                [100.0 * float(self.buckets[gid].point_count) / float(current_map_points) for gid in bucket_ids],
+                dtype=np.float32,
+            )
+        else:
+            point_perc = np.empty((0,), dtype=np.float32)
+        if num_seed_frames > 0:
+            support_perc = np.asarray(
+                [100.0 * float(self.buckets[gid].support_frames) / float(num_seed_frames) for gid in bucket_ids],
+                dtype=np.float32,
+            )
+        else:
+            support_perc = np.empty((0,), dtype=np.float32)
+        return {
+            "frame_id": frame_id,
+            "num_seed_frames": num_seed_frames,
+            "current_map_points": current_map_points,
+            "num_gids": int(len(bucket_ids)),
+            "bucket_ids": bucket_ids,
+            "point_perc": point_perc,
+            "support_perc": support_perc,
+        }
+
+    def _debug_export_instance_cache_payload(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "frame_id": int(self.current_frame_id),
+            "next_gid": int(self.next_gid),
+            "tracker_frame_idx": int(self.tracker_frame_idx),
+            "point_gids": np.array(self.point_gids, copy=True),
+            "buckets": [asdict(self.buckets[gid]) for gid in sorted(self.buckets)],
+            "seeded_gids": sorted(int(gid) for gid in self.seeded_gids),
+            "debug_support_seed_ordinals_by_gid": {
+                int(gid): [int(v) for v in values]
+                for gid, values in self.debug_support_seed_ordinals_by_gid.items()
+            },
+            "debug_birth_seed_ordinal_by_gid": {
+                int(gid): int(value)
+                for gid, value in self.debug_birth_seed_ordinal_by_gid.items()
+            },
+            "last_seed_labels": None if self.last_seed_labels is None else np.array(self.last_seed_labels, copy=True),
+            "last_seed_frame_id": int(self.last_seed_frame_id),
+            "current_view": self.current_view,
+            "history": list(self.history),
+            "debug_timeline_snapshots": list(self.debug_timeline_snapshots),
+            "debug_gid_stats": dict(self.debug_gid_stats),
+            "debug_last_gt_selection_summary": self.debug_last_gt_selection_summary,
+            "debug_last_plots_videos_summary": self.debug_last_plots_videos_summary,
+        }
+
+    def _debug_save_instance_cache(self) -> Path:
+        cache_dir = self._debug_instance_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = self._debug_instance_cache_path()
+        with open(cache_path, "wb") as handle:
+            pickle.dump(self._debug_export_instance_cache_payload(), handle, protocol=pickle.HIGHEST_PROTOCOL)
+        return cache_path
+
+    def _debug_apply_instance_cache_payload(self, payload: dict[str, Any]) -> None:
+        self.point_gids = np.asarray(payload["point_gids"], dtype=np.int32)
+        self.buckets = {
+            int(entry["gid"]): InstanceBucket(**entry)
+            for entry in payload["buckets"]
+        }
+        self.next_gid = int(payload["next_gid"])
+        self.tracker_frame_idx = int(payload["tracker_frame_idx"])
+        self.current_frame_id = int(payload["frame_id"])
+        self.seeded_gids = {int(gid) for gid in payload["seeded_gids"]}
+        self.debug_support_seed_ordinals_by_gid = {
+            int(gid): [int(v) for v in values]
+            for gid, values in payload["debug_support_seed_ordinals_by_gid"].items()
+        }
+        self.debug_birth_seed_ordinal_by_gid = {
+            int(gid): int(value)
+            for gid, value in payload["debug_birth_seed_ordinal_by_gid"].items()
+        }
+        self.last_seed_labels = None if payload["last_seed_labels"] is None else np.asarray(payload["last_seed_labels"], dtype=np.int32)
+        self.last_seed_frame_id = int(payload["last_seed_frame_id"])
+        self.current_view = payload["current_view"]
+        self.history = list(payload["history"])
+        self.debug_timeline_snapshots = list(payload.get("debug_timeline_snapshots", []))
+        self.debug_gid_stats = dict(payload.get("debug_gid_stats", {}))
+        self.debug_last_gt_selection_summary = payload.get("debug_last_gt_selection_summary")
+        self.debug_last_plots_videos_summary = payload.get("debug_last_plots_videos_summary")
+        self.debug_last_learned_collapse_summary = None
+        self.debug_last_learned_fit_frame_id = None
+        self._refresh_gid_scores()
+
+    def _debug_load_instance_cache(self) -> bool:
+        cache_path = self._debug_instance_cache_path()
+        if not cache_path.exists():
+            return False
+        with open(cache_path, "rb") as handle:
+            payload = pickle.load(handle)
+        self.reset()
+        self._debug_apply_instance_cache_payload(payload)
+        return True
 
     def step(self) -> dict[str, Any]:
         next_frame_id = int(self.current_frame_id + 1)
@@ -134,6 +303,9 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
             "last_seed_labels": None if self.last_seed_labels is None else np.array(self.last_seed_labels, copy=True),
             "last_seed_frame_id": int(self.last_seed_frame_id),
             "new_point_mask": frame["new_point_mask"],
+            "filter_depth_mask": frame["filter_depth_mask"],
+            "filter_unmatched_mask": frame["filter_unmatched_mask"],
+            "filter_normal_mask": frame["filter_normal_mask"],
             "decisions": [asdict(decision) for decision in decisions],
             "pruned_gids": [int(gid) for gid in pruned_gids],
             "bucket_snapshot_before": bucket_snapshot_before,
@@ -159,6 +331,39 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
             self.step()
         if self.current_view is None:
             raise RuntimeError("Debugger did not produce a current view.")
+        return self.current_view
+
+    def run_all(self, upto: int = -1, *, progress_desc: str = "run_all") -> dict[str, Any]:
+        upto = int(upto)
+        target_frame = self.total_frames - 1 if upto == -1 else upto
+        if target_frame < 0 or target_frame >= self.total_frames:
+            raise ValueError(f"upto must be -1 or in [0, {self.total_frames - 1}]")
+        if target_frame == self.total_frames - 1 and self._debug_load_instance_cache():
+            if self.current_view is None:
+                raise RuntimeError("Loaded instance cache but current_view is missing.")
+            return self.current_view
+        if target_frame < self.current_frame_id:
+            self.reset()
+        if target_frame == self.total_frames - 1:
+            self.debug_timeline_snapshots = []
+        progress = tqdm(
+            range(self.current_frame_id + 1, target_frame + 1),
+            desc=progress_desc,
+            unit="frame",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        try:
+            for _ in progress:
+                self.step()
+                if target_frame == self.total_frames - 1:
+                    self.debug_timeline_snapshots.append(self._debug_collect_timeline_snapshot())
+        finally:
+            progress.close()
+        if self.current_view is None:
+            raise RuntimeError("Debugger did not produce a current view.")
+        if target_frame == self.total_frames - 1:
+            self._debug_save_instance_cache()
         return self.current_view
 
     def next_seed_frame(self) -> dict[str, Any]:
@@ -205,6 +410,10 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
             current_point_mask=current_point_mask,
             new_point_subtitle=f"is_seed={self.current_view['is_seed_frame']}",
             current_point_subtitle=f"is_seed={self.current_view['is_seed_frame']}",
+            depth=self.current_view["depth"],
+            filter_depth_mask=self.current_view["filter_depth_mask"],
+            filter_unmatched_mask=self.current_view["filter_unmatched_mask"],
+            filter_normal_mask=self.current_view["filter_normal_mask"],
             enabled_panels=enabled_panels,
         )
 
@@ -364,6 +573,692 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
             pass
         return output_path
 
+    def _debug_current_map_points(self, frame_id: int) -> int:
+        return int(np.searchsorted(self.cache.point_birth_frame, int(frame_id), side="right"))
+
+    @staticmethod
+    def _debug_filter_metric_gid_labels(
+        metric_gid_labels: np.ndarray,
+        min_component_size: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        filtered_labels = np.asarray(metric_gid_labels, dtype=np.int32).copy()
+        valid = filtered_labels >= 0
+        if valid.any() and int(min_component_size) > 1:
+            uniq, counts = np.unique(filtered_labels[valid], return_counts=True)
+            keep = uniq[counts >= int(min_component_size)]
+            filtered_labels[~np.isin(filtered_labels, keep)] = -1
+            valid = filtered_labels >= 0
+        surviving_gids = np.unique(filtered_labels[valid]).astype(np.int32, copy=False) if valid.any() else np.empty((0,), dtype=np.int32)
+        return filtered_labels, surviving_gids
+
+    def _debug_resolve_optimal_selected_gids(
+        self,
+        *,
+        scannet_raw_root: str | Path | None,
+        replica_root: str | Path | None,
+        min_component_size: int,
+        progress_desc: str | None = None,
+    ) -> dict[str, Any]:
+        from get_metrics_map import compute_nn_associations, load_gt
+
+        dataset_name = str(self.cache.manifest["dataset_name"])
+        scene_name = str(self.cache.manifest["scene_name"])
+        expected_scannet_root = None if scannet_raw_root is None else str(scannet_raw_root)
+        expected_replica_root = None if replica_root is None else str(replica_root)
+        metric_gid_labels_path = self._debug_optimal_metric_gid_labels_path(min_component_size=int(min_component_size))
+        cached = self.debug_last_gt_selection_summary
+        if (
+            isinstance(cached, dict)
+            and int(cached.get("frame_id", -1)) == int(self.current_frame_id)
+            and int(cached.get("min_component_size", -1)) == int(min_component_size)
+            and cached.get("scannet_raw_root") == expected_scannet_root
+            and cached.get("replica_root") == expected_replica_root
+            and "selected_gids" in cached
+            and cached.get("filtered_metric_gid_labels_path") == str(metric_gid_labels_path)
+            and metric_gid_labels_path.exists()
+        ):
+            return {
+                **cached,
+                "selected_gids": {int(gid) for gid in cached["selected_gids"]},
+                "surviving_gids": [int(gid) for gid in cached.get("surviving_gids", [])],
+            }
+        eval_args = SimpleNamespace(
+            scannet_raw_root=expected_scannet_root,
+            replica_root=expected_replica_root,
+        )
+        stage_desc = "resolve_gt_selection" if progress_desc is None else str(progress_desc)
+        progress = tqdm(total=5, desc=stage_desc, unit="stage", leave=False, dynamic_ncols=True)
+        try:
+            progress.set_postfix_str("load gt", refresh=True)
+            gt = load_gt(dataset_name, scene_name, eval_args)
+            progress.update()
+            if gt["instance_labels"] is None:
+                raise RuntimeError(f"{dataset_name}/{scene_name} does not expose GT instance labels needed for GT selection.")
+
+            progress.set_postfix_str("load map", refresh=True)
+            ply_path = self.cache.cache_dir / "rgb_map.ply"
+            vertex = PlyData.read(str(ply_path))["vertex"].data
+            pred_points = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=1).astype(np.float32)
+            progress.update()
+            if pred_points.shape[0] != self.point_gids.shape[0]:
+                raise ValueError(
+                    f"Point-count mismatch between debugger state and rgb_map.ply: {self.point_gids.shape[0]} vs {pred_points.shape[0]}"
+                )
+
+            progress.set_postfix_str("build/query kd-tree", refresh=True)
+            assoc = compute_nn_associations(gt["points"], pred_points)
+            pred_to_gt_idx = assoc["pred_to_gt_idx"]
+            progress.update()
+
+            progress.set_postfix_str("optimal collapse", refresh=True)
+            metric_gid_labels, collapse_diag = self._resolve_metric_instance_gid_labels(
+                collapse_mode="optimal",
+                pred_to_gt_idx=pred_to_gt_idx,
+                gt_instance_labels=gt["instance_labels"],
+                progress_desc=f"{stage_desc}: optimal collapse",
+            )
+            filtered_metric_gid_labels, surviving_gids = self._debug_filter_metric_gid_labels(metric_gid_labels, int(min_component_size))
+            progress.update()
+
+            progress.set_postfix_str("transfer 5-nn", refresh=True)
+            from get_metrics_map import transfer_instance_labels_ovo_style
+
+            transferred_gids, transfer_diag = transfer_instance_labels_ovo_style(
+                pred_points,
+                filtered_metric_gid_labels,
+                gt["points"],
+            )
+            gt_valid = np.asarray(gt["instance_labels"], dtype=np.int32) >= 0
+            selected_gids = np.unique(transferred_gids[gt_valid]).astype(np.int32, copy=False)
+            selected_gids = selected_gids[selected_gids >= 0]
+            progress.update()
+        finally:
+            progress.close()
+        metric_gid_labels_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(metric_gid_labels_path, filtered_metric_gid_labels.astype(np.int32, copy=False))
+        summary = {
+            "frame_id": int(self.current_frame_id),
+            "min_component_size": int(min_component_size),
+            "scannet_raw_root": expected_scannet_root,
+            "replica_root": expected_replica_root,
+            "selected_gids": sorted(int(gid) for gid in selected_gids.tolist()),
+            "surviving_gids": [int(gid) for gid in surviving_gids.tolist()],
+            "filtered_metric_gid_labels_path": str(metric_gid_labels_path),
+            "collapse_diag": collapse_diag,
+            "transfer_diag": transfer_diag,
+        }
+        self.debug_last_gt_selection_summary = summary
+        self._debug_save_instance_cache()
+        return {
+            **summary,
+            "selected_gids": {int(gid) for gid in summary["selected_gids"]},
+        }
+
+    def _debug_render_binary_signal_frame(
+        self,
+        *,
+        gid_stats: dict[str, Any],
+    ) -> np.ndarray:
+        from matplotlib.figure import Figure
+
+        gid = int(gid_stats["gid"])
+        selected = bool(gid_stats["selected"])
+        total_seed_frames = int(gid_stats["total_seed_frames"])
+        birth_seed_ordinal = int(gid_stats["birth_seed_ordinal"])
+        support_ordinals_arr = np.asarray(gid_stats["support_seed_ordinals"], dtype=np.int32)
+        signal_arr = np.asarray(gid_stats["binary_signal"], dtype=np.float32)
+        fig = Figure(figsize=(10, 4.5), dpi=160)
+        ax = fig.add_subplot(111)
+        x = np.arange(1, int(total_seed_frames) + 1, dtype=np.int32)
+        y = np.full((int(total_seed_frames),), np.nan, dtype=np.float32)
+        if birth_seed_ordinal <= total_seed_frames:
+            y[birth_seed_ordinal - 1 :] = signal_arr
+        color = "#1b7f3b" if selected else "#b22222"
+        ax.plot(x, y, color=color, linewidth=2.5, drawstyle="steps-post")
+        if support_ordinals_arr.size > 0:
+            ax.scatter(support_ordinals_arr, np.ones_like(support_ordinals_arr), color=color, s=28, zorder=3)
+        ax.axvline(birth_seed_ordinal, color="#444444", linestyle="--", linewidth=1.5)
+        ax.set_xlim(1, max(1, int(total_seed_frames)))
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_xlabel("Seed frame ordinal")
+        ax.set_ylabel("Support signal")
+        ax.set_yticks([0, 1])
+        bucket = self.buckets[int(gid)]
+        final_support_ratio = float(gid_stats["support_perc"])
+        ax.set_title(
+            f"gid={int(gid)} | selected={bool(selected)} | birth_seed={birth_seed_ordinal} | "
+            f"support_frames={int(bucket.support_frames)} | support%={final_support_ratio:.3f}"
+        )
+        ax.grid(True, axis="both", alpha=0.25)
+        info_lines = [
+            f"birth_frame={int(bucket.birth_frame)}",
+            f"last_support_frame={int(bucket.last_support_frame)}",
+            f"point_count_final={int(bucket.point_count)}",
+            f"n00={int(gid_stats['n00'])} n01={int(gid_stats['n01'])}",
+            f"n10={int(gid_stats['n10'])} n11={int(gid_stats['n11'])}",
+            f"support_ordinals={support_ordinals_arr.tolist()}",
+        ]
+        ax.text(
+            0.995,
+            0.02,
+            "\n".join(info_lines),
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=9,
+            bbox={"facecolor": "white", "alpha": 0.9, "edgecolor": "#666666"},
+        )
+        fig.tight_layout()
+        frame = _debug_render_matplotlib_figure(fig)
+        fig.clear()
+        return frame
+
+    def get_gid_stats(self, gid: int | None = None) -> dict[int, dict[str, Any]] | dict[str, Any]:
+        if not self.debug_gid_stats:
+            raise RuntimeError("No gid stats available yet. Run plots_videos() first.")
+        if gid is None:
+            return {int(k): dict(v) for k, v in self.debug_gid_stats.items()}
+        gid = int(gid)
+        if gid not in self.debug_gid_stats:
+            raise KeyError(f"gid={gid} is not present in debug_gid_stats.")
+        return dict(self.debug_gid_stats[gid])
+
+    def _debug_get_map_geometry(self) -> tuple[np.ndarray, np.ndarray]:
+        if self._debug_map_xyz is None or self._debug_map_rgb is None:
+            ply_path = self.cache.cache_dir / "rgb_map.ply"
+            vertex = PlyData.read(str(ply_path))["vertex"].data
+            xyz = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=1).astype(np.float32)
+            rgb = np.stack([vertex["red"], vertex["green"], vertex["blue"]], axis=1).astype(np.uint8)
+            if xyz.shape[0] != self.point_gids.shape[0]:
+                raise ValueError(
+                    f"Point-count mismatch between debugger state and rgb_map.ply: {self.point_gids.shape[0]} vs {xyz.shape[0]}"
+                )
+            self._debug_map_xyz = xyz
+            self._debug_map_rgb = rgb
+        return self._debug_map_xyz, self._debug_map_rgb
+
+    def _debug_load_gt_points(
+        self,
+        *,
+        scannet_raw_root: str | Path | None = None,
+        replica_root: str | Path | None = None,
+    ) -> dict[str, Any]:
+        dataset_name = str(self.cache.manifest["dataset_name"])
+        scene_name = str(self.cache.manifest["scene_name"])
+        scannet_key = None if scannet_raw_root is None else str(scannet_raw_root)
+        replica_key = None if replica_root is None else str(replica_root)
+        cache_key = (dataset_name, scene_name, scannet_key, replica_key)
+        if not hasattr(self, "_debug_gt_cache"):
+            self._debug_gt_cache: dict[tuple[str, str, str | None, str | None], dict[str, Any]] = {}
+        cached = self._debug_gt_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        from get_metrics_map import load_gt
+
+        gt = load_gt(
+            dataset_name,
+            scene_name,
+            SimpleNamespace(
+                scannet_raw_root=scannet_key,
+                replica_root=replica_key,
+            ),
+        )
+        self._debug_gt_cache[cache_key] = gt
+        return gt
+
+    @staticmethod
+    def _debug_rgb_strings(rgb_values: np.ndarray) -> list[str]:
+        return [f"rgb({int(r)},{int(g)},{int(b)})" for r, g, b in rgb_values.tolist()]
+
+    def threedshow(
+        self,
+        *,
+        gid: int | None = None,
+        gt_id: int | None = None,
+        scannet_raw_root: str | Path | None = None,
+        replica_root: str | Path | None = None,
+        max_background_points: int | None = 250_000,
+    ):
+        if gid is None and gt_id is None:
+            raise ValueError("Pass gid=... and/or gt_id=... to threedshow().")
+
+        xyz, rgb = self._debug_get_map_geometry()
+        total_points = int(xyz.shape[0])
+        background_idx = np.arange(total_points, dtype=np.int64)
+        sampled_background = False
+        if max_background_points is not None and total_points > int(max_background_points):
+            stride = int(np.ceil(float(total_points) / float(int(max_background_points))))
+            background_idx = background_idx[::stride]
+            sampled_background = True
+
+        import plotly.graph_objects as go
+        from IPython.display import display
+
+        traces: list[go.Scatter3d] = [
+            go.Scatter3d(
+                x=xyz[background_idx, 0],
+                y=xyz[background_idx, 1],
+                z=xyz[background_idx, 2],
+                mode="markers",
+                name=(
+                    f"rgb map ({int(background_idx.size):,}/{total_points:,} pts)"
+                    if sampled_background
+                    else f"rgb map ({total_points:,} pts)"
+                ),
+                marker={
+                    "size": 1.2,
+                    "color": self._debug_rgb_strings(rgb[background_idx]),
+                    "opacity": 0.24,
+                },
+                hoverinfo="skip",
+            )
+        ]
+
+        title_parts: list[str] = []
+        if gid is not None:
+            gid = int(gid)
+            gid_mask = np.any(self.point_gids == gid, axis=1)
+            gid_idx = np.flatnonzero(gid_mask)
+            if gid_idx.size == 0:
+                raise ValueError(f"gid={gid} is not present in the current map state.")
+            gid_color = tuple(int(v) for v in color_for_id(gid).tolist())
+            traces.append(
+                go.Scatter3d(
+                    x=xyz[gid_idx, 0],
+                    y=xyz[gid_idx, 1],
+                    z=xyz[gid_idx, 2],
+                    mode="markers",
+                    name=f"pred gid={gid} ({gid_idx.size:,} pts)",
+                    marker={
+                        "size": 2.8,
+                        "color": f"rgb({gid_color[0]},{gid_color[1]},{gid_color[2]})",
+                        "opacity": 0.95,
+                    },
+                    customdata=np.stack([gid_idx], axis=1),
+                    hovertemplate="pred gid=%{fullData.name}<br>point_id=%{customdata[0]}<extra></extra>",
+                )
+            )
+            title_parts.append(f"gid={gid}")
+
+        if gt_id is not None:
+            gt_id = int(gt_id)
+            gt = self._debug_load_gt_points(
+                scannet_raw_root=scannet_raw_root,
+                replica_root=replica_root,
+            )
+            gt_instance_labels = gt.get("instance_labels")
+            if gt_instance_labels is None:
+                raise RuntimeError("GT instance labels are not available for this dataset.")
+            gt_instance_labels = np.asarray(gt_instance_labels, dtype=np.int32)
+            gt_mask = gt_instance_labels == gt_id
+            gt_idx = np.flatnonzero(gt_mask)
+            if gt_idx.size == 0:
+                raise ValueError(f"gt_id={gt_id} is not present in the GT instance labels.")
+            gt_points = np.asarray(gt["points"], dtype=np.float32)
+            traces.append(
+                go.Scatter3d(
+                    x=gt_points[gt_idx, 0],
+                    y=gt_points[gt_idx, 1],
+                    z=gt_points[gt_idx, 2],
+                    mode="markers",
+                    name=f"gt_id={gt_id} ({gt_idx.size:,} pts)",
+                    marker={
+                        "size": 2.8,
+                        "color": "rgb(255,0,255)",
+                        "opacity": 0.95,
+                    },
+                    customdata=np.stack([gt_idx], axis=1),
+                    hovertemplate="gt_id=%{fullData.name}<br>gt_point_id=%{customdata[0]}<extra></extra>",
+                )
+            )
+            title_parts.append(f"gt_id={gt_id}")
+
+        fig = go.Figure(data=traces)
+        fig.update_layout(
+            title=" | ".join(title_parts),
+            showlegend=True,
+            legend={"title": {"text": "Highlights"}},
+            margin={"l": 0, "r": 0, "b": 0, "t": 40},
+            scene={
+                "aspectmode": "data",
+                "xaxis": {"visible": False},
+                "yaxis": {"visible": False},
+                "zaxis": {"visible": False},
+            },
+        )
+        display(fig)
+        return None
+
+    def fit(
+        self,
+        *,
+        scannet_raw_root: str | Path | None = None,
+        replica_root: str | Path | None = None,
+        min_component_size: int = 2000,
+        embed_dim: int = 8,
+        num_layers: int = 2,
+        epochs: int = 2000,
+        pruning_thresh: float = 0.6,
+        loss_mode: str = "wbce",
+        focal_gamma: float = 2.0,
+        plot_every: int = 25,
+        show_progress: bool = True,
+    ) -> dict[str, Any]:
+        if self.current_frame_id < 0:
+            raise RuntimeError("Run step() or seek() before calling fit().")
+        selection_info = self._debug_resolve_optimal_selected_gids(
+            scannet_raw_root=scannet_raw_root,
+            replica_root=replica_root,
+            min_component_size=int(min_component_size),
+            progress_desc="fit resolve_gt_selection",
+        )
+        diagnostics = self._fit_learned_gid_selector(
+            selected_gids=selection_info["selected_gids"],
+            embed_dim=int(embed_dim),
+            num_layers=int(num_layers),
+            epochs=int(epochs),
+            pruning_thresh=float(pruning_thresh),
+            loss_mode=str(loss_mode),
+            focal_gamma=float(focal_gamma),
+            plot_every=int(plot_every),
+            show_training_plot=bool(show_progress),
+        )
+        self.debug_gid_stats = self._debug_build_gid_stats(selected_gids=selection_info["selected_gids"])
+        self.debug_last_learned_collapse_summary = {
+            **diagnostics,
+            "target_selected_gids": sorted(int(gid) for gid in selection_info["selected_gids"]),
+            "min_component_size": int(min_component_size),
+        }
+        self.debug_last_learned_fit_frame_id = int(self.current_frame_id)
+        compact_keys = [
+            "learned_num_gids",
+            "learned_num_selected",
+            "learned_num_rejected",
+            "learned_embed_dim",
+            "learned_num_layers",
+            "learned_epochs",
+            "learned_pruning_thresh",
+            "learned_loss_mode",
+            "learned_focal_alpha",
+            "learned_focal_gamma",
+            "learned_plot_every",
+            "learned_pos_weight",
+            "learned_train_loss_final",
+            "learned_train_acc_final",
+            "learned_train_selected_acc_final",
+            "learned_train_non_selected_acc_final",
+            "learned_train_selected_f1_final",
+            "learned_train_device",
+            "min_component_size",
+        ]
+        return {
+            key: self.debug_last_learned_collapse_summary[key]
+            for key in compact_keys
+            if key in self.debug_last_learned_collapse_summary
+        }
+
+    @staticmethod
+    def _debug_render_histogram_frame(
+        *,
+        values: np.ndarray,
+        bins: np.ndarray,
+        x_max: float,
+        y_max: int,
+        title: str,
+        threshold_value: float,
+        selected_safe_threshold_value: float | None,
+        annotation_lines: list[str],
+        color: str,
+    ) -> np.ndarray:
+        from matplotlib.figure import Figure
+
+        fig = Figure(figsize=(10, 4.5), dpi=160)
+        ax = fig.add_subplot(111)
+        values = np.asarray(values, dtype=np.float32)
+        counts = np.zeros((max(0, bins.shape[0] - 1),), dtype=np.float32)
+        patches = []
+        if values.size > 0:
+            counts, _, patches = ax.hist(values, bins=bins, color=color, edgecolor="black", linewidth=0.6)
+            for count, patch in zip(counts.tolist(), patches):
+                if count <= 0:
+                    continue
+                x_center = float(patch.get_x() + patch.get_width() * 0.5)
+                ax.text(
+                    x_center,
+                    float(count) + max(0.15, 0.01 * float(y_max)),
+                    str(int(round(count))),
+                    ha="center",
+                    va="bottom",
+                    fontsize=6,
+                    rotation=90,
+                    color="black",
+                )
+        ax.axvline(float(threshold_value), color="#b22222", linestyle="--", linewidth=2.0)
+        if selected_safe_threshold_value is not None:
+            ax.axvline(float(selected_safe_threshold_value), color="#222222", linestyle=":", linewidth=2.0)
+        ax.set_xlim(0.0, float(x_max))
+        ax.set_ylim(0, max(1, int(y_max)))
+        ax.set_xlabel("Percentage")
+        ax.set_ylabel("num_gids")
+        ax.set_title(title)
+        ax.set_xticks(np.linspace(0.0, float(x_max), 16))
+        y_tick_count = min(16, max(2, int(y_max) + 1))
+        y_ticks = np.unique(np.rint(np.linspace(0.0, float(y_max), y_tick_count)).astype(np.int32))
+        ax.set_yticks(y_ticks.tolist())
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.text(
+            0.995,
+            0.98,
+            "\n".join(annotation_lines),
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=9,
+            bbox={"facecolor": "white", "alpha": 0.9, "edgecolor": "#666666"},
+        )
+        fig.tight_layout()
+        frame = _debug_render_matplotlib_figure(fig)
+        fig.clear()
+        return frame
+
+    def plots_videos(
+        self,
+        *,
+        scannet_raw_root: str | Path | None = None,
+        replica_root: str | Path | None = None,
+        min_component_size: int = 2000,
+        output_dir: str | Path | None = None,
+        fps: float = 4.0,
+        hist_bins: int = 150,
+    ) -> dict[str, Any]:
+        output_dir = self.cache.cache_dir / "debug_videos" if output_dir is None else Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.run_all(upto=-1, progress_desc="plots_videos run_all")
+        timeline_snapshots = list(self.debug_timeline_snapshots)
+        cached_summary = self.debug_last_plots_videos_summary
+        expected_scannet_root = None if scannet_raw_root is None else str(scannet_raw_root)
+        expected_replica_root = None if replica_root is None else str(replica_root)
+        if isinstance(cached_summary, dict):
+            cached_binary = cached_summary.get("binary_signal")
+            cached_points = cached_summary.get("timeline_points_perc")
+            cached_support = cached_summary.get("timeline_support_perc")
+            if (
+                int(cached_summary.get("frame_id", -1)) == int(self.current_frame_id)
+                and int(cached_summary.get("min_component_size", -1)) == int(min_component_size)
+                and cached_summary.get("scannet_raw_root") == expected_scannet_root
+                and cached_summary.get("replica_root") == expected_replica_root
+                and isinstance(cached_binary, str)
+                and isinstance(cached_points, str)
+                and isinstance(cached_support, str)
+                and Path(cached_binary).exists()
+                and Path(cached_points).exists()
+                and Path(cached_support).exists()
+            ):
+                return dict(cached_summary)
+
+        selection_info = self._debug_resolve_optimal_selected_gids(
+            scannet_raw_root=scannet_raw_root,
+            replica_root=replica_root,
+            min_component_size=int(min_component_size),
+            progress_desc="plots_videos resolve_gt_selection",
+        )
+
+        selected_gids = selection_info["selected_gids"]
+        surviving_final_gids = [int(gid) for gid in sorted(self.buckets)]
+        non_selected_final_gids = [int(gid) for gid in surviving_final_gids if int(gid) not in selected_gids]
+        selected_final_gids = [int(gid) for gid in surviving_final_gids if int(gid) in selected_gids]
+        ordered_binary_gids = non_selected_final_gids + selected_final_gids
+        total_seed_frames = int(self._num_seed_frames_processed())
+        self.debug_gid_stats = self._debug_build_gid_stats(selected_gids=selected_gids)
+
+        binary_frames: list[np.ndarray] = []
+        if ordered_binary_gids:
+            binary_progress = tqdm(ordered_binary_gids, desc="plots_videos binary_signal", unit="gid", leave=False, dynamic_ncols=True)
+            try:
+                for gid in binary_progress:
+                    binary_progress.set_postfix_str(f"gid={int(gid)}", refresh=True)
+                    binary_frames.append(
+                        self._debug_render_binary_signal_frame(
+                            gid_stats=self.debug_gid_stats[int(gid)],
+                        )
+                    )
+            finally:
+                binary_progress.close()
+        else:
+            binary_frames.append(
+                self._debug_render_histogram_frame(
+                    values=np.empty((0,), dtype=np.float32),
+                    bins=np.linspace(0.0, 100.0, 11, dtype=np.float32),
+                    x_max=100.0,
+                    y_max=1,
+                    title="Binary support lifecycle",
+                    threshold_value=0.0,
+                    annotation_lines=[
+                        "No surviving gids at final frame.",
+                        f"frame_id={int(self.current_frame_id)}",
+                        f"selected_gid_count={len(selected_final_gids)}",
+                    ],
+                    color="#4c78a8",
+                )
+            )
+        binary_path = _debug_write_video_frames(binary_frames, output_dir / "binary_signal.mp4", fps=float(fps))
+
+        bins = np.linspace(0.0, 100.0, int(hist_bins) + 1, dtype=np.float32)
+        max_point_hist = 0
+        max_support_hist = 0
+        for snapshot in timeline_snapshots:
+            point_counts, _ = np.histogram(snapshot["point_perc"], bins=bins)
+            support_counts, _ = np.histogram(snapshot["support_perc"], bins=bins)
+            max_point_hist = max(max_point_hist, int(point_counts.max()) if point_counts.size > 0 else 0)
+            max_support_hist = max(max_support_hist, int(support_counts.max()) if support_counts.size > 0 else 0)
+        max_point_hist = max(1, max_point_hist)
+        max_support_hist = max(1, max_support_hist)
+        point_threshold = 100.0 * float(self.config.pipeline.prune_min_points_perc)
+        support_threshold = 100.0 * float(self.config.pipeline.prune_min_support_perc)
+
+        point_frames: list[np.ndarray] = []
+        point_progress = tqdm(timeline_snapshots, desc="plots_videos timeline_points_perc", unit="frame", leave=False, dynamic_ncols=True)
+        try:
+            for snapshot in point_progress:
+                frame_id = int(snapshot["frame_id"])
+                values = np.asarray(snapshot["point_perc"], dtype=np.float32)
+                bucket_ids = [int(gid) for gid in snapshot["bucket_ids"]]
+                selected_alive_values = np.asarray(
+                    [float(values[idx]) for idx, gid in enumerate(bucket_ids) if int(gid) in selected_gids],
+                    dtype=np.float32,
+                )
+                selected_safe_threshold = (
+                    float(selected_alive_values.min()) if selected_alive_values.size > 0 else None
+                )
+                annotation_lines = [
+                    f"frame_id={frame_id}",
+                    f"num_gids={int(snapshot['num_gids'])}",
+                    f"map_points={int(snapshot['current_map_points'])}",
+                    f"seed_frames={int(snapshot['num_seed_frames'])}",
+                    f"mean={float(values.mean()) if values.size > 0 else 0.0:.4f}%",
+                    f"median={float(np.median(values)) if values.size > 0 else 0.0:.4f}%",
+                    f"max={float(values.max()) if values.size > 0 else 0.0:.4f}%",
+                    f"prune_min_points_perc={point_threshold:.4f}%",
+                    "selected_safe_points_perc="
+                    + ("n/a" if selected_safe_threshold is None else f"{selected_safe_threshold:.4f}%"),
+                ]
+                point_frames.append(
+                    self._debug_render_histogram_frame(
+                        values=values,
+                        bins=bins,
+                        x_max=100.0,
+                        y_max=max_point_hist,
+                        title="Timeline points percentage histogram",
+                        threshold_value=point_threshold,
+                        selected_safe_threshold_value=selected_safe_threshold,
+                        annotation_lines=annotation_lines,
+                        color="#4c78a8",
+                    )
+                )
+        finally:
+            point_progress.close()
+        points_path = _debug_write_video_frames(point_frames, output_dir / "timeline_points_perc.mp4", fps=float(fps))
+
+        support_frames: list[np.ndarray] = []
+        support_progress = tqdm(timeline_snapshots, desc="plots_videos timeline_support_perc", unit="frame", leave=False, dynamic_ncols=True)
+        try:
+            for snapshot in support_progress:
+                frame_id = int(snapshot["frame_id"])
+                values = np.asarray(snapshot["support_perc"], dtype=np.float32)
+                bucket_ids = [int(gid) for gid in snapshot["bucket_ids"]]
+                selected_alive_values = np.asarray(
+                    [float(values[idx]) for idx, gid in enumerate(bucket_ids) if int(gid) in selected_gids],
+                    dtype=np.float32,
+                )
+                selected_safe_threshold = (
+                    float(selected_alive_values.min()) if selected_alive_values.size > 0 else None
+                )
+                annotation_lines = [
+                    f"frame_id={frame_id}",
+                    f"num_gids={int(snapshot['num_gids'])}",
+                    f"map_points={int(snapshot['current_map_points'])}",
+                    f"seed_frames={int(snapshot['num_seed_frames'])}",
+                    f"mean={float(values.mean()) if values.size > 0 else 0.0:.4f}%",
+                    f"median={float(np.median(values)) if values.size > 0 else 0.0:.4f}%",
+                    f"max={float(values.max()) if values.size > 0 else 0.0:.4f}%",
+                    f"prune_min_support_perc={support_threshold:.4f}%",
+                    "selected_safe_support_perc="
+                    + ("n/a" if selected_safe_threshold is None else f"{selected_safe_threshold:.4f}%"),
+                ]
+                support_frames.append(
+                    self._debug_render_histogram_frame(
+                        values=values,
+                        bins=bins,
+                        x_max=100.0,
+                        y_max=max_support_hist,
+                        title="Timeline support percentage histogram",
+                        threshold_value=support_threshold,
+                        selected_safe_threshold_value=selected_safe_threshold,
+                        annotation_lines=annotation_lines,
+                        color="#72b7b2",
+                    )
+                )
+        finally:
+            support_progress.close()
+        support_path = _debug_write_video_frames(support_frames, output_dir / "timeline_support_perc.mp4", fps=float(fps))
+
+        summary = {
+            "binary_signal": str(binary_path),
+            "timeline_points_perc": str(points_path),
+            "timeline_support_perc": str(support_path),
+            "frame_id": int(self.current_frame_id),
+            "min_component_size": int(min_component_size),
+            "scannet_raw_root": expected_scannet_root,
+            "replica_root": expected_replica_root,
+            "selected_gids": sorted(int(gid) for gid in selected_gids),
+            "selected_gid_count": int(len(selected_final_gids)),
+            "non_selected_gid_count": int(len(non_selected_final_gids)),
+        }
+        self.debug_last_plots_videos_summary = summary
+        self._debug_save_instance_cache()
+        return summary
+
     def get_metrics(
         self,
         *,
@@ -372,7 +1267,7 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
         min_component_size: int = 1,
         ovo_score_th: float = 0.0,
         chunk_size: int = 100_000,
-        use_optimal_collapse: bool = False,
+        use_collapse_mode: str = "support",
         use_optimal_text_matching: bool = False,
         save_json: bool = False,
         video_output_dir: str | Path | None = None,
@@ -431,13 +1326,32 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
             progress.set_postfix_str("resolve instances", refresh=True)
             assoc = compute_nn_associations(gt["points"], pred_points)
             pred_to_gt_idx = assoc["pred_to_gt_idx"]
-            if use_optimal_collapse:
+            collapse_mode = str(use_collapse_mode)
+            if collapse_mode == "optimal":
                 progress.set_postfix_str("resolve instances (optimal)", refresh=True)
+            elif collapse_mode == "learned":
+                progress.set_postfix_str("resolve instances (learned)", refresh=True)
+                if self.debug_last_learned_collapse_summary is None:
+                    raise RuntimeError("Learned collapse requires a prior debugger.fit(...).")
+                if self.debug_last_learned_fit_frame_id != int(self.current_frame_id):
+                    raise RuntimeError("Learned collapse fit is stale for the current debugger state. Re-run debugger.fit(...).")
+                learned_selected_gids = {
+                    int(gid)
+                    for gid in self.debug_last_learned_collapse_summary.get("learned_pred_selected_gids", [])
+                }
+            else:
+                learned_selected_gids = None
             metric_gid_labels, collapse_diag = self._resolve_metric_instance_gid_labels(
-                use_optimal_collapse=bool(use_optimal_collapse),
-                pred_to_gt_idx=pred_to_gt_idx if use_optimal_collapse else None,
-                gt_instance_labels=gt["instance_labels"],
+                collapse_mode=collapse_mode,
+                pred_to_gt_idx=pred_to_gt_idx if collapse_mode == "optimal" else None,
+                gt_instance_labels=gt["instance_labels"] if collapse_mode == "optimal" else None,
+                learned_selected_gids=learned_selected_gids if collapse_mode == "learned" else None,
             )
+            if collapse_mode == "learned" and self.debug_last_learned_collapse_summary is not None:
+                collapse_diag = {
+                    **self.debug_last_learned_collapse_summary,
+                    **collapse_diag,
+                }
             metric_point_instance_labels, metric_instance_scores = finalize_instance_labels_and_scores(
                 metric_gid_labels,
                 self._raw_instance_support_scores(),
@@ -497,7 +1411,7 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
             if write_label_video:
                 progress.set_postfix_str("write label video", refresh=True)
                 output_dir = self.cache.cache_dir / "debug_videos" if video_output_dir is None else Path(video_output_dir)
-                mode_tag = "optimal" if use_optimal_collapse else "normal"
+                mode_tag = collapse_mode
                 output_name = (
                     f"{mode_tag}_collapse_frame_{int(self.current_frame_id):06d}"
                     f"_mincomp_{int(min_component_size)}.mp4"
@@ -539,6 +1453,7 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
                 "chunk_size": int(chunk_size),
                 "instance_video_label_source": "metric_point_instance_labels",
                 "instance_score_source": "seed_support_ratio",
+                "collapse_mode": collapse_mode,
                 **collapse_diag,
             },
         }
@@ -906,6 +1821,10 @@ def create_debugger_widget(debugger: CachedSAMInstanceDebugger):
         ("collapsed_after", "collapsed after"),
         ("all_gids_before", "all gids before"),
         ("all_gids_after", "all gids after"),
+        ("filter_depth", "filter 1"),
+        ("filter_unmatched", "filter 2"),
+        ("filter_normal", "filter 3"),
+        ("depth_map", "depth map"),
     ]
     image_out = widgets.Output()
     text_out = widgets.Output()
@@ -930,7 +1849,7 @@ def create_debugger_widget(debugger: CachedSAMInstanceDebugger):
             else:
                 enabled_panels = {key: toggle.value for key, toggle in panel_toggles.items()}
                 panel = debugger.render_current_panel(enabled_panels=enabled_panels)
-                fig, ax = plt.subplots(figsize=(24, 12))
+                fig, ax = plt.subplots(figsize=(24, 18))
                 ax.imshow(panel)
                 ax.axis("off")
                 fig.tight_layout()
@@ -991,11 +1910,16 @@ def create_debugger_widget(debugger: CachedSAMInstanceDebugger):
 
     def on_run_all(_):
         try:
-            run_to_target(debugger.total_frames - 1, description="Run All")
+            set_busy(True, description="Run All", value=0, maximum=1)
+            debugger.run_all(upto=-1, progress_desc="Run All")
+            frame_target.value = max(0, debugger.current_frame_id)
         except Exception as exc:  # noqa: BLE001
             with text_out:
                 text_out.clear_output(wait=True)
                 display(HTML(f"<pre>{html.escape(str(exc))}</pre>"))
+        finally:
+            set_busy(False)
+        refresh()
 
     def on_next_seed(_):
         try:
@@ -1026,8 +1950,9 @@ def create_debugger_widget(debugger: CachedSAMInstanceDebugger):
 
     controls = widgets.HBox([reset_btn, step_btn, next_seed_btn, frame_target, run_to_btn, run_all_btn, progress])
     toggles_row_1 = widgets.HBox([panel_toggles[key] for key, _ in panel_keys[:4]])
-    toggles_row_2 = widgets.HBox([panel_toggles[key] for key, _ in panel_keys[4:]])
-    panel = widgets.VBox([controls, status, toggles_row_1, toggles_row_2, image_out, text_out])
+    toggles_row_2 = widgets.HBox([panel_toggles[key] for key, _ in panel_keys[4:8]])
+    toggles_row_3 = widgets.HBox([panel_toggles[key] for key, _ in panel_keys[8:12]])
+    panel = widgets.VBox([controls, status, toggles_row_1, toggles_row_2, toggles_row_3, image_out, text_out])
     set_busy(False)
     refresh()
     return panel

@@ -223,7 +223,8 @@ class WrapperCuVSLAM(VanillaMapper):
         odom_config.odometry_mode = cuvslam.Tracker.OdometryMode.RGBD
         odom_config.rgbd_settings = rgbd
 
-        self.tracker = cuvslam.Tracker(cuvslam.Rig([camera]), odom_config)
+        slam_config = cuvslam.Tracker.SlamConfig()
+        self.tracker = cuvslam.Tracker(cuvslam.Rig([camera]), odom_config, slam_config)
 
     @property
     def height(self) -> int:
@@ -239,10 +240,14 @@ class WrapperCuVSLAM(VanillaMapper):
         depth_image = np.ascontiguousarray(
             np.clip(np.rint(depth_image.astype(np.float32) * self.depth_scale_factor), 0, np.iinfo(np.uint16).max).astype(np.uint16)
         )
-        pose_estimate, _ = self.tracker.track(frame_id * self.timestamp_step_ns, images=[rgb_image], depths=[depth_image])
-        if pose_estimate.world_from_rig is None:
+        pose_estimate, slam_pose = self.tracker.track(frame_id * self.timestamp_step_ns, images=[rgb_image], depths=[depth_image])
+        pose = slam_pose if slam_pose is not None else pose_estimate.world_from_rig
+        if pose is None:
             return
-        self.estimated_c2ws[frame_id] = self.world_ref @ _pose_to_matrix(pose_estimate.world_from_rig, self.device)
+        c2w = self.world_ref @ _pose_to_matrix(pose, self.device)
+        if not torch.isfinite(c2w).all():
+            return
+        self.estimated_c2ws[frame_id] = c2w
 
 
 def get_slam_backbone(config: Dict[str, Any], dataset, cam_intrinsics: torch.Tensor):

@@ -8,13 +8,17 @@ import open_clip
 import torch
 from tqdm.auto import tqdm
 
-CLIP_MODEL_NAME = "ViT-L-14-336-quickgelu"
-CLIP_PRETRAINED = "openai"
-CLIP_FEATURE_FILE = "clip_feats.npy"
-DEFAULT_PCA_SAMPLE_SIZE = 100_000
-DEFAULT_CHUNK_SIZE = 200_000
-DEFAULT_POINT_SIZE = 1.0
-VIEW_SAVE_KEY = ord("V")
+from map_runtime.defaults import (
+    CLIP_FEATURE_FILE,
+    CLIP_MODEL_NAME,
+    CLIP_PRETRAINED,
+    DEFAULT_MIN_COMPONENT_SIZE,
+    DEFAULT_PCA_SAMPLE_SIZE,
+    DEFAULT_VIS_CHUNK_SIZE,
+    DEFAULT_VIS_POINT_SIZE,
+    FEATURE_SOFTMAX_TEMP,
+    VIEW_SAVE_KEY,
+)
 
 
 def resolve_ply_path(input_path: str) -> Path:
@@ -94,7 +98,12 @@ def l2_normalize_embeddings(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return x / x.norm(dim=-1, keepdim=True).clamp_min(eps)
 
 
-def compute_similarity_scores(clip_features: torch.Tensor, pos_embed: torch.Tensor, neg_embed: torch.Tensor | None = None, softmax_temp: float = 0.1) -> torch.Tensor:
+def compute_similarity_scores(
+    clip_features: torch.Tensor,
+    pos_embed: torch.Tensor,
+    neg_embed: torch.Tensor | None = None,
+    softmax_temp: float = FEATURE_SOFTMAX_TEMP,
+) -> torch.Tensor:
     if pos_embed.ndim == 1:
         pos_embed = pos_embed.unsqueeze(0)
 
@@ -240,11 +249,11 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["rgb", "normals", "feat", "feature-similarity", "instances"], default="rgb")
     parser.add_argument("--positive", default="")
     parser.add_argument("--negative", default="")
-    parser.add_argument("--softmax_temp", type=float, default=0.1)
-    parser.add_argument("--min_component_size", type=int, default=2000)
+    parser.add_argument("--softmax_temp", type=float, default=FEATURE_SOFTMAX_TEMP)
+    parser.add_argument("--min_component_size", type=int, default=DEFAULT_MIN_COMPONENT_SIZE)
     parser.add_argument("--pca_sample_size", type=int, default=DEFAULT_PCA_SAMPLE_SIZE)
-    parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
-    parser.add_argument("--point_size", type=float, default=DEFAULT_POINT_SIZE)
+    parser.add_argument("--chunk_size", type=int, default=DEFAULT_VIS_CHUNK_SIZE)
+    parser.add_argument("--point_size", type=float, default=DEFAULT_VIS_POINT_SIZE)
     parser.add_argument("--view_path", default="", help="Press V in the viewer to save the current camera view to this JSON path.")
     parser.add_argument("--no_window", action="store_true", help="Only load and print map info.")
     main(parser.parse_args())

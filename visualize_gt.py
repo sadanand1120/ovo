@@ -12,11 +12,10 @@ from get_metrics_map import (
     load_scannet_gt,
     resolve_replica_gt_paths,
 )
+from map_runtime.defaults import DEFAULT_GT_POINT_SIZE, DEFAULT_REPLICA_ROOT
 from visualize_rgb_map import colorize_instance_labels, show_point_cloud
 
 
-DEFAULT_REPLICA_ROOT = Path("data/input/Replica")
-DEFAULT_POINT_SIZE = 3.0
 SCANNET_MODES = {"rgb", "normals", "semantics", "instances"}
 REPLICA_MODES = {"rgb", "normals", "semantics", "ovo-semantics", "instances"}
 
@@ -142,6 +141,6 @@ if __name__ == "__main__":
     parser.add_argument("--mode", default="rgb")
     parser.add_argument("--scannet_raw_root", default=None, help="Required for ScanNet.")
     parser.add_argument("--replica_root", default=str(DEFAULT_REPLICA_ROOT), help="Replica root containing semantic_gt/ and scene meshes.")
-    parser.add_argument("--point_size", type=float, default=DEFAULT_POINT_SIZE)
+    parser.add_argument("--point_size", type=float, default=DEFAULT_GT_POINT_SIZE)
     parser.add_argument("--no_window", action="store_true")
     main(parser.parse_args())

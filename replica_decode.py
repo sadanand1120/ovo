@@ -12,13 +12,7 @@ from plyfile import PlyData
 from tqdm.auto import tqdm
 
 from map_runtime.config import load_config
-
-
-REPO_ROOT = Path(__file__).resolve().parent
-CONFIG_DIR = REPO_ROOT / "configs"
-REPLICA_CONFIG_PATH = CONFIG_DIR / "replica.yaml"
-DEFAULT_OUTPUT_ROOT = REPO_ROOT / "data" / "input" / "Replica"
-DEFAULT_OVO_SEMANTIC_GT_ROOT = DEFAULT_OUTPUT_ROOT / "semantic_gt"
+from map_runtime.defaults import DEFAULT_OVO_SEMANTIC_GT_ROOT, DEFAULT_REPLICA_ROOT, REPLICA_CONFIG_PATH
 REQUIRED_SCENE_FILES = ("results", "traj.txt")
 LABEL_FILT_DIR = "label-filt"
 INSTANCE_FILT_DIR = "instance-filt"
@@ -312,7 +306,7 @@ def stage_scene(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Stage NICE-SLAM Replica data into the runtime layout and, when full Replica assets are provided, render per-frame label-filt/ and instance-filt/ GT.")
     parser.add_argument("--source_root", required=True, type=Path, help="NICE-SLAM Replica root containing scene dirs with results/ + traj.txt and root-level <scene>_mesh.ply files.")
-    parser.add_argument("--output_root", default=DEFAULT_OUTPUT_ROOT, type=Path, help="Runtime Replica root to populate.")
+    parser.add_argument("--output_root", default=DEFAULT_REPLICA_ROOT, type=Path, help="Runtime Replica root to populate.")
     parser.add_argument("--full_replica_root", default=None, type=Path, help="Optional full Replica root containing per-scene habitat/, semantic.*, mesh.ply, textures, etc. Used to stage Habitat assets and generate label-filt/ + instance-filt/.")
     parser.add_argument("--scenes", nargs="*", default=None, help="Optional scene names to stage. Defaults to all valid scenes under source_root.")
     parser.add_argument("--copy", action="store_true", help="Copy files instead of symlinking them.")

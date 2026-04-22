@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-import math
 from typing import Any
 
 import numpy as np
+import torch
+from tqdm.auto import tqdm
 
 from map_runtime.sam_masks import SAMMaskExtractor, SAMMaskExtractorConfig
 from map_runtime.sam2_tracking import SAM2VideoTracker, SAMTrackerConfig, build_label_masks
@@ -55,10 +56,10 @@ class SAMInstancePipelineConfig:
     reuse_outside_frac_th: float = 0.10
     min_mask_points: int = 1
     min_track_visible_points: int = 1
+    prune_start_at: int = 0
     prune_every_frames: int = 64
-    prune_stale_gap_frames: int = 100000
-    prune_min_support_ratio: float = 0.0
-    prune_min_points: int = 1000
+    prune_min_support_perc: float = 0.0
+    prune_min_points_perc: float = 0.00015
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,8 @@ class SAMInstanceRuntime:
         self.tracker_frame_idx = 0
         self.seeded_gids: set[int] = set()
         self._gid_scores = np.zeros((0,), dtype=np.int64)
+        self.debug_support_seed_ordinals_by_gid: dict[int, list[int]] = {}
+        self.debug_birth_seed_ordinal_by_gid: dict[int, int] = {}
         if self._tracker is not None:
             self._tracker.close()
             self._tracker = None
@@ -131,6 +134,29 @@ class SAMInstanceRuntime:
             dtype=np.int32,
         )
         self.point_gids = np.concatenate((self.point_gids, extra), axis=0)
+
+    def keep_point_ids(self, point_ids: np.ndarray) -> None:
+        point_ids = np.asarray(point_ids, dtype=np.int64)
+        if point_ids.ndim != 1:
+            raise ValueError(f"point_ids must be a 1D array, got shape {point_ids.shape}.")
+        if point_ids.size == self.point_gids.shape[0]:
+            return
+        self.point_gids = np.ascontiguousarray(self.point_gids[point_ids])
+        point_counts = {int(gid): 0 for gid in self.buckets}
+        valid = self.point_gids[self.point_gids >= 0]
+        if valid.size > 0:
+            gids, counts = np.unique(valid, return_counts=True)
+            for gid, count in zip(gids.tolist(), counts.tolist()):
+                point_counts[int(gid)] = int(count)
+        empty_gids = []
+        for gid, bucket in self.buckets.items():
+            bucket.point_count = int(point_counts.get(int(gid), 0))
+            if bucket.point_count <= 0:
+                empty_gids.append(int(gid))
+        for gid in empty_gids:
+            self.seeded_gids.discard(int(gid))
+            self.buckets.pop(int(gid), None)
+        self._refresh_gid_scores()
 
     def num_active_instances(self) -> int:
         return len(self.seeded_gids)
@@ -179,6 +205,8 @@ class SAMInstanceRuntime:
             last_support_frame=-1,
             birth_frame=int(frame_id),
         )
+        self.debug_support_seed_ordinals_by_gid[gid] = []
+        self.debug_birth_seed_ordinal_by_gid[gid] = int(self._num_seed_frames_processed(upto_frame=int(frame_id)))
         self._refresh_gid_scores()
         self.stats["sam2_births"] += 1
         return gid
@@ -189,6 +217,8 @@ class SAMInstanceRuntime:
             return
         if bucket.last_support_frame != int(frame_id):
             bucket.support_frames += 1
+            seed_ordinal = int(self._num_seed_frames_processed(upto_frame=int(frame_id)))
+            self.debug_support_seed_ordinals_by_gid.setdefault(int(gid), []).append(seed_ordinal)
         bucket.last_support_frame = int(frame_id)
         self._refresh_gid_scores()
 
@@ -238,16 +268,22 @@ class SAMInstanceRuntime:
     def _prune(self, frame_id: int) -> list[int]:
         if self.config.pipeline.prune_every_frames <= 0:
             return []
-        if int(frame_id) <= 0 or int(frame_id) % int(self.config.pipeline.prune_every_frames) != 0:
+        if int(frame_id) < int(self.config.pipeline.prune_start_at):
             return []
-        min_support_frames = max(1, int(math.ceil(self.config.pipeline.prune_min_support_ratio * self.total_frames)))
+        if int(frame_id) % int(self.config.pipeline.prune_every_frames) != 0:
+            return []
+        num_seed_frames = int(self._num_seed_frames_processed(upto_frame=int(frame_id)))
+        num_map_points = int(self.point_gids.shape[0])
+        if num_seed_frames <= 0 or num_map_points <= 0:
+            return []
         pruned = []
         for gid, bucket in list(self.buckets.items()):
-            mature = int(frame_id) - int(bucket.birth_frame) >= min_support_frames
-            stale = int(frame_id) - int(bucket.last_support_frame) > int(self.config.pipeline.prune_stale_gap_frames)
-            low_support = mature and int(bucket.support_frames) < min_support_frames
-            low_points = mature and int(bucket.point_count) < int(self.config.pipeline.prune_min_points)
-            if stale or low_support or low_points:
+            support_perc = float(bucket.support_frames) / float(num_seed_frames)
+            points_perc = float(bucket.point_count) / float(num_map_points)
+            if (
+                support_perc < float(self.config.pipeline.prune_min_support_perc)
+                or points_perc < float(self.config.pipeline.prune_min_points_perc)
+            ):
                 pruned.append(int(gid))
                 self._drop_gid(int(gid))
         self.stats["sam2_pruned_instances"] += int(len(pruned))
@@ -289,11 +325,19 @@ class SAMInstanceRuntime:
         mask[valid_mask] = np.any(self.point_gids[point_ids] == int(gid), axis=1)
         return mask
 
-    def _collapse_point_gid_labels(self) -> np.ndarray:
+    def _collapse_point_gid_labels(self, *, allowed_gids: set[int] | None = None) -> np.ndarray:
         labels = np.full((self.point_gids.shape[0],), -1, dtype=np.int32)
         valid_rows = self.point_gids >= 0
         if not valid_rows.any():
             return labels
+        if allowed_gids is not None:
+            allowed_lookup = np.zeros((max(0, int(self.next_gid)),), dtype=bool)
+            for gid in allowed_gids:
+                if 0 <= int(gid) < allowed_lookup.shape[0]:
+                    allowed_lookup[int(gid)] = True
+            valid_rows = valid_rows & allowed_lookup[self.point_gids.clip(min=0)]
+            if not valid_rows.any():
+                return labels
         clipped = self.point_gids.clip(min=0)
         scores = np.where(valid_rows, self._gid_scores[clipped], -1)
         best_idx = np.argmax(scores, axis=1)
@@ -301,10 +345,11 @@ class SAMInstanceRuntime:
         best_gid[~np.any(valid_rows, axis=1)] = -1
         return best_gid
 
-    def _num_seed_frames_processed(self) -> int:
-        if self.current_frame_id < 0:
+    def _num_seed_frames_processed(self, *, upto_frame: int | None = None) -> int:
+        frame_id = self.current_frame_id if upto_frame is None else int(upto_frame)
+        if frame_id < 0:
             return 0
-        return 1 + (int(self.current_frame_id) // int(self.map_every))
+        return 1 + (int(frame_id) // int(self.map_every))
 
     def _raw_instance_support_scores(self) -> np.ndarray:
         num_seed_frames = int(self._num_seed_frames_processed())
@@ -315,10 +360,62 @@ class SAMInstanceRuntime:
             scores[int(gid)] = float(bucket.support_frames) / float(num_seed_frames)
         return scores
 
+    def _debug_build_gid_stats(self, *, selected_gids: set[int] | None = None) -> dict[int, dict[str, Any]]:
+        selected_gids = set() if selected_gids is None else {int(gid) for gid in selected_gids}
+        total_seed_frames = int(self._num_seed_frames_processed())
+        total_map_points = int(self.point_gids.shape[0])
+        gid_stats: dict[int, dict[str, Any]] = {}
+        for gid in sorted(self.buckets):
+            bucket = self.buckets[int(gid)]
+            birth_seed_ordinal = int(self.debug_birth_seed_ordinal_by_gid.get(int(gid), 1))
+            support_seed_ordinals = sorted(
+                int(v)
+                for v in self.debug_support_seed_ordinals_by_gid.get(int(gid), [])
+                if 1 <= int(v) <= int(total_seed_frames)
+            )
+            signal_len = max(0, int(total_seed_frames) - int(birth_seed_ordinal) + 1)
+            binary_signal = np.zeros((signal_len,), dtype=np.int32)
+            for ordinal in support_seed_ordinals:
+                rel_idx = int(ordinal) - int(birth_seed_ordinal)
+                if 0 <= rel_idx < signal_len:
+                    binary_signal[rel_idx] = 1
+            n00 = n01 = n10 = n11 = 0
+            if signal_len >= 2:
+                prev = binary_signal[:-1]
+                curr = binary_signal[1:]
+                n00 = int(np.sum((prev == 0) & (curr == 0)))
+                n01 = int(np.sum((prev == 0) & (curr == 1)))
+                n10 = int(np.sum((prev == 1) & (curr == 0)))
+                n11 = int(np.sum((prev == 1) & (curr == 1)))
+            support_perc = 0.0 if total_seed_frames <= 0 else (100.0 * float(bucket.support_frames) / float(total_seed_frames))
+            point_perc = 0.0 if total_map_points <= 0 else (100.0 * float(bucket.point_count) / float(total_map_points))
+            gid_stats[int(gid)] = {
+                "gid": int(gid),
+                "selected": bool(int(gid) in selected_gids),
+                "birth_frame": int(bucket.birth_frame),
+                "birth_seed_ordinal": int(birth_seed_ordinal),
+                "last_support_frame": int(bucket.last_support_frame),
+                "support_frames": int(bucket.support_frames),
+                "support_perc": float(support_perc),
+                "point_count": int(bucket.point_count),
+                "point_perc": float(point_perc),
+                "total_seed_frames": int(total_seed_frames),
+                "lifecycle_seed_frames": int(signal_len),
+                "support_seed_ordinals": [int(v) for v in support_seed_ordinals],
+                "binary_signal": binary_signal.astype(np.int32, copy=False).tolist(),
+                "n00": int(n00),
+                "n01": int(n01),
+                "n10": int(n10),
+                "n11": int(n11),
+            }
+        return gid_stats
+
     def _resolve_optimal_metric_instance_labels(
         self,
         pred_to_gt_idx: np.ndarray,
         gt_instance_labels: np.ndarray,
+        *,
+        progress_desc: str | None = None,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         usual_collapse_labels = self._collapse_point_gid_labels()
         pred_to_gt_idx = np.asarray(pred_to_gt_idx, dtype=np.int64)
@@ -330,43 +427,74 @@ class SAMInstanceRuntime:
         canonical_gid_by_gt: dict[int, int] = {}
         canonical_rank_by_gt: dict[int, tuple[int, float, int, int, int]] = {}
 
-        for gid in unique_gids.tolist():
-            member_mask = np.any(gid_rows == int(gid), axis=1)
-            if not member_mask.any():
-                continue
-            member_gt_instances = pred_gt_instances[member_mask]
-            member_gt_instances = member_gt_instances[member_gt_instances >= 0]
-            if member_gt_instances.size == 0:
-                continue
-            gt_ids, gt_counts = np.unique(member_gt_instances, return_counts=True)
-            best_idx = int(np.argmax(gt_counts))
-            target_gt_instance = int(gt_ids[best_idx])
-            intersection = int(gt_counts[best_idx])
-            purity = float(intersection / float(member_mask.sum()))
-            bucket = self.buckets.get(int(gid))
-            support_frames = int(bucket.support_frames) if bucket is not None else 0
-            point_count = int(bucket.point_count) if bucket is not None else int(member_mask.sum())
-            rank = (intersection, purity, support_frames, point_count, -int(gid))
-            current_rank = canonical_rank_by_gt.get(target_gt_instance)
-            if current_rank is None or rank > current_rank:
-                canonical_rank_by_gt[target_gt_instance] = rank
-                canonical_gid_by_gt[target_gt_instance] = int(gid)
+        gid_iter = unique_gids.tolist()
+        gid_progress = None
+        if progress_desc is not None:
+            gid_progress = tqdm(gid_iter, desc=f"{progress_desc}: canonical gids", unit="gid", leave=False, dynamic_ncols=True)
+            gid_iter = gid_progress
+        try:
+            for gid in gid_iter:
+                member_mask = np.any(gid_rows == int(gid), axis=1)
+                if not member_mask.any():
+                    continue
+                member_gt_instances = pred_gt_instances[member_mask]
+                member_gt_instances = member_gt_instances[member_gt_instances >= 0]
+                if member_gt_instances.size == 0:
+                    continue
+                gt_ids, gt_counts = np.unique(member_gt_instances, return_counts=True)
+                best_idx = int(np.argmax(gt_counts))
+                target_gt_instance = int(gt_ids[best_idx])
+                intersection = int(gt_counts[best_idx])
+                purity = float(intersection / float(member_mask.sum()))
+                bucket = self.buckets.get(int(gid))
+                support_frames = int(bucket.support_frames) if bucket is not None else 0
+                point_count = int(bucket.point_count) if bucket is not None else int(member_mask.sum())
+                rank = (intersection, purity, support_frames, point_count, -int(gid))
+                current_rank = canonical_rank_by_gt.get(target_gt_instance)
+                if current_rank is None or rank > current_rank:
+                    canonical_rank_by_gt[target_gt_instance] = rank
+                    canonical_gid_by_gt[target_gt_instance] = int(gid)
+        finally:
+            if gid_progress is not None:
+                gid_progress.close()
 
         labels = np.full((gid_rows.shape[0],), -1, dtype=np.int32)
         matched_canonical_points = 0
         optimized_points = 0
-        for point_idx in range(gid_rows.shape[0]):
-            gt_instance = int(pred_gt_instances[point_idx])
-            if gt_instance < 0:
-                continue
-            canonical_gid = canonical_gid_by_gt.get(gt_instance)
-            if canonical_gid is None:
-                continue
-            if np.any(gid_rows[point_idx] == canonical_gid):
-                matched_canonical_points += 1
-                if usual_collapse_labels[point_idx] != canonical_gid:
-                    optimized_points += 1
-                labels[point_idx] = int(canonical_gid)
+        valid_point_idx = np.flatnonzero(pred_gt_instances >= 0)
+        if valid_point_idx.size > 0 and canonical_gid_by_gt:
+            lookup_size = int(pred_gt_instances[valid_point_idx].max()) + 1
+            canonical_lookup = np.full((lookup_size,), -1, dtype=np.int32)
+            for gt_instance, canonical_gid in canonical_gid_by_gt.items():
+                canonical_lookup[int(gt_instance)] = int(canonical_gid)
+            chunk_size = 100_000
+            chunk_starts = range(0, int(valid_point_idx.size), chunk_size)
+            chunk_progress = None
+            if progress_desc is not None:
+                chunk_progress = tqdm(chunk_starts, desc=f"{progress_desc}: assign points", unit="chunk", leave=False, dynamic_ncols=True)
+                chunk_starts = chunk_progress
+            try:
+                for start in chunk_starts:
+                    idx = valid_point_idx[int(start): int(start) + chunk_size]
+                    gt_chunk = pred_gt_instances[idx]
+                    canonical_chunk = canonical_lookup[gt_chunk]
+                    has_canonical = canonical_chunk >= 0
+                    if not has_canonical.any():
+                        continue
+                    idx = idx[has_canonical]
+                    canonical_chunk = canonical_chunk[has_canonical]
+                    rows = gid_rows[idx]
+                    matches = np.any(rows == canonical_chunk[:, None], axis=1)
+                    if not matches.any():
+                        continue
+                    matched_idx = idx[matches]
+                    matched_gid = canonical_chunk[matches]
+                    labels[matched_idx] = matched_gid.astype(np.int32, copy=False)
+                    matched_canonical_points += int(matches.sum())
+                    optimized_points += int(np.count_nonzero(usual_collapse_labels[matched_idx] != matched_gid))
+            finally:
+                if chunk_progress is not None:
+                    chunk_progress.close()
 
         diagnostics = {
             "optimal_collapse_gt_instances": int(len(canonical_gid_by_gt)),
@@ -380,23 +508,282 @@ class SAMInstanceRuntime:
             )
         return labels, diagnostics
 
+    def _fit_learned_gid_selector(
+        self,
+        *,
+        selected_gids: set[int],
+        embed_dim: int = 8,
+        num_layers: int = 2,
+        epochs: int = 2000,
+        pruning_thresh: float = 0.6,
+        loss_mode: str = "wbce",
+        focal_gamma: float = 2.0,
+        plot_every: int = 25,
+        show_training_plot: bool = False,
+    ) -> dict[str, Any]:
+        num_layers = max(int(num_layers), 2)
+        plot_every = max(int(plot_every), 1)
+        loss_mode = str(loss_mode)
+        if loss_mode not in {"wbce", "focal"}:
+            raise ValueError(f"Unknown loss_mode={loss_mode!r}. Expected one of: wbce, focal.")
+        gid_stats = self._debug_build_gid_stats(selected_gids=selected_gids)
+        ordered_gids = sorted(int(gid) for gid in gid_stats)
+        if not ordered_gids:
+            return {
+                "learned_num_gids": 0,
+                "learned_num_selected": 0,
+                "learned_num_rejected": 0,
+                "learned_embed_dim": int(embed_dim),
+                "learned_num_layers": int(num_layers),
+                "learned_epochs": int(epochs),
+                "learned_pruning_thresh": float(pruning_thresh),
+                "learned_loss_mode": loss_mode,
+                "learned_focal_alpha": float("nan"),
+                "learned_focal_gamma": float(focal_gamma),
+                "learned_plot_every": int(plot_every),
+                "learned_train_loss_final": float("nan"),
+                "learned_train_acc_final": float("nan"),
+                "learned_train_selected_acc_final": float("nan"),
+                "learned_train_non_selected_acc_final": float("nan"),
+                "learned_train_selected_f1_final": float("nan"),
+                "learned_feature_names": [
+                    "log_support_perc",
+                    "log_point_perc",
+                    "n00_norm",
+                    "n01_norm",
+                    "n10_norm",
+                    "n11_norm",
+                ],
+                "learned_rows": [],
+                "learned_pred_selected_gids": [],
+            }
+
+        eps = 1e-6
+        rows = []
+        for gid in ordered_gids:
+            stats = gid_stats[int(gid)]
+            lifecycle_seed_frames = max(int(stats["lifecycle_seed_frames"]), 1)
+            rows.append(
+                {
+                    "gid": int(gid),
+                    "selected": float(stats["selected"]),
+                    "log_support_perc": float(np.log10(max(float(stats["support_perc"]), eps))),
+                    "log_point_perc": float(np.log10(max(float(stats["point_perc"]), eps))),
+                    "n00_norm": float(stats["n00"]) / float(lifecycle_seed_frames),
+                    "n01_norm": float(stats["n01"]) / float(lifecycle_seed_frames),
+                    "n10_norm": float(stats["n10"]) / float(lifecycle_seed_frames),
+                    "n11_norm": float(stats["n11"]) / float(lifecycle_seed_frames),
+                }
+            )
+
+        feature_names = ["log_support_perc", "log_point_perc", "n00_norm", "n01_norm", "n10_norm", "n11_norm"]
+        train_device = torch.device(self.device)
+        X = torch.tensor([[row[name] for name in feature_names] for row in rows], dtype=torch.float32, device=train_device)
+        y = torch.tensor([row["selected"] for row in rows], dtype=torch.float32, device=train_device).unsqueeze(1)
+        y_flat = y.squeeze(1)
+        pos_mask = y_flat > 0.5
+        neg_mask = ~pos_mask
+        num_pos = int(pos_mask.sum().item())
+        num_neg = int(neg_mask.sum().item())
+        X_mean = X.mean(dim=0, keepdim=True)
+        X_std = X.std(dim=0, keepdim=True).clamp_min(1e-6)
+        X_norm = (X - X_mean) / X_std
+
+        torch.manual_seed(0)
+        trunk_layers: list[torch.nn.Module] = [
+            torch.nn.Linear(X_norm.shape[1], int(embed_dim)),
+            torch.nn.ReLU(),
+        ]
+        for _ in range(num_layers - 2):
+            trunk_layers.extend(
+                [
+                    torch.nn.Linear(int(embed_dim), int(embed_dim)),
+                    torch.nn.ReLU(),
+                ]
+            )
+        trunk = torch.nn.Sequential(*trunk_layers).to(train_device)
+        keep_head = torch.nn.Linear(int(embed_dim), 1).to(train_device)
+        params = list(trunk.parameters()) + list(keep_head.parameters())
+        opt = torch.optim.Adam(params, lr=1e-2, weight_decay=1e-4)
+        pos_weight = 1.0 if num_pos <= 0 or num_neg <= 0 else float(num_neg) / float(num_pos)
+        focal_alpha = 0.5 if (num_pos + num_neg) <= 0 else float(num_neg) / float(num_pos + num_neg)
+        num_epochs = int(epochs)
+        loss_history: list[float] = []
+        acc_history: list[float] = []
+        pos_acc_history: list[float] = []
+        neg_acc_history: list[float] = []
+        f1_history: list[float] = []
+
+        if show_training_plot:
+            import matplotlib.pyplot as plt
+            from IPython.display import clear_output, display
+
+        for epoch in range(num_epochs):
+            opt.zero_grad()
+            hidden = trunk(X_norm)
+            keep_logits = keep_head(hidden)
+            if loss_mode == "wbce":
+                keep_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                    keep_logits,
+                    y,
+                    pos_weight=torch.tensor([pos_weight], dtype=torch.float32, device=train_device),
+                )
+            else:
+                probs_loss = torch.sigmoid(keep_logits)
+                bce = torch.nn.functional.binary_cross_entropy_with_logits(keep_logits, y, reduction="none")
+                pt = torch.where(y > 0.5, probs_loss, 1.0 - probs_loss).clamp_min(1e-8)
+                alpha_t = torch.where(
+                    y > 0.5,
+                    torch.full_like(y, float(focal_alpha)),
+                    torch.full_like(y, 1.0 - float(focal_alpha)),
+                )
+                keep_loss = (alpha_t * ((1.0 - pt) ** float(focal_gamma)) * bce).mean()
+            keep_loss.backward()
+            opt.step()
+            with torch.no_grad():
+                hidden_epoch = trunk(X_norm)
+                probs_epoch = torch.sigmoid(keep_head(hidden_epoch).squeeze(1))
+                preds_epoch = (probs_epoch >= float(pruning_thresh)).float()
+                acc_epoch = float((preds_epoch == y.squeeze(1)).float().mean().item())
+                pos_acc_epoch = float((preds_epoch[pos_mask] == y_flat[pos_mask]).float().mean().item()) if num_pos > 0 else float("nan")
+                neg_acc_epoch = float((preds_epoch[neg_mask] == y_flat[neg_mask]).float().mean().item()) if num_neg > 0 else float("nan")
+                pred_pos_epoch = preds_epoch > 0.5
+                tp_epoch = int((pred_pos_epoch & pos_mask).sum().item())
+                fp_epoch = int((pred_pos_epoch & neg_mask).sum().item())
+                fn_epoch = int(((~pred_pos_epoch) & pos_mask).sum().item())
+                precision_epoch = float(tp_epoch / max(tp_epoch + fp_epoch, 1))
+                recall_epoch = float(tp_epoch / max(tp_epoch + fn_epoch, 1))
+                f1_epoch = float((2.0 * precision_epoch * recall_epoch) / max(precision_epoch + recall_epoch, 1e-8))
+            loss_history.append(float(keep_loss.item()))
+            acc_history.append(acc_epoch)
+            pos_acc_history.append(pos_acc_epoch)
+            neg_acc_history.append(neg_acc_epoch)
+            f1_history.append(f1_epoch)
+            if show_training_plot and (epoch == 0 or (epoch + 1) % plot_every == 0 or (epoch + 1) == num_epochs):
+                clear_output(wait=True)
+                fig, axes = plt.subplots(1, 5, figsize=(22, 3.5))
+                axes[0].plot(loss_history, linewidth=2)
+                axes[0].set_xlabel("epoch")
+                axes[0].set_ylabel("loss")
+                axes[0].set_title(f"train loss | epoch={epoch + 1}/{num_epochs}")
+                axes[0].grid(True, alpha=0.3)
+                axes[1].plot(acc_history, linewidth=2)
+                axes[1].set_xlabel("epoch")
+                axes[1].set_ylabel("train acc")
+                axes[1].set_title(f"train acc | current={acc_history[-1]:.4f}")
+                axes[1].set_ylim(0.0, 1.0)
+                axes[1].grid(True, alpha=0.3)
+                axes[2].plot(pos_acc_history, linewidth=2)
+                axes[2].set_xlabel("epoch")
+                axes[2].set_ylabel("selected acc")
+                axes[2].set_title(f"selected acc | current={pos_acc_history[-1]:.4f}" if num_pos > 0 else "selected acc | n/a")
+                axes[2].set_ylim(0.0, 1.0)
+                axes[2].grid(True, alpha=0.3)
+                axes[3].plot(neg_acc_history, linewidth=2)
+                axes[3].set_xlabel("epoch")
+                axes[3].set_ylabel("non-selected acc")
+                axes[3].set_title(f"non-selected acc | current={neg_acc_history[-1]:.4f}" if num_neg > 0 else "non-selected acc | n/a")
+                axes[3].set_ylim(0.0, 1.0)
+                axes[3].grid(True, alpha=0.3)
+                axes[4].plot(f1_history, linewidth=2)
+                axes[4].set_xlabel("epoch")
+                axes[4].set_ylabel("selected F1")
+                axes[4].set_title(f"selected F1 | current={f1_history[-1]:.4f}")
+                axes[4].set_ylim(0.0, 1.0)
+                axes[4].grid(True, alpha=0.3)
+                fig.tight_layout()
+                display(fig)
+                plt.close(fig)
+
+        with torch.no_grad():
+            hidden = trunk(X_norm)
+            keep_logits = keep_head(hidden).squeeze(1)
+            probs = torch.sigmoid(keep_logits)
+            preds = (probs >= float(pruning_thresh)).float()
+            acc = float((preds == y.squeeze(1)).float().mean().item())
+            pos_acc = float((preds[pos_mask] == y_flat[pos_mask]).float().mean().item()) if num_pos > 0 else float("nan")
+            neg_acc = float((preds[neg_mask] == y_flat[neg_mask]).float().mean().item()) if num_neg > 0 else float("nan")
+            pred_pos = preds > 0.5
+            tp = int((pred_pos & pos_mask).sum().item())
+            fp = int((pred_pos & neg_mask).sum().item())
+            fn = int(((~pred_pos) & pos_mask).sum().item())
+            precision = float(tp / max(tp + fp, 1))
+            recall = float(tp / max(tp + fn, 1))
+            f1 = float((2.0 * precision * recall) / max(precision + recall, 1e-8))
+            probs_cpu = probs.detach().cpu()
+            preds_cpu = preds.detach().cpu()
+
+        ranked_rows = sorted(
+            [
+                {
+                    **row,
+                    "keep_prob": float(prob),
+                    "pred_selected": bool(pred),
+                }
+                for row, prob, pred in zip(rows, probs_cpu.tolist(), preds_cpu.tolist())
+            ],
+            key=lambda row: (-row["keep_prob"], row["gid"]),
+        )
+        pred_selected_gids = sorted(int(row["gid"]) for row in ranked_rows if bool(row["pred_selected"]))
+        diagnostics = {
+            "learned_num_gids": int(len(ordered_gids)),
+            "learned_num_selected": int(y.sum().item()),
+            "learned_num_rejected": int(len(ordered_gids) - int(y.sum().item())),
+            "learned_embed_dim": int(embed_dim),
+            "learned_num_layers": int(num_layers),
+            "learned_epochs": int(epochs),
+            "learned_pruning_thresh": float(pruning_thresh),
+            "learned_loss_mode": loss_mode,
+            "learned_focal_alpha": float(focal_alpha),
+            "learned_focal_gamma": float(focal_gamma),
+            "learned_plot_every": int(plot_every),
+            "learned_pos_weight": float(pos_weight),
+            "learned_train_loss_final": float(keep_loss.item()),
+            "learned_train_acc_final": float(acc),
+            "learned_train_selected_acc_final": float(pos_acc),
+            "learned_train_non_selected_acc_final": float(neg_acc),
+            "learned_train_selected_f1_final": float(f1),
+            "learned_train_device": str(train_device),
+            "learned_feature_names": feature_names,
+            "learned_rows": ranked_rows,
+            "learned_pred_selected_gids": pred_selected_gids,
+        }
+        return diagnostics
+
     def _resolve_metric_instance_gid_labels(
         self,
         *,
-        use_optimal_collapse: bool = False,
+        collapse_mode: str = "support",
         pred_to_gt_idx: np.ndarray | None = None,
         gt_instance_labels: np.ndarray | None = None,
+        learned_selected_gids: set[int] | None = None,
+        progress_desc: str | None = None,
     ) -> tuple[np.ndarray, dict[str, Any]]:
-        if use_optimal_collapse:
-            if pred_to_gt_idx is None or gt_instance_labels is None:
-                raise ValueError("Optimal collapse requires pred_to_gt_idx and gt_instance_labels.")
-            labels, diagnostics = self._resolve_optimal_metric_instance_labels(pred_to_gt_idx, gt_instance_labels)
-        else:
+        collapse_mode = str(collapse_mode)
+        if collapse_mode == "support":
             labels = self._collapse_point_gid_labels()
             diagnostics = {}
+        elif collapse_mode == "optimal":
+            if pred_to_gt_idx is None or gt_instance_labels is None:
+                raise ValueError("Optimal collapse requires pred_to_gt_idx and gt_instance_labels.")
+            labels, diagnostics = self._resolve_optimal_metric_instance_labels(
+                pred_to_gt_idx,
+                gt_instance_labels,
+                progress_desc=progress_desc,
+            )
+        elif collapse_mode == "learned":
+            if learned_selected_gids is None:
+                raise ValueError("Learned collapse requires learned_selected_gids from a prior fit().")
+            labels = self._collapse_point_gid_labels(allowed_gids=learned_selected_gids)
+            diagnostics = {
+                "learned_pred_selected_gids": sorted(int(gid) for gid in learned_selected_gids),
+                "learned_num_pred_selected_gids": int(len(learned_selected_gids)),
+            }
+        else:
+            raise ValueError(f"Unknown collapse_mode={collapse_mode!r}. Expected one of: support, optimal, learned.")
         diagnostics = {
             **diagnostics,
-            "use_optimal_collapse": bool(use_optimal_collapse),
+            "collapse_mode": collapse_mode,
         }
         return labels, diagnostics
 
@@ -439,12 +826,12 @@ class SAMInstanceRuntime:
                 rgb,
                 config=self.config.tracker,
             )
-            self._tracker.reset_and_seed_masks(seed_pairs)
+            seeded_masks = self._tracker.reset_and_seed_masks(seed_pairs)
         else:
-            self._tracker.restart_and_seed_masks(rgb, seed_pairs)
-        self.seeded_gids = {int(gid) for gid, _ in seed_pairs}
+            seeded_masks = self._tracker.restart_and_seed_masks(rgb, seed_pairs)
+        self.seeded_gids = {int(gid) for gid in seeded_masks}
         self.tracker_frame_idx = 1
-        return {int(gid): mask for gid, mask in seed_pairs}
+        return {int(gid): np.asarray(mask, dtype=bool) for gid, mask in seeded_masks.items()}
 
     def _step_non_seed(self, frame: dict[str, Any]) -> tuple[np.ndarray, list[MaskDecision]]:
         tracker_labels = np.full(frame["point_ids_after"].shape, -1, dtype=np.int32)

@@ -12,31 +12,34 @@ from scipy.spatial import cKDTree
 import torch
 from tqdm.auto import tqdm
 
+from map_runtime.defaults import (
+    CLIP_FEATURE_FILE,
+    CLIP_MODEL_NAME,
+    CLIP_PRETRAINED,
+    CONFIG_DIR,
+    DATASET_CONFIG_NAMES,
+    DEFAULT_EVAL_CHUNK_SIZE,
+    DEFAULT_FEATURE_PROB_TH,
+    DEFAULT_MIN_COMPONENT_SIZE,
+    DEFAULT_MATCH_DISTANCE_TH,
+    DEFAULT_OVO_SCORE_TH,
+    FEATURE_INSTANCE_AGG,
+    FEATURE_SOFTMAX_TEMP,
+    FEATURE_TEXT_TEMPLATE,
+    INPUT_DIR,
+    INSTANCE_SUPPORT_FILE,
+    OVO_FEATURE_AGG,
+    OVO_FEATURE_AGG_OPTIMAL,
+    OVO_TEXT_TEMPLATE,
+    OVO_TEXT_TEMPLATE_OPTIMAL,
+    STATS_PATH,
+    TIMING_PATH,
+)
 from map_runtime.config import load_config
 from map_runtime.instance_label_video import write_instance_label_video_from_scene_output
 from map_runtime.metrics_utils import compute_instance_ap_dataset, finalize_instance_labels_and_scores, iou_acc_from_confmat
 
 
-DATASET_CONFIG_NAMES = {"Replica": "replica", "ScanNet": "scannet"}
-CONFIG_DIR = Path("configs")
-INPUT_DIR = Path("data/input")
-TIMING_PATH = "timing.json"
-STATS_PATH = "stats.json"
-CLIP_FEATURE_FILE = "clip_feats.npy"
-INSTANCE_SUPPORT_FILE = "instance_seed_hits.npy"
-CLIP_MODEL_NAME = "ViT-L-14-336-quickgelu"
-CLIP_PRETRAINED = "openai"
-FEATURE_TEXT_TEMPLATE = "{}"
-FEATURE_SOFTMAX_TEMP = 0.01
-OVO_TEXT_TEMPLATE = "This is a photo of a {}"
-OVO_TEXT_TEMPLATE_OPTIMAL = "{}"
-DEFAULT_MATCH_DISTANCE_TH = 0.03
-DEFAULT_FEATURE_PROB_TH = 0.0
-DEFAULT_OVO_SCORE_TH = 0.0
-DEFAULT_CHUNK_SIZE = 100_000
-FEATURE_INSTANCE_AGG = "mean_probs"
-OVO_FEATURE_AGG = "mean_l2norm_point_features_then_cosine"
-OVO_FEATURE_AGG_OPTIMAL = "mean_point_cosine_scores_after_l2norm"
 GEOM_THRESHOLDS = (0.01, 0.03, 0.05)
 INSTANCE_AP_MEAN_THRESHOLDS = tuple(float(x) for x in np.arange(0.50, 1.00, 0.05))
 INSTANCE_AP_REPORT_THRESHOLDS = (0.25,) + INSTANCE_AP_MEAN_THRESHOLDS
@@ -212,7 +215,7 @@ def load_replica_gt(scene_name: str, replica_root: str | Path | None) -> dict:
     if habitat_points.shape == points.shape and np.allclose(habitat_points, points):
         instance_labels = habitat_instance_labels
     else:
-        _, nn_idx = cKDTree(habitat_points).query(points, k=1, workers=-1)
+        _, nn_idx = cKDTree(habitat_points).query(points, k=1, workers=16)
         instance_labels = habitat_instance_labels[np.asarray(nn_idx, dtype=np.int64)]
     return {
         "points": points,
@@ -281,8 +284,8 @@ def load_instance_support_scores(map_dir: Path) -> np.ndarray:
 def compute_nn_associations(gt_points: np.ndarray, pred_points: np.ndarray) -> dict:
     pred_tree = cKDTree(pred_points)
     gt_tree = cKDTree(gt_points)
-    gt_to_pred_d, gt_to_pred_idx = pred_tree.query(gt_points, k=1, workers=-1)
-    pred_to_gt_d, pred_to_gt_idx = gt_tree.query(pred_points, k=1, workers=-1)
+    gt_to_pred_d, gt_to_pred_idx = pred_tree.query(gt_points, k=1, workers=16)
+    pred_to_gt_d, pred_to_gt_idx = gt_tree.query(pred_points, k=1, workers=16)
     return {
         "gt_to_pred_d": gt_to_pred_d.astype(np.float32),
         "gt_to_pred_idx": gt_to_pred_idx.astype(np.int64),
@@ -671,7 +674,7 @@ def transfer_instance_labels_ovo_style(
     valid_labels = pred_instance_labels[valid]
     valid_points = pred_points[valid]
     k = min(5, valid_points.shape[0])
-    _, knn_idx = cKDTree(valid_points).query(gt_points, k=k, workers=-1)
+    _, knn_idx = cKDTree(valid_points).query(gt_points, k=k, workers=16)
     if k == 1:
         mesh_instance_labels = valid_labels[np.asarray(knn_idx, dtype=np.int64)]
     else:
@@ -1171,8 +1174,8 @@ if __name__ == "__main__":
     parser.add_argument("--feature_prob_th", type=float, default=DEFAULT_FEATURE_PROB_TH, help="Minimum class softmax probability before assigning background.")
     parser.add_argument("--ovo_score_th", type=float, default=DEFAULT_OVO_SCORE_TH, help="Minimum cosine similarity before assigning an OVO-style instance class.")
     parser.add_argument("--use_optimal_text_matching", action="store_true", help="For semantic OVO instance scoring, score each L2-normalized point against text first and then pool per-class scores over the instance.")
-    parser.add_argument("--min_component_size", type=int, default=2000)
-    parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
+    parser.add_argument("--min_component_size", type=int, default=DEFAULT_MIN_COMPONENT_SIZE)
+    parser.add_argument("--chunk_size", type=int, default=DEFAULT_EVAL_CHUNK_SIZE)
     parser.add_argument("--compare", default="", help="Optional baseline run directory or rgb_map.ply path to recompute and compare against after computing current metrics.")
     parser.add_argument("--scannet_raw_root", default=None, help="ScanNet raw scans root containing aggregation and segs files, e.g. /path/to/scannet_v2/scans.")
     parser.add_argument("--replica_root", default=None, help="Replica root containing semantic_gt/ and *_mesh.ply files. Defaults to data/input/Replica.")

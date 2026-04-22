@@ -5,18 +5,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from map_runtime.defaults import CONFIG_DIR, DATASET_CONFIG_NAMES, DEFAULT_CONFIG_PATH, INPUT_DIR, OUTPUT_DIR
 from .config import load_config, update_recursive
 from .datasets import get_dataset
 from .slam_backends import get_slam_backbone
-
-
-DATASET_CONFIG_NAMES = {
-    "Replica": "replica",
-    "ScanNet": "scannet",
-}
-CONFIG_DIR = Path("configs")
-INPUT_DIR = Path("data/input")
-OUTPUT_DIR = Path("data/output")
 
 
 def canonical_dataset_name(dataset_name: str) -> str:
@@ -28,7 +20,7 @@ def canonical_dataset_name(dataset_name: str) -> str:
 def build_scene_config(
     scene: str,
     dataset: str,
-    config_path: str | Path = CONFIG_DIR / "ovo.yaml",
+    config_path: str | Path = DEFAULT_CONFIG_PATH,
     slam_module: str | None = None,
     frame_limit: int | None = None,
     disable_loop_closure: bool = False,
@@ -55,7 +47,7 @@ def load_dataset(
     dataset_name: str,
     scene_name: str,
     frame_limit: int | None = None,
-    config_path: str | Path = CONFIG_DIR / "ovo.yaml",
+    config_path: str | Path = DEFAULT_CONFIG_PATH,
     slam_module: str | None = None,
     disable_loop_closure: bool = False,
 ):
@@ -76,7 +68,7 @@ def load_dataset_and_slam(
     scene_name: str,
     device: str,
     frame_limit: int | None = None,
-    config_path: str | Path = CONFIG_DIR / "ovo.yaml",
+    config_path: str | Path = DEFAULT_CONFIG_PATH,
     slam_module: str | None = None,
     disable_loop_closure: bool = False,
 ):

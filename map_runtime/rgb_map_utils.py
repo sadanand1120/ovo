@@ -5,25 +5,20 @@ import open_clip
 import torch
 import torch.nn.functional as F
 
-
-CLIP_MODEL_NAME = "ViT-L-14-336-quickgelu"
-CLIP_PRETRAINED = "openai"
-CLIP_LOAD_SIZE = 1024
-CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
-CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
-CLIP_GLOBAL_PATCH_THRESHOLD = 0.07
+from map_runtime.defaults import (
+    CLIP_GLOBAL_PATCH_THRESHOLD,
+    CLIP_LOAD_SIZE,
+    CLIP_MEAN,
+    CLIP_MODEL_NAME,
+    CLIP_PRETRAINED,
+    CLIP_STD,
+)
 
 
 def resolve_resized_hw(width: int, height: int, size: int) -> tuple[int, int]:
     if width <= height:
         return size, max(1, int(round(height * size / width)))
     return max(1, int(round(width * size / height))), size
-
-
-def stride_sample_2d(x: torch.Tensor, stride: int) -> torch.Tensor:
-    if stride == 1:
-        return x
-    return x[::stride, ::stride]
 
 
 def pad_to_multiple(batch: torch.Tensor, patch_size: int) -> torch.Tensor:

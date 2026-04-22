@@ -12,14 +12,23 @@ import torch
 from tqdm.auto import tqdm
 
 from map_runtime import geometry
-from map_runtime.rgb_map_utils import (
+from map_runtime.defaults import (
+    CLIP_FEATURE_FILE,
     CLIP_LOAD_SIZE,
     CLIP_MODEL_NAME,
     CLIP_PRETRAINED,
+    DEFAULT_CONFIG_PATH,
+    DEFAULT_MAP_EVERY,
+    DEFAULT_MATCH_DISTANCE_TH,
+    DEFAULT_MAX_TOTAL_POINTS,
+    DEFAULT_RGB_MAP_OUTPUT_ROOT,
+    INSTANCE_SUPPORT_FILE,
+    TIMING_PATH,
+)
+from map_runtime.rgb_map_utils import (
     DenseCLIPExtractor,
     compute_normals_from_depth,
     invert_rigid_transform,
-    stride_sample_2d,
 )
 from map_runtime.sam_instance_runtime import SAMInstanceRuntime, SAMInstanceRuntimeConfig
 from map_runtime.sam2_tracking import _input_dir, _sam2_apply_postprocessing, _sam2_hydra_overrides, _sam2_levels, _sam2_mode
@@ -28,17 +37,6 @@ from map_runtime.scene import (
     get_tracked_pose,
     load_dataset_and_slam,
 )
-
-
-OUTPUT_DIR = Path("data/output/rgb_maps")
-TIMING_PATH = "timing.json"
-CLIP_FEATURE_FILE = "clip_feats.npy"
-INSTANCE_SUPPORT_FILE = "instance_seed_hits.npy"
-DEFAULT_MAP_EVERY = 8
-DEFAULT_POINT_SAMPLE_STRIDE = 2
-DEFAULT_MAX_FRAME_POINTS = 5_000_000
-DEFAULT_MATCH_DISTANCE_TH = 0.03
-
 
 def as_int(value) -> int:
     return int(float(value))
@@ -51,8 +49,7 @@ class RGBMapper:
         device: str,
         total_frames: int,
         map_every: int,
-        point_sample_stride: int,
-        max_frame_points: int,
+        max_total_points: int,
         match_distance_th: float,
         instance_config: SAMInstanceRuntimeConfig | None = None,
     ) -> None:
@@ -60,8 +57,7 @@ class RGBMapper:
         self.cam_intrinsics = torch.tensor(intrinsics.astype(np.float32), device=device)
         self.total_frames = int(total_frames)
         self.map_every = max(1, int(map_every))
-        self.point_sample_stride = max(1, int(point_sample_stride))
-        self.max_frame_points = as_int(max_frame_points)
+        self.max_total_points = as_int(max_total_points)
         self.match_distance_th = float(match_distance_th)
         self.clip_extractor = DenseCLIPExtractor(device)
         self.instance_runtime = SAMInstanceRuntime(
@@ -73,6 +69,7 @@ class RGBMapper:
         )
 
         self.n_points = 0
+        self.total_points_original = 0
         self.points = torch.empty((0, 3), device=device)
         self.colors = torch.empty((0, 3), device=device, dtype=torch.uint8)
         self.normals = torch.empty((0, 3), device=device)
@@ -86,10 +83,66 @@ class RGBMapper:
         self.cached_depth_shape = None
         self.cached_x = None
         self.cached_y = None
-        self.cached_row_ids = None
-        self.cached_col_ids = None
 
-        self.sample_seed_grid = lambda x: stride_sample_2d(x, self.point_sample_stride)
+    def _select_keep_indices(self, total_count: int, keep_count: int) -> torch.Tensor:
+        if keep_count < 0 or keep_count > total_count:
+            raise ValueError(f"Invalid keep_count={keep_count} for total_count={total_count}.")
+        if keep_count == total_count:
+            return torch.arange(total_count, device=self.device)
+        if keep_count == 0:
+            return torch.empty((0,), dtype=torch.long, device=self.device)
+        step = float(total_count) / float(keep_count)
+        keep = torch.floor(torch.arange(keep_count, device=self.device, dtype=torch.float64) * step).long()
+        return keep
+
+    def _rewrite_feature_store(self, keep_indices: torch.Tensor, original_count: int) -> None:
+        if self.feature_tmp_file is not None and not self.feature_tmp_file.closed:
+            self.feature_tmp_file.flush()
+            self.feature_tmp_file.close()
+        keep_np = keep_indices.detach().cpu().numpy()
+        src = np.memmap(
+            self.feature_tmp_path,
+            dtype=np.float16,
+            mode="r",
+            shape=(int(original_count), int(self.clip_extractor.feature_dim)),
+        )
+        rewritten_path = self.feature_tmpdir / "clip_feats_resampled.bin"
+        chunk_size = 131072
+        with open(rewritten_path, "wb") as dst:
+            chunk_iter = range(0, keep_np.shape[0], chunk_size)
+            for start in tqdm(chunk_iter, desc="downsample clip", unit="chunk", dynamic_ncols=True):
+                end = min(start + chunk_size, keep_np.shape[0])
+                np.ascontiguousarray(src[keep_np[start:end]], dtype=np.float16).tofile(dst)
+        del src
+        rewritten_path.replace(self.feature_tmp_path)
+        self.feature_tmp_file = open(self.feature_tmp_path, "ab")
+        self.n_features = int(keep_np.shape[0])
+
+    def finalize_for_output(self) -> None:
+        original_count = int(self.n_points)
+        if self.total_points_original == 0:
+            self.total_points_original = original_count
+        if original_count <= int(self.max_total_points):
+            print(
+                f"[downsample] not needed: total_points_original={original_count:,} "
+                f"<= max_total_points={int(self.max_total_points):,}"
+            )
+            return
+        print(
+            f"[downsample] needed: total_points_original={original_count:,} "
+            f"> max_total_points={int(self.max_total_points):,}"
+        )
+        keep = self._select_keep_indices(original_count, int(self.max_total_points))
+        self.points[: keep.shape[0]] = self.points[keep]
+        self.colors[: keep.shape[0]] = self.colors[keep]
+        self.normals[: keep.shape[0]] = self.normals[keep]
+        self.color_sum[: keep.shape[0]] = self.color_sum[keep]
+        self.normal_sum[: keep.shape[0]] = self.normal_sum[keep]
+        self.obs_count[: keep.shape[0]] = self.obs_count[keep]
+        self.n_points = int(keep.shape[0])
+        self.instance_runtime.keep_point_ids(keep.detach().cpu().numpy())
+        self._rewrite_feature_store(keep, original_count)
+        print(f"[downsample] done: kept {self.n_points:,} / {original_count:,} points")
 
     def should_map_frame(self, frame_id: int) -> bool:
         return frame_id % self.map_every == 0
@@ -112,20 +165,14 @@ class RGBMapper:
         self.normal_sum = grow(self.normal_sum, 3)
         self.obs_count = grow(self.obs_count)
 
-    def _get_cached_sampled_grids(self, depth_shape: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _get_cached_grids(self, depth_shape: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor]:
         if self.cached_depth_shape != depth_shape:
             h, w = depth_shape
             full_y, full_x = torch.meshgrid(torch.arange(h, device=self.device), torch.arange(w, device=self.device), indexing="ij")
-            self.cached_x = self.sample_seed_grid(full_x)
-            self.cached_y = self.sample_seed_grid(full_y)
-            ds_h, ds_w = self.cached_x.shape
-            self.cached_row_ids, self.cached_col_ids = torch.meshgrid(
-                torch.arange(ds_h, device=self.device),
-                torch.arange(ds_w, device=self.device),
-                indexing="ij",
-            )
+            self.cached_x = full_x
+            self.cached_y = full_y
             self.cached_depth_shape = depth_shape
-        return self.cached_x, self.cached_y, self.cached_row_ids, self.cached_col_ids
+        return self.cached_x, self.cached_y
 
     def _append_points(self, points: torch.Tensor, colors: torch.Tensor, normals: torch.Tensor, features: torch.Tensor | None = None) -> None:
         start = self.n_points
@@ -183,7 +230,7 @@ class RGBMapper:
             depth = torch.from_numpy(depth_np).to(self.device)
             image = torch.from_numpy(image_np).to(self.device)
             full_image = image
-            x, y, row_ids, col_ids = self._get_cached_sampled_grids((h, w))
+            x, y = self._get_cached_grids((h, w))
             mask = depth > 0
 
             if self.n_points > 0:
@@ -206,47 +253,37 @@ class RGBMapper:
             if is_seed_frame:
                 seed_labels_np = self.instance_runtime.extract_seed_labels(image_np)
                 tr_labels_full = torch.from_numpy(seed_labels_np).to(self.device)
-                depth_sampled = self.sample_seed_grid(depth)
-                mask_sampled = self.sample_seed_grid(mask)
-                image_sampled = self.sample_seed_grid(image)
-                point_ids_sampled = self.sample_seed_grid(point_ids_after)
-                normals_cam, normal_valid = compute_normals_from_depth(x, y, depth_sampled, self.cam_intrinsics)
-                visible_existing = (point_ids_sampled >= 0) & normal_valid
+                normals_cam, normal_valid = compute_normals_from_depth(x, y, depth, self.cam_intrinsics)
+                visible_existing = (point_ids_after >= 0) & normal_valid
                 if visible_existing.any():
-                    visible_ids = point_ids_sampled[visible_existing]
-                    visible_colors = image_sampled[visible_existing].reshape(-1, 3)
+                    visible_ids = point_ids_after[visible_existing]
+                    visible_colors = image[visible_existing].reshape(-1, 3)
                     visible_normals = normals_cam[visible_existing].reshape(-1, 3)
                     visible_normals = torch.einsum("ij,mj->mi", c2w[:3, :3], visible_normals)
                     visible_normals = visible_normals / torch.linalg.norm(visible_normals, dim=1, keepdim=True).clamp_min(1e-8)
                     self._update_observed_points(visible_ids, visible_colors, visible_normals)
-                mask_sampled = mask_sampled & normal_valid
-                if mask_sampled.any():
-                    x_keep = x[mask_sampled]
-                    y_keep = y[mask_sampled]
-                    row_keep = row_ids[mask_sampled]
-                    col_keep = col_ids[mask_sampled]
-                    depth_keep = depth_sampled[mask_sampled]
-                    colors = image_sampled[mask_sampled].reshape(-1, 3)
-                    normals_cam = normals_cam[mask_sampled].reshape(-1, 3)
-                    if depth_keep.shape[0] > self.max_frame_points:
-                        keep = torch.linspace(0, depth_keep.shape[0] - 1, self.max_frame_points, device=self.device).round().long()
-                        x_keep, y_keep = x_keep[keep], y_keep[keep]
-                        row_keep, col_keep = row_keep[keep], col_keep[keep]
-                        depth_keep, colors = depth_keep[keep], colors[keep]
-                        normals_cam = normals_cam[keep]
-
-                    dense_clip = self.clip_extractor.extract_dense(full_image, tr_labels_full)
-                    features = dense_clip[y_keep, x_keep].half()
-                    x_3d = (x_keep - self.cam_intrinsics[0, 2]) * depth_keep / self.cam_intrinsics[0, 0]
-                    y_3d = (y_keep - self.cam_intrinsics[1, 2]) * depth_keep / self.cam_intrinsics[1, 1]
-                    points = torch.stack((x_3d, y_3d, depth_keep, torch.ones_like(depth_keep)), dim=1)
-                    points = torch.einsum("ij,mj->mi", c2w, points)[:, :3]
-                    normals = torch.einsum("ij,mj->mi", c2w[:3, :3], normals_cam)
-                    normals = normals / torch.linalg.norm(normals, dim=1, keepdim=True).clamp_min(1e-8)
-                    old_n = self.n_points
-                    new_ids = torch.arange(old_n, old_n + points.shape[0], device=self.device, dtype=torch.int32)
-                    point_ids_after[y_keep, x_keep] = new_ids
-                    self._append_points(points, colors, normals, features)
+                mask = mask & normal_valid
+                if mask.any():
+                    x_keep = x[mask]
+                    y_keep = y[mask]
+                    depth_keep = depth[mask]
+                    colors = image[mask].reshape(-1, 3)
+                    normals_cam = normals_cam[mask].reshape(-1, 3)
+                    candidate_count = int(depth_keep.shape[0])
+                    self.total_points_original += candidate_count
+                    if depth_keep.numel() > 0:
+                        dense_clip = self.clip_extractor.extract_dense(full_image, tr_labels_full)
+                        features = dense_clip[y_keep, x_keep].half()
+                        x_3d = (x_keep - self.cam_intrinsics[0, 2]) * depth_keep / self.cam_intrinsics[0, 0]
+                        y_3d = (y_keep - self.cam_intrinsics[1, 2]) * depth_keep / self.cam_intrinsics[1, 1]
+                        points = torch.stack((x_3d, y_3d, depth_keep, torch.ones_like(depth_keep)), dim=1)
+                        points = torch.einsum("ij,mj->mi", c2w, points)[:, :3]
+                        normals = torch.einsum("ij,mj->mi", c2w[:3, :3], normals_cam)
+                        normals = normals / torch.linalg.norm(normals, dim=1, keepdim=True).clamp_min(1e-8)
+                        old_n = self.n_points
+                        new_ids = torch.arange(old_n, old_n + points.shape[0], device=self.device, dtype=torch.int32)
+                        point_ids_after[y_keep, x_keep] = new_ids
+                        self._append_points(points, colors, normals, features)
 
         self.instance_runtime.ensure_point_capacity(self.n_points)
         self.instance_runtime.process_frame(
@@ -344,10 +381,10 @@ class RGBMapper:
                 "instance_reuse_outside_frac_th": float(self.instance_runtime.config.pipeline.reuse_outside_frac_th),
                 "instance_min_mask_points": int(self.instance_runtime.config.pipeline.min_mask_points),
                 "instance_min_track_visible_points": int(self.instance_runtime.config.pipeline.min_track_visible_points),
+                "instance_prune_start_at": int(self.instance_runtime.config.pipeline.prune_start_at),
                 "instance_prune_every_frames": int(self.instance_runtime.config.pipeline.prune_every_frames),
-                "instance_prune_stale_gap_frames": int(self.instance_runtime.config.pipeline.prune_stale_gap_frames),
-                "instance_prune_min_support_ratio": float(self.instance_runtime.config.pipeline.prune_min_support_ratio),
-                "instance_prune_min_points": int(self.instance_runtime.config.pipeline.prune_min_points),
+                "instance_prune_min_support_perc": float(self.instance_runtime.config.pipeline.prune_min_support_perc),
+                "instance_prune_min_points_perc": float(self.instance_runtime.config.pipeline.prune_min_points_perc),
                 **self.instance_runtime.stats,
             }
             stats.update(
@@ -397,7 +434,6 @@ def build_run_stats(
     scene_name: str,
     device: str,
     n_frames: int,
-    point_sample_stride: int,
 ) -> dict:
     return {
         "dataset_name": canonical_dataset_name(dataset_name),
@@ -409,8 +445,8 @@ def build_run_stats(
         "slam_module": config["slam"].get("slam_module", "vanilla"),
         "slam_close_loops": bool(config["slam"].get("close_loops", True)),
         "map_every": mapper.map_every,
-        "point_sample_stride": point_sample_stride,
-        "max_frame_points": mapper.max_frame_points,
+        "max_total_points": mapper.max_total_points,
+        "total_points_original": mapper.total_points_original,
         "match_distance_th": mapper.match_distance_th,
         "clip_model_name": CLIP_MODEL_NAME,
         "clip_pretrained": CLIP_PRETRAINED,
@@ -438,8 +474,7 @@ def run_scene_build(
     disable_loop_closure: bool,
     config_path: str,
     map_every: int,
-    point_sample_stride: int,
-    max_frame_points: int,
+    max_total_points: int,
     match_distance_th: float,
     extra_stats: dict | None = None,
     snapshot_hook=None,
@@ -465,8 +500,7 @@ def run_scene_build(
         device=device,
         total_frames=len(dataset),
         map_every=map_every,
-        point_sample_stride=point_sample_stride,
-        max_frame_points=max_frame_points,
+        max_total_points=max_total_points,
         match_distance_th=match_distance_th,
     )
 
@@ -490,6 +524,8 @@ def run_scene_build(
         progress.close()
     frame_loop_sec = time.perf_counter() - frame_loop_start
 
+    mapper.finalize_for_output()
+
     stats = build_run_stats(
         mapper=mapper,
         config=config,
@@ -497,7 +533,6 @@ def run_scene_build(
         scene_name=scene_name,
         device=device,
         n_frames=len(dataset),
-        point_sample_stride=point_sample_stride,
     )
     if extra_stats:
         stats.update(extra_stats)
@@ -521,15 +556,14 @@ def run_scene_build(
     }
 
 
-def add_build_args(parser: argparse.ArgumentParser, *, default_output_root: str | Path, default_map_every: int) -> None:
+def add_build_args(parser: argparse.ArgumentParser, *, default_output_root: str | Path) -> None:
     parser.add_argument("--output_root", default=str(default_output_root))
     parser.add_argument("--frame_limit", type=int, default=None)
     parser.add_argument("--slam_module", type=str, default=None, help="Override slam backend, e.g. vanilla, orbslam, or cuvslam.")
     parser.add_argument("--disable_loop_closure", action="store_true", help="Disable ORB-SLAM loop closure/global BA updates by forcing slam.close_loops=false.")
-    parser.add_argument("--config_path", type=str, default="configs/ovo.yaml", help="Base runtime config file to load.")
-    parser.add_argument("--map_every", type=int, default=default_map_every)
-    parser.add_argument("--point_sample_stride", type=int, default=DEFAULT_POINT_SAMPLE_STRIDE, help="Seed-frame point-sampling stride used for geometry/normal/label sampling before point fusion.")
-    parser.add_argument("--max_frame_points", type=int, default=DEFAULT_MAX_FRAME_POINTS)
+    parser.add_argument("--config_path", type=str, default=str(DEFAULT_CONFIG_PATH), help="Base runtime config file to load.")
+    parser.add_argument("--map_every", type=int, default=DEFAULT_MAP_EVERY)
+    parser.add_argument("--max_total_points", type=int, default=DEFAULT_MAX_TOTAL_POINTS)
     parser.add_argument("--match_distance_th", type=float, default=DEFAULT_MATCH_DISTANCE_TH)
 
 
@@ -543,8 +577,7 @@ def main(args):
         disable_loop_closure=args.disable_loop_closure,
         config_path=args.config_path,
         map_every=args.map_every,
-        point_sample_stride=args.point_sample_stride,
-        max_frame_points=args.max_frame_points,
+        max_total_points=args.max_total_points,
         match_distance_th=args.match_distance_th,
     )
     print(json.dumps({"timing": timing_summary}, indent=2))
@@ -555,6 +588,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build a standalone RGB pointcloud map from RGB-D using the selected SLAM pose backend.")
     parser.add_argument("--dataset_name", required=True, choices=["Replica", "ScanNet"])
     parser.add_argument("--scene_name", required=True)
-    add_build_args(parser, default_output_root=OUTPUT_DIR, default_map_every=DEFAULT_MAP_EVERY)
+    add_build_args(parser, default_output_root=DEFAULT_RGB_MAP_OUTPUT_ROOT)
     parsed = parser.parse_args()
     main(parsed)

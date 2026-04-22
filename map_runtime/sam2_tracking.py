@@ -32,6 +32,7 @@ _sam2_apply_postprocessing = True
 class SAMTrackerConfig:
     model_level: int = 24
     max_num_objects: int = 16
+    boundary_masking_width: int = 0
 
 
 def logits_to_mask(mask_logits: np.ndarray) -> np.ndarray:
@@ -41,6 +42,31 @@ def logits_to_mask(mask_logits: np.ndarray) -> np.ndarray:
     if mask.ndim != 2:
         raise ValueError(f"Expected 2D mask after squeeze, got shape {mask.shape}")
     return mask.astype(bool, copy=False)
+
+
+def trim_mask_boundary(mask: np.ndarray, boundary_masking_width: int) -> np.ndarray:
+    mask = np.asarray(mask, dtype=bool)
+    width = int(boundary_masking_width)
+    if width <= 0 or not mask.any():
+        return mask.astype(bool, copy=False)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    eroded = cv2.erode(mask.astype(np.uint8), kernel, iterations=width)
+    return eroded.astype(bool, copy=False)
+
+
+def apply_boundary_masking_to_labels(labels: np.ndarray, boundary_masking_width: int) -> np.ndarray:
+    labels = np.asarray(labels, dtype=np.int32)
+    width = int(boundary_masking_width)
+    if width <= 0:
+        return labels.astype(np.int32, copy=True)
+    masked = np.full(labels.shape, -1, dtype=np.int32)
+    for obj_id in np.unique(labels).tolist():
+        if int(obj_id) < 0:
+            continue
+        interior = trim_mask_boundary(labels == int(obj_id), width)
+        if interior.any():
+            masked[interior] = int(obj_id)
+    return masked
 
 
 def build_label_masks(labels: np.ndarray, max_objects: int | None = None) -> list[tuple[int, np.ndarray]]:
@@ -207,28 +233,23 @@ class SAM2VideoTracker:
             )
         return int(frame_idx_out), list(obj_ids), mask_logits.detach().cpu().numpy()
 
-    def _finalize_seed(self, frame_idx: int) -> dict[int, np.ndarray]:
-        with self._inference_context():
-            self.predictor.propagate_in_video_preflight(self.inference_state)
-            current_out = self.inference_state["output_dict"]["cond_frame_outputs"][int(frame_idx)]
-            obj_ids = list(self.inference_state["obj_ids"])
-            _, video_res_masks = self.predictor._get_orig_video_res_output(
-                self.inference_state,
-                current_out["pred_masks"],
-            )
-        self.inference_state["frames_already_tracked"][int(frame_idx)] = {"reverse": False}
-        return {
-            int(obj_id): logits_to_mask(video_res_masks[out_idx].detach().cpu().numpy())
-            for out_idx, obj_id in enumerate(obj_ids)
-        }
-
     def reset_and_seed_masks(self, seed_masks: list[tuple[int, np.ndarray]]) -> dict[int, np.ndarray]:
         self.predictor.reset_state(self.inference_state)
         if not seed_masks:
             return {}
+        retained_seed_masks: dict[int, np.ndarray] = {}
         for obj_id, mask in seed_masks:
+            mask = np.asarray(mask, dtype=bool)
+            if not mask.any():
+                continue
+            retained_seed_masks[int(obj_id)] = mask
             self._request_add_mask(frame_idx=0, obj_id=int(obj_id), mask=mask)
-        return self._finalize_seed(frame_idx=0)
+        if not retained_seed_masks:
+            return {}
+        with self._inference_context():
+            self.predictor.propagate_in_video_preflight(self.inference_state)
+        self.inference_state["frames_already_tracked"][0] = {"reverse": False}
+        return retained_seed_masks
 
     def restart_and_seed_masks(
         self,
@@ -267,6 +288,9 @@ class SAM2VideoTracker:
         with self._inference_context():
             _, video_res_masks = self.predictor._get_orig_video_res_output(self.inference_state, pred_masks)
         return {
-            int(obj_id): logits_to_mask(video_res_masks[out_idx].detach().cpu().numpy())
+            int(obj_id): trim_mask_boundary(
+                logits_to_mask(video_res_masks[out_idx].detach().cpu().numpy()),
+                self.config.boundary_masking_width,
+            )
             for out_idx, obj_id in enumerate(obj_ids)
         }

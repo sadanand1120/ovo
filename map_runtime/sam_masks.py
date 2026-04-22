@@ -9,7 +9,13 @@ import sys
 import numpy as np
 import torch
 
-from map_runtime.sam2_tracking import _sam2_apply_postprocessing, _sam2_hydra_overrides, _sam2_levels, _sam2_mode
+from map_runtime.sam2_tracking import (
+    _sam2_apply_postprocessing,
+    _sam2_hydra_overrides,
+    _sam2_levels,
+    _sam2_mode,
+    apply_boundary_masking_to_labels,
+)
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "thirdParty" / "segment-anything-2"))
@@ -27,6 +33,7 @@ _sam_amg_levels = {**_sam1_levels, **_sam2_levels}
 class SAMMaskExtractorConfig:
     model_level: int = 13
     sort_mode: str = "area"
+    boundary_masking_width: int = 0
     min_mask_area_perc: float = 0.01
     points_per_side: int = 24
     points_per_batch: int = 128
@@ -71,7 +78,6 @@ def mask_score(
     if sort_mode == "score":
         return (predicted_iou**pred_iou_power) * (stability**stability_power) * (area**area_power)
     return area
-
 
 def rescore_masks_by_redundancy(
     masks: list[np.ndarray],
@@ -316,4 +322,5 @@ class SAMMaskExtractor:
     @torch.inference_mode()
     def extract_labels(self, image: np.ndarray) -> np.ndarray:
         masks = self.mask_generator.generate(image)
-        return flatten_masks(masks, image.shape, self.config)
+        labels = flatten_masks(masks, image.shape, self.config)
+        return apply_boundary_masking_to_labels(labels, self.config.boundary_masking_width)

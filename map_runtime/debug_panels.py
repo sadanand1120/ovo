@@ -118,6 +118,29 @@ def overlay_binary_mask(
     return overlay
 
 
+def render_depth_map(depth: np.ndarray | None) -> np.ndarray:
+    if depth is None:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+    depth = np.asarray(depth, dtype=np.float32)
+    canvas = np.zeros((*depth.shape, 3), dtype=np.uint8)
+    valid = np.isfinite(depth) & (depth >= 0.0)
+    if valid.any():
+        valid_depth = depth[valid]
+        depth_min = float(valid_depth.min())
+        depth_max = float(np.quantile(valid_depth, 0.99))
+        if depth_max <= depth_min + 1e-8:
+            gray = np.full(depth.shape, 255, dtype=np.uint8)
+        else:
+            clipped = np.clip(depth, depth_min, depth_max)
+            gray = np.clip((clipped - depth_min) / (depth_max - depth_min), 0.0, 1.0)
+            gray = np.round(gray * 255.0).astype(np.uint8)
+        canvas[valid] = np.stack([gray[valid], gray[valid], gray[valid]], axis=1)
+    negative = np.isfinite(depth) & (depth < 0.0)
+    if negative.any():
+        canvas[negative] = np.array([255, 0, 0], dtype=np.uint8)
+    return canvas
+
+
 def overlay_header(image: np.ndarray, title: str, subtitle: str) -> np.ndarray:
     image = np.asarray(image, dtype=np.uint8)
     canvas = np.zeros((image.shape[0] + HEADER_HEIGHT, image.shape[1], 3), dtype=np.uint8)
@@ -126,6 +149,12 @@ def overlay_header(image: np.ndarray, title: str, subtitle: str) -> np.ndarray:
     cv2.putText(canvas, title, (20, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.85, TEXT_COLOR, 2, cv2.LINE_AA)
     cv2.putText(canvas, subtitle, (20, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.70, TEXT_COLOR, 2, cv2.LINE_AA)
     return canvas
+
+
+def _mask_count_subtitle(mask: np.ndarray | None, fallback: str) -> str:
+    if mask is None:
+        return fallback
+    return f"count={int(np.asarray(mask, dtype=bool).sum()):,}"
 
 
 def compose_instance_debug_grid(
@@ -147,6 +176,10 @@ def compose_instance_debug_grid(
     new_point_subtitle: str = "",
     current_point_title: str = "Current Map Points",
     current_point_subtitle: str = "",
+    depth: np.ndarray | None = None,
+    filter_depth_mask: np.ndarray | None = None,
+    filter_unmatched_mask: np.ndarray | None = None,
+    filter_normal_mask: np.ndarray | None = None,
     enabled_panels: dict[str, bool] | None = None,
 ) -> np.ndarray:
     rgb = np.asarray(rgb, dtype=np.uint8)
@@ -155,7 +188,7 @@ def compose_instance_debug_grid(
         overlay_header(
         overlay_binary_mask(rgb, new_point_mask, color=(255, 255, 0), alpha=0.65),
         new_point_title,
-        new_point_subtitle or f"frame={frame_id}",
+        new_point_subtitle or _mask_count_subtitle(new_point_mask, f"frame={frame_id}"),
         ),
         enabled_panels.get("new_points", True),
     )
@@ -171,7 +204,7 @@ def compose_instance_debug_grid(
         overlay_header(
         overlay_binary_mask(rgb, current_point_mask, color=(0, 255, 255), alpha=0.65),
         current_point_title,
-        current_point_subtitle or f"frame={frame_id}",
+        current_point_subtitle or _mask_count_subtitle(current_point_mask, f"frame={frame_id}"),
         ),
         enabled_panels.get("current_points", True),
     )
@@ -207,6 +240,41 @@ def compose_instance_debug_grid(
         ),
         enabled_panels.get("all_gids_after", True),
     )
+    filter_depth_panel = _disable_panel(
+        overlay_header(
+        overlay_binary_mask(rgb, filter_depth_mask, color=(255, 128, 0), alpha=0.65),
+        "Filter 1: depth > 0",
+        _mask_count_subtitle(filter_depth_mask, "seed frame only"),
+        ),
+        enabled_panels.get("filter_depth", True),
+    )
+    filter_unmatched_panel = _disable_panel(
+        overlay_header(
+        overlay_binary_mask(rgb, filter_unmatched_mask, color=(255, 0, 255), alpha=0.65),
+        "Filter 2: unmatched",
+        _mask_count_subtitle(filter_unmatched_mask, "seed frame only"),
+        ),
+        enabled_panels.get("filter_unmatched", True),
+    )
+    filter_normal_panel = _disable_panel(
+        overlay_header(
+        overlay_binary_mask(rgb, filter_normal_mask, color=(0, 255, 0), alpha=0.65),
+        "Filter 3: valid normals",
+        _mask_count_subtitle(filter_normal_mask, "seed frame only"),
+        ),
+        enabled_panels.get("filter_normal", True),
+    )
+    depth_neg_mask = None if depth is None else np.asarray(depth, dtype=np.float32) < 0.0
+    depth_subtitle = "seed frame only" if depth is None else f"neg={int(np.asarray(depth_neg_mask, dtype=bool).sum()):,}"
+    depth_panel = _disable_panel(
+        overlay_header(
+        render_depth_map(depth),
+        "Depth Map",
+        depth_subtitle,
+        ),
+        enabled_panels.get("depth_map", True),
+    )
     top_row = np.hstack((new_points_panel, last_seed_panel, current_panel, current_points_panel))
     bottom_row = np.hstack((collapsed_before_panel, collapsed_after_panel, all_gids_before_panel, all_gids_after_panel))
-    return np.vstack((top_row, bottom_row))
+    filter_row = np.hstack((depth_panel, filter_depth_panel, filter_unmatched_panel, filter_normal_panel))
+    return np.vstack((top_row, bottom_row, filter_row))

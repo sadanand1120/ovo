@@ -177,6 +177,10 @@ def decode_scene(scene_dir: Path, output_scene_dir: Path, frame_skip: int, min_f
     intrinsic_dir.mkdir(exist_ok=True)
 
     sensor_data = SensorData(sens_files[0])
+    if not np.isclose(sensor_data.depth_shift, 1000.0):
+        raise ValueError(
+            f"Unexpected ScanNet depth_shift={sensor_data.depth_shift} in {sens_files[0]}; expected 1000.0"
+        )
     save_matrix(sensor_data.intrinsic_color, intrinsic_dir / "intrinsic_color.txt")
     save_matrix(sensor_data.extrinsic_color, intrinsic_dir / "extrinsic_color.txt")
     save_matrix(sensor_data.intrinsic_depth, intrinsic_dir / "intrinsic_depth.txt")
@@ -259,12 +263,7 @@ def main() -> None:
     parser.add_argument("--link_pcds", action="store_true", help="Link each ground-truth mesh into the decoded scene folder.")
     parser.add_argument("--write_semantic_gt", action="store_true", help="Write semantic_gt/<scene>.txt from each labeled ScanNet mesh.")
     parser.add_argument("--extract_2d_gt_filt", action="store_true", help="Extract *_2d-label-filt.zip and *_2d-instance-filt.zip into each decoded scene folder.")
-    parser.add_argument(
-        "--min_free_gb",
-        type=float,
-        default=100.0,
-        help="Abort before writing more data if free space drops below this threshold.",
-    )
+    parser.add_argument("--min_free_gb", type=float, default=100.0, help="Abort before writing more data if free space drops below this threshold.")
     args = parser.parse_args()
 
     args.output_root.mkdir(parents=True, exist_ok=True)

@@ -9,15 +9,11 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from map_runtime.defaults import CACHE_MANIFEST_FILE, FRAME_CACHE_DIR, STATS_PATH
 from . import geometry
 from .debug_panels import overlay_header, render_sorted_label_map
 from .rgb_map_utils import invert_rigid_transform
 from .scene import get_tracked_pose, load_dataset_and_slam
-
-
-CACHE_MANIFEST_FILE = "cache_manifest.json"
-FRAME_CACHE_DIR = "frame_cache"
-STATS_PATH = "stats.json"
 
 
 def _project_point_labels_to_image(point_ids_image: np.ndarray, point_labels: np.ndarray) -> np.ndarray:

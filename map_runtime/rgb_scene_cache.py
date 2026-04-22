@@ -12,27 +12,25 @@ import torch
 from tqdm.auto import tqdm
 
 from map_runtime import geometry
-from map_runtime.rgb_map_utils import (
+from map_runtime.defaults import (
+    CACHE_MANIFEST_FILE,
+    CLIP_FEATURE_FILE,
     CLIP_LOAD_SIZE,
     CLIP_MODEL_NAME,
     CLIP_PRETRAINED,
+    FRAME_CACHE_DIR,
+    FRAME_CACHE_FILE_TEMPLATE,
+    POINT_BIRTH_FRAME_FILE,
+    STATS_PATH,
+    TIMING_PATH,
+)
+from map_runtime.rgb_map_utils import (
     DenseCLIPExtractor,
     compute_normals_from_depth,
     invert_rigid_transform,
-    stride_sample_2d,
 )
 from map_runtime.sam_masks import SAMMaskExtractor, SAMMaskExtractorConfig
 from map_runtime.scene import canonical_dataset_name, get_tracked_pose, load_dataset_and_slam
-
-
-TIMING_PATH = "timing.json"
-STATS_PATH = "stats.json"
-CLIP_FEATURE_FILE = "clip_feats.npy"
-POINT_BIRTH_FRAME_FILE = "point_birth_frame.npy"
-CACHE_MANIFEST_FILE = "cache_manifest.json"
-FRAME_CACHE_DIR = "frame_cache"
-FRAME_CACHE_FILE_TEMPLATE = "{frame_id:06d}.npz"
-
 
 def as_int(value) -> int:
     return int(float(value))
@@ -44,15 +42,13 @@ class RGBSceneCacheBuilder:
         intrinsics: np.ndarray,
         device: str,
         map_every: int,
-        point_sample_stride: int,
-        max_frame_points: int,
+        max_total_points: int,
         match_distance_th: float,
     ) -> None:
         self.device = device
         self.cam_intrinsics = torch.tensor(intrinsics.astype(np.float32), device=device)
         self.map_every = max(1, int(map_every))
-        self.point_sample_stride = max(1, int(point_sample_stride))
-        self.max_frame_points = as_int(max_frame_points)
+        self.max_total_points = as_int(max_total_points)
         self.match_distance_th = float(match_distance_th)
         self.clip_extractor = DenseCLIPExtractor(device)
         self.textregion_mask_extractor = SAMMaskExtractor(
@@ -61,6 +57,7 @@ class RGBSceneCacheBuilder:
         )
 
         self.n_points = 0
+        self.total_points_original = 0
         self.points = torch.empty((0, 3), device=device)
         self.colors = torch.empty((0, 3), device=device, dtype=torch.uint8)
         self.normals = torch.empty((0, 3), device=device)
@@ -75,9 +72,93 @@ class RGBSceneCacheBuilder:
         self.cached_depth_shape = None
         self.cached_x = None
         self.cached_y = None
-        self.cached_row_ids = None
-        self.cached_col_ids = None
-        self.sample_seed_grid = lambda x: stride_sample_2d(x, self.point_sample_stride)
+
+    def _select_keep_indices(self, total_count: int, keep_count: int) -> torch.Tensor:
+        if keep_count < 0 or keep_count > total_count:
+            raise ValueError(f"Invalid keep_count={keep_count} for total_count={total_count}.")
+        if keep_count == total_count:
+            return torch.arange(total_count, device=self.device)
+        if keep_count == 0:
+            return torch.empty((0,), dtype=torch.long, device=self.device)
+        step = float(total_count) / float(keep_count)
+        keep = torch.floor(torch.arange(keep_count, device=self.device, dtype=torch.float64) * step).long()
+        return keep
+
+    def _rewrite_feature_store(self, keep_indices: torch.Tensor, original_count: int) -> None:
+        if self.feature_tmp_file is not None and not self.feature_tmp_file.closed:
+            self.feature_tmp_file.flush()
+            self.feature_tmp_file.close()
+        keep_np = keep_indices.detach().cpu().numpy()
+        src = np.memmap(
+            self.feature_tmp_path,
+            dtype=np.float16,
+            mode="r",
+            shape=(int(original_count), int(self.clip_extractor.feature_dim)),
+        )
+        rewritten_path = self.feature_tmpdir / "clip_feats_resampled.bin"
+        chunk_size = 131072
+        with open(rewritten_path, "wb") as dst:
+            chunk_iter = range(0, keep_np.shape[0], chunk_size)
+            for start in tqdm(chunk_iter, desc="downsample clip", unit="chunk", dynamic_ncols=True):
+                end = min(start + chunk_size, keep_np.shape[0])
+                np.ascontiguousarray(src[keep_np[start:end]], dtype=np.float16).tofile(dst)
+        del src
+        rewritten_path.replace(self.feature_tmp_path)
+        self.feature_tmp_file = open(self.feature_tmp_path, "ab")
+        self.n_features = int(keep_np.shape[0])
+
+    @staticmethod
+    def _remap_point_ids(point_ids: np.ndarray, point_id_map: np.ndarray) -> np.ndarray:
+        point_ids = np.asarray(point_ids, dtype=np.int32)
+        remapped = np.full(point_ids.shape, -1, dtype=np.int32)
+        valid = point_ids >= 0
+        if valid.any():
+            remapped[valid] = point_id_map[point_ids[valid]]
+        return remapped
+
+    def finalize_for_output(self, output_dir: Path) -> None:
+        original_count = int(self.n_points)
+        if self.total_points_original == 0:
+            self.total_points_original = original_count
+        if original_count <= int(self.max_total_points):
+            print(
+                f"[downsample] not needed: total_points_original={original_count:,} "
+                f"<= max_total_points={int(self.max_total_points):,}"
+            )
+            return
+        print(
+            f"[downsample] needed: total_points_original={original_count:,} "
+            f"> max_total_points={int(self.max_total_points):,}"
+        )
+        keep = self._select_keep_indices(original_count, int(self.max_total_points))
+        keep_np = keep.detach().cpu().numpy()
+        point_id_map = np.full((original_count,), -1, dtype=np.int32)
+        point_id_map[keep_np] = np.arange(keep_np.shape[0], dtype=np.int32)
+        self.points[: keep.shape[0]] = self.points[keep]
+        self.colors[: keep.shape[0]] = self.colors[keep]
+        self.normals[: keep.shape[0]] = self.normals[keep]
+        self.color_sum[: keep.shape[0]] = self.color_sum[keep]
+        self.normal_sum[: keep.shape[0]] = self.normal_sum[keep]
+        self.obs_count[: keep.shape[0]] = self.obs_count[keep]
+        self.point_birth_frame[: keep.shape[0]] = self.point_birth_frame[keep]
+        self.n_points = int(keep.shape[0])
+        self._rewrite_feature_store(keep, original_count)
+
+        cache_paths = sorted((output_dir / FRAME_CACHE_DIR).glob("*.npz"))
+        for cache_path in tqdm(cache_paths, desc="remap frame cache", unit="frame", dynamic_ncols=True):
+            with np.load(cache_path) as data:
+                frame_cache = {key: np.array(data[key], copy=True) for key in data.files}
+            frame_cache["point_ids_before"] = self._remap_point_ids(frame_cache["point_ids_before"], point_id_map)
+            frame_cache["point_ids_after"] = self._remap_point_ids(frame_cache["point_ids_after"], point_id_map)
+            frame_cache["new_point_mask"] = np.asarray(
+                frame_cache["new_point_mask"].astype(bool, copy=False) & (frame_cache["point_ids_after"] >= 0),
+                dtype=bool,
+            )
+            np.savez_compressed(cache_path, **frame_cache)
+        print(
+            f"[downsample] done: kept {self.n_points:,} / {original_count:,} points "
+            f"and remapped {len(cache_paths):,} cached frames"
+        )
 
     def should_map_frame(self, frame_id: int) -> bool:
         return frame_id % self.map_every == 0
@@ -101,20 +182,14 @@ class RGBSceneCacheBuilder:
         self.obs_count = grow(self.obs_count)
         self.point_birth_frame = grow(self.point_birth_frame)
 
-    def _get_cached_sampled_grids(self, depth_shape: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _get_cached_grids(self, depth_shape: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor]:
         if self.cached_depth_shape != depth_shape:
             h, w = depth_shape
             full_y, full_x = torch.meshgrid(torch.arange(h, device=self.device), torch.arange(w, device=self.device), indexing="ij")
-            self.cached_x = self.sample_seed_grid(full_x)
-            self.cached_y = self.sample_seed_grid(full_y)
-            ds_h, ds_w = self.cached_x.shape
-            self.cached_row_ids, self.cached_col_ids = torch.meshgrid(
-                torch.arange(ds_h, device=self.device),
-                torch.arange(ds_w, device=self.device),
-                indexing="ij",
-            )
+            self.cached_x = full_x
+            self.cached_y = full_y
             self.cached_depth_shape = depth_shape
-        return self.cached_x, self.cached_y, self.cached_row_ids, self.cached_col_ids
+        return self.cached_x, self.cached_y
 
     def _append_points(
         self,
@@ -167,6 +242,9 @@ class RGBSceneCacheBuilder:
         point_ids_before = torch.full((h, w), -1, dtype=torch.int32, device=self.device)
         point_ids_after = torch.full((h, w), -1, dtype=torch.int32, device=self.device)
         new_point_mask = np.zeros((h, w), dtype=bool)
+        filter_depth_mask = np.zeros((h, w), dtype=bool)
+        filter_unmatched_mask = np.zeros((h, w), dtype=bool)
+        filter_normal_mask = np.zeros((h, w), dtype=bool)
         valid_pose = c2w_np is not None
 
         if valid_pose:
@@ -190,12 +268,15 @@ class RGBSceneCacheBuilder:
                 "point_ids_before": point_ids_before.cpu().numpy(),
                 "point_ids_after": point_ids_after.cpu().numpy(),
                 "new_point_mask": new_point_mask,
+                "filter_depth_mask": filter_depth_mask,
+                "filter_unmatched_mask": filter_unmatched_mask,
+                "filter_normal_mask": filter_normal_mask,
             }
 
         depth = torch.from_numpy(depth_np).to(self.device)
         image = torch.from_numpy(image_np).to(self.device)
         full_image = image
-        x, y, row_ids, col_ids = self._get_cached_sampled_grids((h, w))
+        x, y = self._get_cached_grids((h, w))
         mask = depth > 0
 
         if self.n_points > 0:
@@ -219,55 +300,48 @@ class RGBSceneCacheBuilder:
         if is_seed_frame:
             tr_labels_np = self.textregion_mask_extractor.extract_labels(image_np)
             tr_labels_full = torch.from_numpy(tr_labels_np).to(self.device)
-            depth_sampled = self.sample_seed_grid(depth)
-            mask_sampled = self.sample_seed_grid(mask)
-            image_sampled = self.sample_seed_grid(image)
-            point_ids_sampled = self.sample_seed_grid(point_ids_after)
-            normals_cam, normal_valid = compute_normals_from_depth(x, y, depth_sampled, self.cam_intrinsics)
-            visible_existing = (point_ids_sampled >= 0) & normal_valid
+            filter_depth_mask = np.asarray((depth > 0).detach().cpu().numpy(), dtype=bool)
+            filter_unmatched_mask = np.asarray(mask.detach().cpu().numpy(), dtype=bool)
+            normals_cam, normal_valid = compute_normals_from_depth(x, y, depth, self.cam_intrinsics)
+            visible_existing = (point_ids_after >= 0) & normal_valid
             if visible_existing.any():
-                visible_ids = point_ids_sampled[visible_existing]
-                visible_colors = image_sampled[visible_existing].reshape(-1, 3)
+                visible_ids = point_ids_after[visible_existing]
+                visible_colors = image[visible_existing].reshape(-1, 3)
                 visible_normals = normals_cam[visible_existing].reshape(-1, 3)
                 visible_normals = torch.einsum("ij,mj->mi", c2w[:3, :3], visible_normals)
                 visible_normals = visible_normals / torch.linalg.norm(visible_normals, dim=1, keepdim=True).clamp_min(1e-8)
                 self._update_observed_points(visible_ids, visible_colors, visible_normals)
 
-            mask_sampled = mask_sampled & normal_valid
-            if mask_sampled.any():
-                x_keep = x[mask_sampled]
-                y_keep = y[mask_sampled]
-                row_keep = row_ids[mask_sampled]
-                col_keep = col_ids[mask_sampled]
-                depth_keep = depth_sampled[mask_sampled]
-                colors = image_sampled[mask_sampled].reshape(-1, 3)
-                normals_cam = normals_cam[mask_sampled].reshape(-1, 3)
-                if depth_keep.shape[0] > self.max_frame_points:
-                    keep = torch.linspace(0, depth_keep.shape[0] - 1, self.max_frame_points, device=self.device).round().long()
-                    x_keep, y_keep = x_keep[keep], y_keep[keep]
-                    row_keep, col_keep = row_keep[keep], col_keep[keep]
-                    depth_keep, colors = depth_keep[keep], colors[keep]
-                    normals_cam = normals_cam[keep]
-                dense_clip = self.clip_extractor.extract_dense(full_image, tr_labels_full)
-                features = dense_clip[y_keep, x_keep].half()
-                x_3d = (x_keep - self.cam_intrinsics[0, 2]) * depth_keep / self.cam_intrinsics[0, 0]
-                y_3d = (y_keep - self.cam_intrinsics[1, 2]) * depth_keep / self.cam_intrinsics[1, 1]
-                points = torch.stack((x_3d, y_3d, depth_keep, torch.ones_like(depth_keep)), dim=1)
-                points = torch.einsum("ij,mj->mi", c2w, points)[:, :3]
-                normals = torch.einsum("ij,mj->mi", c2w[:3, :3], normals_cam)
-                normals = normals / torch.linalg.norm(normals, dim=1, keepdim=True).clamp_min(1e-8)
-                old_n = self.n_points
-                new_ids = torch.arange(old_n, old_n + points.shape[0], device=self.device, dtype=torch.int32)
-                point_ids_sampled[row_keep, col_keep] = new_ids
-                point_ids_after[y_keep, x_keep] = new_ids
-                new_point_mask[y_keep.cpu().numpy(), x_keep.cpu().numpy()] = True
-                self._append_points(
-                    points,
-                    colors,
-                    normals,
-                    features,
-                    birth_frame_id=int(frame_id),
-                )
+            mask = mask & normal_valid
+            filter_normal_mask = np.asarray(mask.detach().cpu().numpy(), dtype=bool)
+            if mask.any():
+                x_keep = x[mask]
+                y_keep = y[mask]
+                depth_keep = depth[mask]
+                colors = image[mask].reshape(-1, 3)
+                normals_cam = normals_cam[mask].reshape(-1, 3)
+                candidate_count = int(depth_keep.shape[0])
+                self.total_points_original += candidate_count
+                if depth_keep.numel() > 0:
+                    dense_clip = self.clip_extractor.extract_dense(full_image, tr_labels_full)
+                    features = dense_clip[y_keep, x_keep].half()
+                    x_3d = (x_keep - self.cam_intrinsics[0, 2]) * depth_keep / self.cam_intrinsics[0, 0]
+                    y_3d = (y_keep - self.cam_intrinsics[1, 2]) * depth_keep / self.cam_intrinsics[1, 1]
+                    points = torch.stack((x_3d, y_3d, depth_keep, torch.ones_like(depth_keep)), dim=1)
+                    points = torch.einsum("ij,mj->mi", c2w, points)[:, :3]
+                    normals = torch.einsum("ij,mj->mi", c2w[:3, :3], normals_cam)
+                    normals = normals / torch.linalg.norm(normals, dim=1, keepdim=True).clamp_min(1e-8)
+                    old_n = self.n_points
+                    new_ids = torch.arange(old_n, old_n + points.shape[0], device=self.device, dtype=torch.int32)
+                    point_ids_after[y_keep, x_keep] = new_ids
+                    new_point_mask[y_keep.cpu().numpy(), x_keep.cpu().numpy()] = True
+                    self._append_points(
+                        points,
+                        colors,
+                        normals,
+                        features,
+                        birth_frame_id=int(frame_id),
+                    )
 
         return {
             "frame_id": int(frame_id),
@@ -279,6 +353,9 @@ class RGBSceneCacheBuilder:
             "point_ids_before": point_ids_before.cpu().numpy(),
             "point_ids_after": point_ids_after.cpu().numpy(),
             "new_point_mask": new_point_mask,
+            "filter_depth_mask": filter_depth_mask,
+            "filter_unmatched_mask": filter_unmatched_mask,
+            "filter_normal_mask": filter_normal_mask,
         }
 
     def save(self, output_dir: Path, stats: dict) -> dict:
@@ -344,6 +421,9 @@ def write_frame_cache(output_dir: Path, frame_cache: dict) -> None:
         point_ids_before=frame_cache["point_ids_before"].astype(np.int32, copy=False),
         point_ids_after=frame_cache["point_ids_after"].astype(np.int32, copy=False),
         new_point_mask=frame_cache["new_point_mask"].astype(bool, copy=False),
+        filter_depth_mask=frame_cache["filter_depth_mask"].astype(bool, copy=False),
+        filter_unmatched_mask=frame_cache["filter_unmatched_mask"].astype(bool, copy=False),
+        filter_normal_mask=frame_cache["filter_normal_mask"].astype(bool, copy=False),
     )
 
 
@@ -366,8 +446,8 @@ def build_run_stats(
         "slam_module": config["slam"].get("slam_module", "vanilla"),
         "slam_close_loops": bool(config["slam"].get("close_loops", True)),
         "map_every": builder.map_every,
-        "point_sample_stride": builder.point_sample_stride,
-        "max_frame_points": builder.max_frame_points,
+        "max_total_points": builder.max_total_points,
+        "total_points_original": builder.total_points_original,
         "match_distance_th": builder.match_distance_th,
         "clip_model_name": CLIP_MODEL_NAME,
         "clip_pretrained": CLIP_PRETRAINED,
@@ -398,7 +478,6 @@ def write_cache_manifest(
     n_frames: int,
     n_points: int,
     map_every: int,
-    point_sample_stride: int,
 ) -> None:
     manifest = {
         "version": 1,
@@ -407,7 +486,6 @@ def write_cache_manifest(
         "n_frames": int(n_frames),
         "n_points": int(n_points),
         "map_every": int(map_every),
-        "point_sample_stride": int(point_sample_stride),
         "intrinsics": intrinsics.astype(np.float32).tolist(),
         "source_width": int(source_width),
         "source_height": int(source_height),
@@ -432,8 +510,7 @@ def run_scene_cache_build(
     disable_loop_closure: bool,
     config_path: str,
     map_every: int,
-    point_sample_stride: int,
-    max_frame_points: int,
+    max_total_points: int,
     match_distance_th: float,
 ) -> tuple[Path, dict]:
     run_start = time.perf_counter()
@@ -459,8 +536,7 @@ def run_scene_cache_build(
         intrinsics=dataset.intrinsics,
         device=device,
         map_every=map_every,
-        point_sample_stride=point_sample_stride,
-        max_frame_points=max_frame_points,
+        max_total_points=max_total_points,
         match_distance_th=match_distance_th,
     )
 
@@ -479,6 +555,8 @@ def run_scene_cache_build(
     finally:
         progress.close()
     frame_loop_sec = time.perf_counter() - frame_loop_start
+
+    builder.finalize_for_output(output_dir)
 
     stats = build_run_stats(
         builder=builder,
@@ -499,7 +577,6 @@ def run_scene_cache_build(
         n_frames=len(dataset),
         n_points=builder.n_points,
         map_every=map_every,
-        point_sample_stride=point_sample_stride,
     )
     timing_summary = {
         "dataset_load_sec": dataset_load_sec,

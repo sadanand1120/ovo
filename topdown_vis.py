@@ -6,27 +6,28 @@ import cv2
 import numpy as np
 
 from build_rgb_map import (
-    DEFAULT_MAP_EVERY,
     add_build_args,
     canonical_dataset_name,
     run_scene_build,
 )
 from get_metrics_map import load_pred_map
-from visualize_rgb_map import (
-    DEFAULT_CHUNK_SIZE,
+from map_runtime.defaults import (
+    DEFAULT_MIN_COMPONENT_SIZE,
     DEFAULT_PCA_SAMPLE_SIZE,
+    DEFAULT_TOPDOWN_POINT_DILATE,
+    DEFAULT_TOPDOWN_VIDEO_FPS,
+    DEFAULT_TOPDOWN_VIS_OUTPUT_ROOT,
+    DEFAULT_VIS_CHUNK_SIZE,
+    TOPDOWN_FRUSTUM_COLOR,
+    TOPDOWN_FRUSTUM_DEPTH,
+    TOPDOWN_FRUSTUM_THICKNESS,
+    TOPDOWN_VIDEO_DIR_NAME,
+)
+from visualize_rgb_map import (
     apply_pca_colormap_chunked,
     colorize_instance_labels,
     resolve_instance_labels,
 )
-
-
-VIDEO_FPS = 8
-POINT_DILATE = 3
-VIDEO_DIR_NAME = "topdown_videos"
-FRUSTUM_DEPTH = 0.6
-FRUSTUM_COLOR = (40, 40, 220)
-FRUSTUM_THICKNESS = 2
 
 def load_view(view_path: Path) -> tuple[np.ndarray, np.ndarray, int, int]:
     view = json.loads(view_path.read_text())
@@ -203,9 +204,9 @@ def render_incremental_video(
                 extrinsic,
                 width,
                 height,
-                FRUSTUM_DEPTH,
-                FRUSTUM_COLOR,
-                FRUSTUM_THICKNESS,
+                TOPDOWN_FRUSTUM_DEPTH,
+                TOPDOWN_FRUSTUM_COLOR,
+                TOPDOWN_FRUSTUM_THICKNESS,
             )
             cv2.putText(frame, f"{mode_name} view build", (24, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (30, 30, 30), 2, cv2.LINE_AA)
             cv2.putText(frame, f"frame: {frame_id}", (24, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (30, 30, 30), 2, cv2.LINE_AA)
@@ -241,8 +242,7 @@ def main(args: argparse.Namespace) -> None:
         disable_loop_closure=args.disable_loop_closure,
         config_path=args.config_path,
         map_every=args.map_every,
-        point_sample_stride=args.point_sample_stride,
-        max_frame_points=args.max_frame_points,
+        max_total_points=args.max_total_points,
         match_distance_th=args.match_distance_th,
         snapshot_hook=snapshot_hook,
     )
@@ -266,7 +266,7 @@ def main(args: argparse.Namespace) -> None:
     ).astype(np.uint8)
     instance_colors = (colorize_instance_labels(resolve_instance_labels(output_dir, points.shape[0], args.min_component_size)) * 255.0).astype(np.uint8)
 
-    video_dir = output_dir / VIDEO_DIR_NAME
+    video_dir = output_dir / TOPDOWN_VIDEO_DIR_NAME
     source_intrinsic = build_meta["dataset_intrinsics"]
     source_width = build_meta["source_width"]
     source_height = build_meta["source_height"]
@@ -297,11 +297,11 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_name", required=True, choices=["Replica", "ScanNet"])
     parser.add_argument("--scene_name", required=True)
     parser.add_argument("--load-view", required=True, help="Path to a saved view JSON dumped from visualize_rgb_map.py.")
-    add_build_args(parser, default_output_root="data/output/topdown_vis", default_map_every=DEFAULT_MAP_EVERY)
-    parser.add_argument("--fps", type=int, default=VIDEO_FPS)
-    parser.add_argument("--dilate", type=int, default=POINT_DILATE)
-    parser.add_argument("--min_component_size", type=int, default=2000)
+    add_build_args(parser, default_output_root=DEFAULT_TOPDOWN_VIS_OUTPUT_ROOT)
+    parser.add_argument("--fps", type=int, default=DEFAULT_TOPDOWN_VIDEO_FPS)
+    parser.add_argument("--dilate", type=int, default=DEFAULT_TOPDOWN_POINT_DILATE)
+    parser.add_argument("--min_component_size", type=int, default=DEFAULT_MIN_COMPONENT_SIZE)
     parser.add_argument("--pca_sample_size", type=int, default=DEFAULT_PCA_SAMPLE_SIZE)
-    parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
+    parser.add_argument("--chunk_size", type=int, default=DEFAULT_VIS_CHUNK_SIZE)
     parsed = parser.parse_args()
     main(parsed)
