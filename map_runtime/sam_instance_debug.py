@@ -5,6 +5,7 @@ import html
 import json
 import pickle
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 from typing import Any
 
@@ -16,7 +17,13 @@ from tqdm.auto import tqdm
 
 from map_runtime.debug_panels import color_for_id, compose_instance_debug_grid, overlay_header, render_sorted_label_map
 from map_runtime.defaults import CACHE_MANIFEST_FILE, CLIP_FEATURE_FILE, FRAME_CACHE_DIR, POINT_BIRTH_FRAME_FILE
-from map_runtime.instance_label_video import write_instance_label_video_from_cache
+from map_runtime.metrics_utils import (
+    build_instance_iou_from_candidates,
+    collect_instance_candidates,
+    compute_instance_metrics_from_iou,
+    finalize_instance_labels_and_scores,
+    solve_oracle_pruning_for_ap,
+)
 from map_runtime.sam2_tracking import SAM2VideoTracker, build_label_masks
 from map_runtime.sam_instance_runtime import InstanceBucket, SAMInstanceRuntime, SAMInstanceRuntimeConfig
 
@@ -54,6 +61,23 @@ class SceneCache:
 
 DEBUG_INSTANCE_CACHE_DIR = "cache_instances"
 DEBUG_INSTANCE_CACHE_FILE = "full_state.pkl"
+DEBUG_TIMELINE_FRAME_DIR = "timeline_frames"
+DEBUG_TIMELINE_CACHE_VERSION = 1
+
+
+def _normalize_oracle_prune_num_inst_perc_delta(
+    oracle_prune_num_inst_perc_delta: tuple[float, float] | None,
+) -> tuple[float, float] | None:
+    if oracle_prune_num_inst_perc_delta is None:
+        return None
+    if len(oracle_prune_num_inst_perc_delta) != 2:
+        raise ValueError(
+            "oracle_prune_num_inst_perc_delta must be a 2-tuple like (0.8, 1.1)."
+        )
+    return (
+        float(oracle_prune_num_inst_perc_delta[0]),
+        float(oracle_prune_num_inst_perc_delta[1]),
+    )
 
 
 def _debug_render_matplotlib_figure(fig) -> np.ndarray:
@@ -120,8 +144,9 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
         self.debug_gid_stats: dict[int, dict[str, Any]] = {}
         self.debug_last_gt_selection_summary: dict[str, Any] | None = None
         self.debug_last_plots_videos_summary: dict[str, Any] | None = None
-        self.debug_last_learned_collapse_summary: dict[str, Any] | None = None
-        self.debug_last_learned_fit_frame_id: int | None = None
+        self.debug_last_learned_postpruning_summary: dict[str, Any] | None = None
+        self.debug_last_learned_postpruning_frame_id: int | None = None
+        self._debug_record_timeline_cache = False
 
     def _summarize_frame(self, view: dict[str, Any]) -> None:
         self.history.append(
@@ -142,12 +167,68 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
     def _debug_instance_cache_path(self) -> Path:
         return self._debug_instance_cache_dir() / DEBUG_INSTANCE_CACHE_FILE
 
-    def _debug_optimal_metric_gid_labels_path(self, *, frame_id: int | None = None, min_component_size: int) -> Path:
-        target_frame = int(self.current_frame_id if frame_id is None else frame_id)
-        return (
-            self._debug_instance_cache_dir()
-            / f"debug_optimal_metric_gid_labels_frame_{target_frame:06d}_mincomp_{int(min_component_size)}.npy"
+    def _debug_timeline_frame_dir(self) -> Path:
+        return self._debug_instance_cache_dir() / DEBUG_TIMELINE_FRAME_DIR
+
+    def _debug_timeline_frame_path(self, frame_id: int) -> Path:
+        return self._debug_timeline_frame_dir() / f"{int(frame_id):06d}.npz"
+
+    def _debug_has_timeline_frame_cache(self) -> bool:
+        frame_dir = self._debug_timeline_frame_dir()
+        if not frame_dir.exists():
+            return False
+        version_path = frame_dir / "version.json"
+        if not version_path.exists():
+            return False
+        with open(version_path, "r") as handle:
+            version_payload = json.load(handle)
+        if int(version_payload.get("version", -1)) != int(DEBUG_TIMELINE_CACHE_VERSION):
+            return False
+        expected = self.total_frames
+        actual = len(list(frame_dir.glob("*.npz")))
+        return int(actual) == int(expected)
+
+    def _debug_prepare_timeline_frame_cache(self) -> None:
+        frame_dir = self._debug_timeline_frame_dir()
+        if frame_dir.exists():
+            shutil.rmtree(frame_dir)
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        with open(frame_dir / "version.json", "w") as handle:
+            json.dump({"version": int(DEBUG_TIMELINE_CACHE_VERSION)}, handle)
+
+    def _debug_write_timeline_frame_cache(
+        self,
+        *,
+        frame_id: int,
+        is_seed_frame: bool,
+        last_seed_labels: np.ndarray | None,
+        current_labels: np.ndarray,
+        point_ids_after: np.ndarray,
+        changed_point_ids: np.ndarray,
+        changed_rows_after: np.ndarray,
+    ) -> None:
+        np.savez_compressed(
+            self._debug_timeline_frame_path(frame_id),
+            frame_id=np.int32(frame_id),
+            is_seed_frame=np.bool_(is_seed_frame),
+            last_seed_labels=np.asarray(last_seed_labels if last_seed_labels is not None else np.full(current_labels.shape, -1, dtype=np.int32), dtype=np.int32),
+            current_labels=np.asarray(current_labels, dtype=np.int32),
+            point_ids_after=np.asarray(point_ids_after, dtype=np.int32),
+            changed_point_ids=np.asarray(changed_point_ids, dtype=np.int32),
+            changed_rows_after=np.asarray(changed_rows_after, dtype=np.int32),
         )
+
+    def _debug_load_timeline_frame_cache(self, frame_id: int) -> dict[str, Any]:
+        with np.load(self._debug_timeline_frame_path(frame_id)) as data:
+            return {
+                "frame_id": int(data["frame_id"]),
+                "is_seed_frame": bool(data["is_seed_frame"]),
+                "last_seed_labels": np.array(data["last_seed_labels"], copy=True),
+                "current_labels": np.array(data["current_labels"], copy=True),
+                "point_ids_after": np.array(data["point_ids_after"], copy=True),
+                "changed_point_ids": np.array(data["changed_point_ids"], copy=True),
+                "changed_rows_after": np.array(data["changed_rows_after"], copy=True),
+            }
 
     def _debug_collect_timeline_snapshot(self) -> dict[str, Any]:
         frame_id = int(self.current_frame_id)
@@ -239,8 +320,8 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
         self.debug_gid_stats = dict(payload.get("debug_gid_stats", {}))
         self.debug_last_gt_selection_summary = payload.get("debug_last_gt_selection_summary")
         self.debug_last_plots_videos_summary = payload.get("debug_last_plots_videos_summary")
-        self.debug_last_learned_collapse_summary = None
-        self.debug_last_learned_fit_frame_id = None
+        self.debug_last_learned_postpruning_summary = None
+        self.debug_last_learned_postpruning_frame_id = None
         self._refresh_gid_scores()
 
     def _debug_load_instance_cache(self) -> bool:
@@ -280,14 +361,16 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
         projected_after = self._project_primary_labels(frame["point_ids_after"])
         all_gids_after = self._project_all_gid_rows(frame["point_ids_after"])
         changed_point_ids = np.flatnonzero(np.any(point_gids_before != self.point_gids, axis=1))
+        changed_rows_after = self.point_gids[changed_point_ids].astype(np.int32, copy=True)
         point_gid_changes = [
             {
                 "point_id": int(point_id),
                 "before": point_gids_before[point_id].astype(np.int32, copy=True).tolist(),
-                "after": self.point_gids[point_id].astype(np.int32, copy=True).tolist(),
+                "after": changed_rows_after[idx].tolist(),
             }
-            for point_id in changed_point_ids.tolist()
+            for idx, point_id in enumerate(changed_point_ids.tolist())
         ]
+        current_labels = seed_labels if frame["is_seed_frame"] else tracker_labels
         view = {
             "frame_id": int(frame["frame_id"]),
             "is_seed_frame": bool(frame["is_seed_frame"]),
@@ -319,6 +402,16 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
         self.current_frame_id = int(frame["frame_id"])
         self.current_view = view
         self._summarize_frame(view)
+        if self._debug_record_timeline_cache:
+            self._debug_write_timeline_frame_cache(
+                frame_id=int(frame["frame_id"]),
+                is_seed_frame=bool(frame["is_seed_frame"]),
+                last_seed_labels=self.last_seed_labels,
+                current_labels=np.asarray(current_labels, dtype=np.int32),
+                point_ids_after=np.asarray(frame["point_ids_after"], dtype=np.int32),
+                changed_point_ids=changed_point_ids.astype(np.int32, copy=False),
+                changed_rows_after=changed_rows_after,
+            )
         return view
 
     def seek(self, frame_id: int) -> dict[str, Any]:
@@ -341,11 +434,15 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
         if target_frame == self.total_frames - 1 and self._debug_load_instance_cache():
             if self.current_view is None:
                 raise RuntimeError("Loaded instance cache but current_view is missing.")
-            return self.current_view
+            if self._debug_has_timeline_frame_cache():
+                return self.current_view
+            self.reset()
         if target_frame < self.current_frame_id:
             self.reset()
         if target_frame == self.total_frames - 1:
             self.debug_timeline_snapshots = []
+            self._debug_prepare_timeline_frame_cache()
+            self._debug_record_timeline_cache = True
         progress = tqdm(
             range(self.current_frame_id + 1, target_frame + 1),
             desc=progress_desc,
@@ -360,6 +457,7 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
                     self.debug_timeline_snapshots.append(self._debug_collect_timeline_snapshot())
         finally:
             progress.close()
+            self._debug_record_timeline_cache = False
         if self.current_view is None:
             raise RuntimeError("Debugger did not produce a current view.")
         if target_frame == self.total_frames - 1:
@@ -433,15 +531,10 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
         if output_path.exists():
             output_path.unlink()
 
-        try:
-            from tqdm.auto import tqdm
-        except Exception:  # noqa: BLE001
-            tqdm = None
-
         self.reset()
         writer: cv2.VideoWriter | None = None
         iterator = range(target_frame + 1)
-        progress = tqdm(iterator, desc="simulate_video", unit="frame") if tqdm is not None else iterator
+        progress = tqdm(iterator, desc="simulate_video", unit="frame", leave=False, dynamic_ncols=True)
         try:
             for _ in progress:
                 self.step()
@@ -460,7 +553,7 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
         finally:
             if writer is not None:
                 writer.release()
-            if tqdm is not None and hasattr(progress, "close"):
+            if hasattr(progress, "close"):
                 progress.close()
 
         try:
@@ -490,17 +583,12 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
         if output_path.exists():
             output_path.unlink()
 
-        try:
-            from tqdm.auto import tqdm
-        except Exception:  # noqa: BLE001
-            tqdm = None
-
         mask_extractor = self._ensure_mask_extractor()
         local_tracker: SAM2VideoTracker | None = None
         tracker_frame_idx = 0
         writer: cv2.VideoWriter | None = None
         iterator = range(target_frame + 1)
-        progress = tqdm(iterator, desc="simulate_sam_onlyseed_video", unit="frame") if tqdm is not None else iterator
+        progress = tqdm(iterator, desc="simulate_sam_onlyseed_video", unit="frame", leave=False, dynamic_ncols=True)
         try:
             for frame_id in progress:
                 frame = self.cache.load_frame(int(frame_id))
@@ -562,7 +650,7 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
                 writer.release()
             if local_tracker is not None:
                 local_tracker.close()
-            if tqdm is not None and hasattr(progress, "close"):
+            if hasattr(progress, "close"):
                 progress.close()
 
         try:
@@ -576,46 +664,34 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
     def _debug_current_map_points(self, frame_id: int) -> int:
         return int(np.searchsorted(self.cache.point_birth_frame, int(frame_id), side="right"))
 
-    @staticmethod
-    def _debug_filter_metric_gid_labels(
-        metric_gid_labels: np.ndarray,
-        min_component_size: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        filtered_labels = np.asarray(metric_gid_labels, dtype=np.int32).copy()
-        valid = filtered_labels >= 0
-        if valid.any() and int(min_component_size) > 1:
-            uniq, counts = np.unique(filtered_labels[valid], return_counts=True)
-            keep = uniq[counts >= int(min_component_size)]
-            filtered_labels[~np.isin(filtered_labels, keep)] = -1
-            valid = filtered_labels >= 0
-        surviving_gids = np.unique(filtered_labels[valid]).astype(np.int32, copy=False) if valid.any() else np.empty((0,), dtype=np.int32)
-        return filtered_labels, surviving_gids
-
     def _debug_resolve_optimal_selected_gids(
         self,
         *,
         scannet_raw_root: str | Path | None,
         replica_root: str | Path | None,
         min_component_size: int,
+        oracle_prune_iou_th: float | None,
+        oracle_prune_num_inst_perc_delta: tuple[float, float] | None,
         progress_desc: str | None = None,
     ) -> dict[str, Any]:
-        from get_metrics_map import compute_nn_associations, load_gt
+        from get_metrics_map import load_gt
 
         dataset_name = str(self.cache.manifest["dataset_name"])
         scene_name = str(self.cache.manifest["scene_name"])
         expected_scannet_root = None if scannet_raw_root is None else str(scannet_raw_root)
         expected_replica_root = None if replica_root is None else str(replica_root)
-        metric_gid_labels_path = self._debug_optimal_metric_gid_labels_path(min_component_size=int(min_component_size))
+        expected_num_inst_delta = _normalize_oracle_prune_num_inst_perc_delta(oracle_prune_num_inst_perc_delta)
         cached = self.debug_last_gt_selection_summary
         if (
             isinstance(cached, dict)
             and int(cached.get("frame_id", -1)) == int(self.current_frame_id)
             and int(cached.get("min_component_size", -1)) == int(min_component_size)
+            and cached.get("oracle_prune_iou_th") == (None if oracle_prune_iou_th is None else float(oracle_prune_iou_th))
+            and cached.get("oracle_prune_num_inst_perc_delta")
+            == (None if expected_num_inst_delta is None else list(expected_num_inst_delta))
             and cached.get("scannet_raw_root") == expected_scannet_root
             and cached.get("replica_root") == expected_replica_root
             and "selected_gids" in cached
-            and cached.get("filtered_metric_gid_labels_path") == str(metric_gid_labels_path)
-            and metric_gid_labels_path.exists()
         ):
             return {
                 **cached,
@@ -645,46 +721,49 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
                     f"Point-count mismatch between debugger state and rgb_map.ply: {self.point_gids.shape[0]} vs {pred_points.shape[0]}"
                 )
 
-            progress.set_postfix_str("build/query kd-tree", refresh=True)
-            assoc = compute_nn_associations(gt["points"], pred_points)
-            pred_to_gt_idx = assoc["pred_to_gt_idx"]
-            progress.update()
-
-            progress.set_postfix_str("optimal collapse", refresh=True)
-            metric_gid_labels, collapse_diag = self._resolve_metric_instance_gid_labels(
-                collapse_mode="optimal",
-                pred_to_gt_idx=pred_to_gt_idx,
-                gt_instance_labels=gt["instance_labels"],
-                progress_desc=f"{stage_desc}: optimal collapse",
+            progress.set_postfix_str("collect gids", refresh=True)
+            raw_instance_scores = self._raw_instance_support_scores()
+            surviving_gids, surviving_scores, _surviving_counts = collect_instance_candidates(
+                self.point_gids,
+                raw_instance_scores,
+                int(min_component_size),
             )
-            filtered_metric_gid_labels, surviving_gids = self._debug_filter_metric_gid_labels(metric_gid_labels, int(min_component_size))
             progress.update()
 
-            progress.set_postfix_str("transfer 5-nn", refresh=True)
-            from get_metrics_map import transfer_instance_labels_ovo_style
-
-            transferred_gids, transfer_diag = transfer_instance_labels_ovo_style(
+            progress.set_postfix_str("build iou", refresh=True)
+            instance_iou, _gt_instance_ids, transfer_diag = build_instance_iou_from_candidates(
                 pred_points,
-                filtered_metric_gid_labels,
+                self.point_gids,
+                surviving_gids,
                 gt["points"],
+                gt["instance_labels"],
+                progress_desc=f"{stage_desc}: gt transfer",
             )
-            gt_valid = np.asarray(gt["instance_labels"], dtype=np.int32) >= 0
-            selected_gids = np.unique(transferred_gids[gt_valid]).astype(np.int32, copy=False)
-            selected_gids = selected_gids[selected_gids >= 0]
+            progress.update()
+
+            progress.set_postfix_str("oracle prune", refresh=True)
+            oracle_diag = solve_oracle_pruning_for_ap(
+                instance_iou,
+                surviving_scores,
+                None if oracle_prune_iou_th is None else float(oracle_prune_iou_th),
+                pred_ids=surviving_gids,
+                oracle_prune_num_inst_perc_delta=expected_num_inst_delta,
+                progress_desc=f"{stage_desc}: oracle prune",
+            )
+            selected_gids = np.asarray(oracle_diag["selected_pred_ids"], dtype=np.int32)
             progress.update()
         finally:
             progress.close()
-        metric_gid_labels_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(metric_gid_labels_path, filtered_metric_gid_labels.astype(np.int32, copy=False))
         summary = {
             "frame_id": int(self.current_frame_id),
             "min_component_size": int(min_component_size),
+            "oracle_prune_iou_th": None if oracle_prune_iou_th is None else float(oracle_prune_iou_th),
+            "oracle_prune_num_inst_perc_delta": None if expected_num_inst_delta is None else list(expected_num_inst_delta),
             "scannet_raw_root": expected_scannet_root,
             "replica_root": expected_replica_root,
             "selected_gids": sorted(int(gid) for gid in selected_gids.tolist()),
             "surviving_gids": [int(gid) for gid in surviving_gids.tolist()],
-            "filtered_metric_gid_labels_path": str(metric_gid_labels_path),
-            "collapse_diag": collapse_diag,
+            "oracle_diag": oracle_diag,
             "transfer_diag": transfer_diag,
         }
         self.debug_last_gt_selection_summary = summary
@@ -929,12 +1008,91 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
         display(fig)
         return None
 
+    def save_timeline_gid(self, *, gid: int, fps: float = 8.0, output_dir: str | Path | None = None) -> Path:
+        gid = int(gid)
+        if gid < 0:
+            raise ValueError("gid must be >= 0.")
+        if gid not in self.buckets and gid >= int(self.next_gid):
+            raise ValueError(f"gid={gid} is not present in the current debugger state.")
+
+        output_dir = self.cache.cache_dir / "debug_videos" if output_dir is None else Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"timeline_gid_{gid:04d}.mp4"
+        if output_path.exists() and self._debug_has_timeline_frame_cache():
+            try:
+                from IPython.display import Video, display
+
+                display(Video(filename=str(output_path), embed=False, html_attributes="controls"))
+            except Exception:
+                pass
+            return output_path
+
+        self.run_all(upto=-1, progress_desc=f"save_timeline_gid[{gid}] run_all")
+        if not self._debug_has_timeline_frame_cache():
+            raise RuntimeError("Timeline frame cache is missing after run_all().")
+
+        xyz, _rgb = self._debug_get_map_geometry()
+        point_has_gid = np.zeros((int(xyz.shape[0]),), dtype=bool)
+        gid_color = color_for_id(gid)
+        frames: list[np.ndarray] = []
+        progress = tqdm(
+            range(self.total_frames),
+            desc=f"save_timeline_gid[{gid}]",
+            unit="frame",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        try:
+            for frame_id in progress:
+                payload = self._debug_load_timeline_frame_cache(frame_id)
+                changed_ids = np.asarray(payload["changed_point_ids"], dtype=np.int64)
+                changed_rows_after = np.asarray(payload["changed_rows_after"], dtype=np.int32)
+                if changed_ids.size > 0:
+                    point_has_gid[changed_ids] = np.any(changed_rows_after == int(gid), axis=1)
+                point_ids_after = np.asarray(payload["point_ids_after"], dtype=np.int64)
+                gid_mask = np.zeros(point_ids_after.shape, dtype=bool)
+                valid = point_ids_after >= 0
+                if valid.any():
+                    gid_mask[valid] = point_has_gid[point_ids_after[valid]]
+                gid_panel = np.zeros((*gid_mask.shape, 3), dtype=np.uint8)
+                gid_panel[gid_mask] = gid_color
+                last_seed_panel = overlay_header(
+                    render_sorted_label_map(payload["last_seed_labels"]),
+                    "Last Seed SAM Masks",
+                    f"frame={int(frame_id)}",
+                )
+                current_mode = "seed" if bool(payload["is_seed_frame"]) else "tracked"
+                current_panel = overlay_header(
+                    render_sorted_label_map(payload["current_labels"]),
+                    "Current SAM Masks",
+                    f"frame={int(frame_id)} | {current_mode}",
+                )
+                gid_panel = overlay_header(
+                    gid_panel,
+                    f"GID Timeline Projection",
+                    f"gid={gid} | frame={int(frame_id)} | visible={int(gid_mask.sum()):,}",
+                )
+                frames.append(np.hstack([last_seed_panel, current_panel, gid_panel]))
+        finally:
+            progress.close()
+
+        _debug_write_video_frames(frames, output_path, float(fps))
+        try:
+            from IPython.display import Video, display
+
+            display(Video(filename=str(output_path), embed=False, html_attributes="controls"))
+        except Exception:
+            pass
+        return output_path
+
     def fit(
         self,
         *,
         scannet_raw_root: str | Path | None = None,
         replica_root: str | Path | None = None,
         min_component_size: int = 2000,
+        oracle_prune_iou_th: float | None = 0.25,
+        oracle_prune_num_inst_perc_delta: tuple[float, float] | None = None,
         embed_dim: int = 8,
         num_layers: int = 2,
         epochs: int = 2000,
@@ -950,6 +1108,8 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
             scannet_raw_root=scannet_raw_root,
             replica_root=replica_root,
             min_component_size=int(min_component_size),
+            oracle_prune_iou_th=None if oracle_prune_iou_th is None else float(oracle_prune_iou_th),
+            oracle_prune_num_inst_perc_delta=_normalize_oracle_prune_num_inst_perc_delta(oracle_prune_num_inst_perc_delta),
             progress_desc="fit resolve_gt_selection",
         )
         diagnostics = self._fit_learned_gid_selector(
@@ -964,12 +1124,16 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
             show_training_plot=bool(show_progress),
         )
         self.debug_gid_stats = self._debug_build_gid_stats(selected_gids=selection_info["selected_gids"])
-        self.debug_last_learned_collapse_summary = {
+        self.debug_last_learned_postpruning_summary = {
             **diagnostics,
             "target_selected_gids": sorted(int(gid) for gid in selection_info["selected_gids"]),
             "min_component_size": int(min_component_size),
+            "oracle_prune_iou_th": None if oracle_prune_iou_th is None else float(oracle_prune_iou_th),
+            "oracle_prune_num_inst_perc_delta": None
+            if oracle_prune_num_inst_perc_delta is None
+            else list(_normalize_oracle_prune_num_inst_perc_delta(oracle_prune_num_inst_perc_delta)),
         }
-        self.debug_last_learned_fit_frame_id = int(self.current_frame_id)
+        self.debug_last_learned_postpruning_frame_id = int(self.current_frame_id)
         compact_keys = [
             "learned_num_gids",
             "learned_num_selected",
@@ -990,11 +1154,13 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
             "learned_train_selected_f1_final",
             "learned_train_device",
             "min_component_size",
+            "oracle_prune_iou_th",
+            "oracle_prune_num_inst_perc_delta",
         ]
         return {
-            key: self.debug_last_learned_collapse_summary[key]
+            key: self.debug_last_learned_postpruning_summary[key]
             for key in compact_keys
-            if key in self.debug_last_learned_collapse_summary
+            if key in self.debug_last_learned_postpruning_summary
         }
 
     @staticmethod
@@ -1067,6 +1233,8 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
         scannet_raw_root: str | Path | None = None,
         replica_root: str | Path | None = None,
         min_component_size: int = 2000,
+        oracle_prune_iou_th: float | None = 0.25,
+        oracle_prune_num_inst_perc_delta: tuple[float, float] | None = None,
         output_dir: str | Path | None = None,
         fps: float = 4.0,
         hist_bins: int = 150,
@@ -1076,9 +1244,19 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
 
         self.run_all(upto=-1, progress_desc="plots_videos run_all")
         timeline_snapshots = list(self.debug_timeline_snapshots)
+        if not timeline_snapshots:
+            cache_path = self._debug_instance_cache_path()
+            if cache_path.exists():
+                cache_path.unlink()
+            self.reset()
+            self.run_all(upto=-1, progress_desc="plots_videos rebuild_timeline")
+            timeline_snapshots = list(self.debug_timeline_snapshots)
+            if not timeline_snapshots:
+                raise RuntimeError("plots_videos requires timeline snapshots, but none were produced.")
         cached_summary = self.debug_last_plots_videos_summary
         expected_scannet_root = None if scannet_raw_root is None else str(scannet_raw_root)
         expected_replica_root = None if replica_root is None else str(replica_root)
+        expected_num_inst_delta = _normalize_oracle_prune_num_inst_perc_delta(oracle_prune_num_inst_perc_delta)
         if isinstance(cached_summary, dict):
             cached_binary = cached_summary.get("binary_signal")
             cached_points = cached_summary.get("timeline_points_perc")
@@ -1086,6 +1264,9 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
             if (
                 int(cached_summary.get("frame_id", -1)) == int(self.current_frame_id)
                 and int(cached_summary.get("min_component_size", -1)) == int(min_component_size)
+                and cached_summary.get("oracle_prune_iou_th") == (None if oracle_prune_iou_th is None else float(oracle_prune_iou_th))
+                and cached_summary.get("oracle_prune_num_inst_perc_delta")
+                == (None if expected_num_inst_delta is None else list(expected_num_inst_delta))
                 and cached_summary.get("scannet_raw_root") == expected_scannet_root
                 and cached_summary.get("replica_root") == expected_replica_root
                 and isinstance(cached_binary, str)
@@ -1101,6 +1282,8 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
             scannet_raw_root=scannet_raw_root,
             replica_root=replica_root,
             min_component_size=int(min_component_size),
+            oracle_prune_iou_th=None if oracle_prune_iou_th is None else float(oracle_prune_iou_th),
+            oracle_prune_num_inst_perc_delta=expected_num_inst_delta,
             progress_desc="plots_videos resolve_gt_selection",
         )
 
@@ -1134,6 +1317,7 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
                     y_max=1,
                     title="Binary support lifecycle",
                     threshold_value=0.0,
+                    selected_safe_threshold_value=None,
                     annotation_lines=[
                         "No surviving gids at final frame.",
                         f"frame_id={int(self.current_frame_id)}",
@@ -1249,6 +1433,8 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
             "timeline_support_perc": str(support_path),
             "frame_id": int(self.current_frame_id),
             "min_component_size": int(min_component_size),
+            "oracle_prune_iou_th": None if oracle_prune_iou_th is None else float(oracle_prune_iou_th),
+            "oracle_prune_num_inst_perc_delta": None if expected_num_inst_delta is None else list(expected_num_inst_delta),
             "scannet_raw_root": expected_scannet_root,
             "replica_root": expected_replica_root,
             "selected_gids": sorted(int(gid) for gid in selected_gids),
@@ -1267,7 +1453,9 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
         min_component_size: int = 1,
         ovo_score_th: float = 0.0,
         chunk_size: int = 100_000,
-        use_collapse_mode: str = "support",
+        use_postpruning_mode: str | None = None,
+        oracle_prune_iou_th: float | None = 0.25,
+        oracle_prune_num_inst_perc_delta: tuple[float, float] | None = None,
         use_optimal_text_matching: bool = False,
         save_json: bool = False,
         video_output_dir: str | Path | None = None,
@@ -1278,15 +1466,11 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
 
         from get_metrics_map import (
             classify_instance_features_ovo_style,
-            compute_instance_metrics,
-            compute_nn_associations,
             encode_class_texts,
-            finalize_instance_labels_and_scores,
             load_dataset_info,
             load_gt,
             map_gt_labels_to_eval_ids,
             ovo_text_template,
-            transfer_instance_labels_ovo_style,
         )
 
         dataset_name = str(self.cache.manifest["dataset_name"])
@@ -1324,42 +1508,43 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
             progress.update()
 
             progress.set_postfix_str("resolve instances", refresh=True)
-            assoc = compute_nn_associations(gt["points"], pred_points)
-            pred_to_gt_idx = assoc["pred_to_gt_idx"]
-            collapse_mode = str(use_collapse_mode)
-            if collapse_mode == "optimal":
-                progress.set_postfix_str("resolve instances (optimal)", refresh=True)
-            elif collapse_mode == "learned":
-                progress.set_postfix_str("resolve instances (learned)", refresh=True)
-                if self.debug_last_learned_collapse_summary is None:
-                    raise RuntimeError("Learned collapse requires a prior debugger.fit(...).")
-                if self.debug_last_learned_fit_frame_id != int(self.current_frame_id):
-                    raise RuntimeError("Learned collapse fit is stale for the current debugger state. Re-run debugger.fit(...).")
-                learned_selected_gids = {
-                    int(gid)
-                    for gid in self.debug_last_learned_collapse_summary.get("learned_pred_selected_gids", [])
-                }
-            else:
-                learned_selected_gids = None
-            metric_gid_labels, collapse_diag = self._resolve_metric_instance_gid_labels(
-                collapse_mode=collapse_mode,
-                pred_to_gt_idx=pred_to_gt_idx if collapse_mode == "optimal" else None,
-                gt_instance_labels=gt["instance_labels"] if collapse_mode == "optimal" else None,
-                learned_selected_gids=learned_selected_gids if collapse_mode == "learned" else None,
-            )
-            if collapse_mode == "learned" and self.debug_last_learned_collapse_summary is not None:
-                collapse_diag = {
-                    **self.debug_last_learned_collapse_summary,
-                    **collapse_diag,
-                }
-            metric_point_instance_labels, metric_instance_scores = finalize_instance_labels_and_scores(
-                metric_gid_labels,
-                self._raw_instance_support_scores(),
+            raw_instance_scores = self._raw_instance_support_scores()
+            semantic_point_instance_labels, _semantic_instance_scores = finalize_instance_labels_and_scores(
+                self.export_collapsed_labels(),
+                raw_instance_scores,
                 int(min_component_size),
             )
-            gt_point_instance_labels = np.full((pred_points.shape[0],), -1, dtype=np.int32)
-            if gt["instance_labels"] is not None:
-                gt_point_instance_labels = np.asarray(gt["instance_labels"], dtype=np.int32)[pred_to_gt_idx]
+            candidate_gids, candidate_scores, _candidate_counts = collect_instance_candidates(
+                self.point_gids,
+                raw_instance_scores,
+                int(min_component_size),
+            )
+            postpruning_mode = None if use_postpruning_mode in {None, "none", "None"} else str(use_postpruning_mode)
+            postpruning_diag: dict[str, Any] = {"use_postpruning_mode": postpruning_mode}
+            if postpruning_mode == "optimal":
+                progress.set_postfix_str("resolve instances (optimal)", refresh=True)
+            elif postpruning_mode == "learned":
+                progress.set_postfix_str("resolve instances (learned)", refresh=True)
+                if self.debug_last_learned_postpruning_summary is None:
+                    raise RuntimeError("Learned post-pruning requires a prior debugger.fit(...).")
+                if self.debug_last_learned_postpruning_frame_id != int(self.current_frame_id):
+                    raise RuntimeError("Learned post-pruning fit is stale for the current debugger state. Re-run debugger.fit(...).")
+                learned_selected_gids = {
+                    int(gid)
+                    for gid in self.debug_last_learned_postpruning_summary.get("learned_pred_selected_gids", [])
+                }
+                postpruning_diag = {
+                    **{
+                        key: value
+                        for key, value in self.debug_last_learned_postpruning_summary.items()
+                        if key != "oracle_prune_iou_th"
+                    },
+                    **postpruning_diag,
+                }
+            elif postpruning_mode is None:
+                learned_selected_gids = None
+            else:
+                raise ValueError(f"Unknown use_postpruning_mode={use_postpruning_mode!r}. Expected one of: None, 'optimal', 'learned'.")
             gt_semantic = map_gt_labels_to_eval_ids(gt["semantic_raw"], dataset_info)
             progress.update()
 
@@ -1376,7 +1561,7 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
             progress.set_postfix_str("classify instances", refresh=True)
             instance_classes, _semantic_instance_scores, semantic_ovo_diag = classify_instance_features_ovo_style(
                 clip_features,
-                metric_point_instance_labels,
+                semantic_point_instance_labels,
                 ovo_text_embeds,
                 float(ovo_score_th),
                 int(chunk_size),
@@ -1386,45 +1571,59 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
             progress.update()
 
             progress.set_postfix_str("transfer + ap", refresh=True)
-            transferred_instance_labels, instance_transfer_diag = transfer_instance_labels_ovo_style(
-                pred_points,
-                metric_point_instance_labels,
-                gt["points"],
-            )
             if gt["instance_labels"] is None:
                 instance_metrics, instance_diag = None, None
             else:
-                instance_metrics, instance_diag = compute_instance_metrics(
+                instance_iou, _gt_instance_ids, instance_transfer_diag = build_instance_iou_from_candidates(
+                    pred_points,
+                    self.point_gids,
+                    candidate_gids,
+                    gt["points"],
                     gt["instance_labels"],
-                    gt_semantic,
-                    transferred_instance_labels,
-                    instance_classes,
-                    metric_instance_scores,
-                    dataset_info,
+                    chunk_size=int(chunk_size),
+                    progress_desc="instance gt transfer",
+                )
+                if postpruning_mode == "optimal":
+                    oracle_diag = solve_oracle_pruning_for_ap(
+                        instance_iou,
+                        candidate_scores,
+                        None if oracle_prune_iou_th is None else float(oracle_prune_iou_th),
+                        pred_ids=candidate_gids,
+                        oracle_prune_num_inst_perc_delta=_normalize_oracle_prune_num_inst_perc_delta(oracle_prune_num_inst_perc_delta),
+                        progress_desc=f"{scene_name} oracle prune",
+                    )
+                    selected_mask = np.asarray(oracle_diag["selected_pred_mask"], dtype=bool)
+                    postpruning_diag = {
+                        **postpruning_diag,
+                        **oracle_diag,
+                    }
+                elif postpruning_mode == "learned":
+                    selected_mask = np.isin(candidate_gids, np.asarray(sorted(learned_selected_gids), dtype=np.int32))
+                else:
+                    selected_mask = np.ones((candidate_gids.shape[0],), dtype=bool)
+                selected_gids = candidate_gids[selected_mask]
+                selected_scores = candidate_scores[selected_mask]
+                selected_iou = instance_iou[:, selected_mask]
+                instance_metrics, instance_diag = compute_instance_metrics_from_iou(
+                    selected_iou,
+                    selected_scores,
                 )
                 instance_diag = {
                     **instance_diag,
                     **instance_transfer_diag,
+                    "surviving_pred_gids": candidate_gids.astype(np.int32, copy=False).tolist(),
+                    "surviving_pred_instance_count": int(candidate_gids.shape[0]),
+                    "selected_pred_gids": selected_gids.astype(np.int32, copy=False).tolist(),
+                    "selected_pred_instance_count": int(selected_gids.shape[0]),
                 }
+                if postpruning_mode == "optimal":
+                    instance_diag["oracle_prune_iou_th"] = None if oracle_prune_iou_th is None else float(oracle_prune_iou_th)
+                    instance_diag["oracle_prune_num_inst_perc_delta"] = None if oracle_prune_num_inst_perc_delta is None else list(_normalize_oracle_prune_num_inst_perc_delta(oracle_prune_num_inst_perc_delta))
             progress.update()
 
             if write_label_video:
-                progress.set_postfix_str("write label video", refresh=True)
-                output_dir = self.cache.cache_dir / "debug_videos" if video_output_dir is None else Path(video_output_dir)
-                mode_tag = collapse_mode
-                output_name = (
-                    f"{mode_tag}_collapse_frame_{int(self.current_frame_id):06d}"
-                    f"_mincomp_{int(min_component_size)}.mp4"
-                )
-                instance_video_path = write_instance_label_video_from_cache(
-                    self.cache.cache_dir,
-                    metric_point_instance_labels,
-                    gt_point_labels=gt_point_instance_labels,
-                    output_path=output_dir / output_name,
-                    title="Instance Labels",
-                    subtitle_prefix="projected",
-                    upto_frame=int(self.current_frame_id),
-                )
+                progress.set_postfix_str("skip label video", refresh=True)
+                instance_video_path = None
             else:
                 progress.set_postfix_str("skip label video", refresh=True)
                 instance_video_path = None
@@ -1442,22 +1641,20 @@ class CachedSAMInstanceDebugger(SAMInstanceRuntime):
             "diagnostics": {
                 "instance": instance_diag,
                 "semantic_ovo_style": semantic_ovo_diag,
-                "pred_instance_count": int(
-                    np.sum(np.unique(metric_point_instance_labels[metric_point_instance_labels >= 0]) >= 0)
-                ),
+                "pred_instance_count": 0 if instance_diag is None else int(instance_diag["selected_pred_instance_count"]),
                 "min_component_size": int(min_component_size),
                 "ovo_score_th": float(ovo_score_th),
                 "use_optimal_text_matching": bool(use_optimal_text_matching),
                 "ovo_text_template": ovo_text_template(bool(use_optimal_text_matching)),
                 "ovo_feature_agg": semantic_ovo_diag.get("agg_mode"),
                 "chunk_size": int(chunk_size),
-                "instance_video_label_source": "metric_point_instance_labels",
+                "instance_video_label_source": "unsupported_for_overlapping_instance_ap",
                 "instance_score_source": "seed_support_ratio",
-                "collapse_mode": collapse_mode,
-                **collapse_diag,
+                "use_postpruning_mode": postpruning_mode,
+                **postpruning_diag,
             },
         }
-        summary["instance_video_path"] = str(instance_video_path)
+        summary["instance_video_path"] = None if instance_video_path is None else str(instance_video_path)
         if save_json:
             out_path = self.cache.cache_dir / f"debugger_metrics_frame_{int(self.current_frame_id):06d}.json"
             with open(out_path, "w") as handle:

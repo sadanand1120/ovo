@@ -27,6 +27,8 @@ from map_runtime.defaults import (
     FEATURE_SOFTMAX_TEMP,
     FEATURE_TEXT_TEMPLATE,
     INPUT_DIR,
+    INSTANCE_GID_SLOTS_FILE,
+    INSTANCE_LABEL_FILE,
     INSTANCE_SUPPORT_FILE,
     OVO_FEATURE_AGG,
     OVO_FEATURE_AGG_OPTIMAL,
@@ -36,13 +38,14 @@ from map_runtime.defaults import (
     TIMING_PATH,
 )
 from map_runtime.config import load_config
-from map_runtime.instance_label_video import write_instance_label_video_from_scene_output
-from map_runtime.metrics_utils import compute_instance_ap_dataset, finalize_instance_labels_and_scores, iou_acc_from_confmat
-
-
+from map_runtime.metrics_utils import (
+    build_instance_iou_from_candidates,
+    collect_instance_candidates,
+    compute_instance_metrics_from_iou,
+    finalize_instance_labels_and_scores,
+    iou_acc_from_confmat,
+)
 GEOM_THRESHOLDS = (0.01, 0.03, 0.05)
-INSTANCE_AP_MEAN_THRESHOLDS = tuple(float(x) for x in np.arange(0.50, 1.00, 0.05))
-INSTANCE_AP_REPORT_THRESHOLDS = (0.25,) + INSTANCE_AP_MEAN_THRESHOLDS
 METRIC_ROW_ORDER = (
     ("geometry", "chamfer_l1_m"),
     ("geometry", "fscore_3cm"),
@@ -248,7 +251,7 @@ def load_pred_map(ply_path: Path) -> dict:
     clip_path = ply_path.with_name(CLIP_FEATURE_FILE)
     if not clip_path.exists():
         raise ValueError(f"Missing CLIP features: {clip_path}")
-    instance_label_path = ply_path.with_name("instance_labels.npy")
+    instance_label_path = ply_path.with_name(INSTANCE_LABEL_FILE)
     if not instance_label_path.exists():
         raise ValueError(f"Missing instance labels for {ply_path.parent}")
     return {
@@ -259,14 +262,26 @@ def load_pred_map(ply_path: Path) -> dict:
     }
 
 
-def load_raw_instance_labels(map_dir: Path, n_points: int) -> np.ndarray:
-    label_path = map_dir / "instance_labels.npy"
+def load_collapsed_instance_labels(map_dir: Path, n_points: int) -> np.ndarray:
+    label_path = map_dir / INSTANCE_LABEL_FILE
     if not label_path.exists():
         raise FileNotFoundError(f"Missing instance labels at {label_path}")
     labels = np.load(label_path)
     if labels.shape[0] != n_points:
         raise ValueError(f"Instance label count mismatch: expected {n_points}, found {labels.shape[0]}")
     return np.asarray(labels, dtype=np.int32)
+
+
+def load_raw_point_gids(map_dir: Path, n_points: int) -> np.ndarray:
+    gid_slots_path = map_dir / INSTANCE_GID_SLOTS_FILE
+    if not gid_slots_path.exists():
+        raise FileNotFoundError(f"Missing raw instance gid slots at {gid_slots_path}")
+    point_gids = np.load(gid_slots_path)
+    if point_gids.ndim != 2:
+        raise ValueError(f"Expected {gid_slots_path} to have shape [n_points, K], got {point_gids.shape}.")
+    if point_gids.shape[0] != n_points:
+        raise ValueError(f"Instance gid slot count mismatch: expected {n_points}, found {point_gids.shape[0]}")
+    return np.asarray(point_gids, dtype=np.int32)
 
 
 def load_instance_support_scores(map_dir: Path) -> np.ndarray:
@@ -707,93 +722,6 @@ def transfer_semantic_labels_ovo_style(
     return mesh_semantic_labels, diagnostics
 
 
-def build_iou_matrix(gt_labels: np.ndarray, pred_labels: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    valid_gt = gt_labels >= 0
-    gt = gt_labels[valid_gt]
-    pred = pred_labels[valid_gt]
-    uniq_gt, gt_inv = np.unique(gt, return_inverse=True)
-    valid_pred = pred >= 0
-    uniq_pred = np.unique(pred[valid_pred])
-    if uniq_gt.size == 0 or uniq_pred.size == 0:
-        return np.zeros((uniq_gt.size, uniq_pred.size), dtype=np.float32), uniq_gt, uniq_pred, np.bincount(gt_inv, minlength=uniq_gt.size)
-
-    pred_map = {pred_id: i for i, pred_id in enumerate(uniq_pred)}
-    pred_inv = np.asarray([pred_map[p] for p in pred[valid_pred]], dtype=np.int32)
-    contingency = np.zeros((uniq_gt.shape[0], uniq_pred.shape[0]), dtype=np.int64)
-    np.add.at(contingency, (gt_inv[valid_pred], pred_inv), 1)
-    gt_count = np.bincount(gt_inv, minlength=uniq_gt.shape[0])
-    pred_count = np.bincount(pred_inv, minlength=uniq_pred.shape[0])
-    union = gt_count[:, None] + pred_count[None, :] - contingency
-    iou = np.where(union > 0, contingency / union, 0.0).astype(np.float32)
-    return iou, uniq_gt, uniq_pred, gt_count
-
-
-def majority_class_per_instance(
-    instance_labels: np.ndarray,
-    semantic_labels: np.ndarray,
-    instance_ids: np.ndarray,
-    ignore_labels: list[int],
-) -> np.ndarray:
-    ignore_set = set(int(x) for x in ignore_labels)
-    class_ids = np.full((instance_ids.shape[0],), -1, dtype=np.int32)
-    for idx, instance_id in enumerate(instance_ids.tolist()):
-        mask = instance_labels == int(instance_id)
-        semantic = semantic_labels[mask]
-        semantic = semantic[(semantic >= 0) & (~np.isin(semantic, list(ignore_set)))]
-        if semantic.size == 0:
-            continue
-        values, counts = np.unique(semantic.astype(np.int32, copy=False), return_counts=True)
-        class_ids[idx] = int(values[np.argmax(counts)])
-    return class_ids
-
-
-def compute_instance_metrics(
-    gt_instance_labels: np.ndarray,
-    gt_semantic_labels: np.ndarray,
-    pred_instance_labels: np.ndarray,
-    pred_instance_classes: np.ndarray,
-    pred_instance_scores: np.ndarray,
-    dataset_info: dict,
-) -> tuple[dict, dict]:
-    del gt_semantic_labels
-    del pred_instance_classes
-    del dataset_info
-    iou, uniq_gt, uniq_pred, _ = build_iou_matrix(gt_instance_labels, pred_instance_labels)
-    if uniq_gt.size == 0:
-        metrics = {"ap": float("nan")}
-        for threshold in INSTANCE_AP_REPORT_THRESHOLDS:
-            metrics[f"ap_{int(round(threshold * 100)):02d}"] = float("nan")
-        diagnostics = {"gt_instance_count": 0, "pred_instance_count": int(uniq_pred.shape[0])}
-        return metrics, diagnostics
-
-    gt_class_ids = np.zeros((uniq_gt.shape[0],), dtype=np.int32)
-    pred_class_ids = np.zeros((uniq_pred.shape[0],), dtype=np.int32) if uniq_pred.size > 0 else np.empty((0,), dtype=np.int32)
-    pred_scores = pred_instance_scores[uniq_pred] if uniq_pred.size > 0 else np.empty((0,), dtype=np.float32)
-    class_ids = np.array([0], dtype=np.int32)
-    metrics, ap_diag = compute_instance_ap_dataset(
-        entries=[
-            {
-                "iou": iou,
-                "gt_class_ids": gt_class_ids,
-                "pred_class_ids": pred_class_ids,
-                "pred_scores": pred_scores,
-            }
-        ],
-        class_ids=class_ids,
-        iou_thresholds=INSTANCE_AP_REPORT_THRESHOLDS,
-        mean_ap_thresholds=INSTANCE_AP_MEAN_THRESHOLDS,
-    )
-    diagnostics = {
-        "gt_instance_count": int(uniq_gt.shape[0]),
-        "pred_instance_count": int(uniq_pred.shape[0]),
-        "ignored_gt_instance_count": 0,
-        "instance_metric_mode": "class_agnostic_ap",
-        "instance_score_source": "seed_support_ratio",
-        **ap_diag,
-    }
-    return metrics, diagnostics
-
-
 def round_for_print(value, digits: int = 3):
     if isinstance(value, dict):
         return {key: round_for_print(val, digits) for key, val in value.items()}
@@ -949,7 +877,12 @@ def compute_single_scene_summary(
 ) -> tuple[dict, Path]:
     ply_path = resolve_ply_path(input_path)
     dataset_name, scene_name = infer_scene_info_from_path(ply_path)
-    progress = tqdm(total=7 if save_instance_video else 6, desc=progress_desc or scene_name, unit="stage", dynamic_ncols=True)
+    progress = tqdm(
+        total=7 if save_instance_video else 6,
+        desc=progress_desc or scene_name,
+        unit="stage",
+        dynamic_ncols=True,
+    )
     try:
         progress.set_postfix_str("load gt", refresh=True)
         dataset_info = load_dataset_info(dataset_name)
@@ -981,7 +914,15 @@ def compute_single_scene_summary(
             template=ovo_text_template(bool(args.use_optimal_text_matching)),
         )
         background_idx = class_names.index("background") if "background" in class_names else None
-        raw_instance_labels = load_raw_instance_labels(ply_path.parent, pred["points"].shape[0])
+        collapsed_instance_labels = load_collapsed_instance_labels(ply_path.parent, pred["points"].shape[0])
+        raw_point_gids = None
+        raw_point_gids_skip_reason = None
+        try:
+            raw_point_gids = load_raw_point_gids(ply_path.parent, pred["points"].shape[0])
+        except FileNotFoundError:
+            if not allow_missing_instance_support:
+                raise
+            raw_point_gids_skip_reason = f"missing {INSTANCE_GID_SLOTS_FILE}"
         instance_support_available = True
         instance_support_skip_reason = None
         try:
@@ -991,16 +932,13 @@ def compute_single_scene_summary(
                 raise
             instance_support_available = False
             instance_support_skip_reason = f"missing {INSTANCE_SUPPORT_FILE}"
-            max_gid = int(raw_instance_labels[raw_instance_labels >= 0].max()) if np.any(raw_instance_labels >= 0) else -1
+            max_gid = int(raw_point_gids[raw_point_gids >= 0].max()) if raw_point_gids is not None and np.any(raw_point_gids >= 0) else -1
             raw_instance_scores = np.zeros((max_gid + 1,), dtype=np.float32)
-        metric_point_instance_labels, metric_instance_scores = finalize_instance_labels_and_scores(
-            raw_instance_labels,
+        metric_point_instance_labels, _collapsed_instance_scores = finalize_instance_labels_and_scores(
+            collapsed_instance_labels,
             raw_instance_scores,
             int(args.min_component_size),
         )
-        gt_point_instance_labels = np.full((pred["points"].shape[0],), -1, dtype=np.int32)
-        if gt["instance_labels"] is not None:
-            gt_point_instance_labels = np.asarray(gt["instance_labels"], dtype=np.int32)[pred_to_gt_idx]
         pred_point_labels, max_point_probs, _, _ = score_pred_points_and_instances(
             pred["clip_features"],
             metric_point_instance_labels,
@@ -1043,46 +981,43 @@ def compute_single_scene_summary(
             dataset_info.get("ignore", []),
         )
         semantic_ovo_metrics = confusion_to_metrics(semantic_ovo_conf, dataset_info)
-        if gt["instance_labels"] is not None and instance_support_available:
-            transferred_instance_labels, instance_transfer_diag = transfer_instance_labels_ovo_style(
+        if gt["instance_labels"] is not None and instance_support_available and raw_point_gids is not None:
+            candidate_gids, candidate_scores, _candidate_counts = collect_instance_candidates(
+                raw_point_gids,
+                raw_instance_scores,
+                int(args.min_component_size),
+            )
+            instance_iou, _gt_instance_ids, instance_transfer_diag = build_instance_iou_from_candidates(
                 pred["points"],
-                metric_point_instance_labels,
+                raw_point_gids,
+                candidate_gids,
                 gt["points"],
-            )
-            instance_metrics, instance_diag = compute_instance_metrics(
                 gt["instance_labels"],
-                gt_semantic,
-                transferred_instance_labels,
-                instance_classes,
-                metric_instance_scores,
-                dataset_info,
+                chunk_size=int(args.chunk_size),
+                progress_desc="instance gt transfer",
             )
+            instance_metrics, instance_diag = compute_instance_metrics_from_iou(instance_iou, candidate_scores)
             instance_diag = {
                 **instance_diag,
                 **instance_transfer_diag,
+                "selected_pred_gids": candidate_gids.astype(np.int32, copy=False).tolist(),
+                "selected_pred_instance_count": int(candidate_gids.shape[0]),
+                "use_postpruning_mode": None,
             }
         else:
             instance_metrics, instance_diag = None, None
-            if gt["instance_labels"] is not None and not instance_support_available:
+            if gt["instance_labels"] is not None and (not instance_support_available or raw_point_gids is None):
+                skip_reason = instance_support_skip_reason if not instance_support_available else raw_point_gids_skip_reason
                 instance_diag = {
                     "instance_metric_mode": "class_agnostic_ap",
                     "instance_score_source": "seed_support_ratio",
-                    "skipped_reason": str(instance_support_skip_reason),
+                    "skipped_reason": str(skip_reason),
                 }
         progress.update()
 
         instance_video_path = None
         if save_instance_video:
-            progress.set_postfix_str("write label video", refresh=True)
-            instance_video_path = write_instance_label_video_from_scene_output(
-                ply_path.parent,
-                pred["points"],
-                metric_point_instance_labels,
-                gt_point_labels=gt_point_instance_labels,
-                output_path=ply_path.parent / "debug_videos" / f"instance_labels_mincomp_{int(args.min_component_size)}.mp4",
-                title="Instance Labels",
-                device=device,
-            )
+            progress.set_postfix_str("skip label video", refresh=True)
             progress.update()
 
         progress.set_postfix_str("summary", refresh=True)
@@ -1120,7 +1055,7 @@ def compute_single_scene_summary(
             "feature_text_template": FEATURE_TEXT_TEMPLATE,
             "ovo_text_template": ovo_text_template(bool(args.use_optimal_text_matching)),
             "ovo_feature_agg": ovo_feature_agg_name(bool(args.use_optimal_text_matching)),
-            "instance_video_label_source": "metric_point_instance_labels",
+            "instance_video_label_source": "unsupported_for_overlapping_instance_ap",
             "instance": None if instance_diag is None else {
                 **instance_diag,
                 "min_component_size": int(args.min_component_size),

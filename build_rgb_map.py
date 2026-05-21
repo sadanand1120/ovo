@@ -22,6 +22,8 @@ from map_runtime.defaults import (
     DEFAULT_MATCH_DISTANCE_TH,
     DEFAULT_MAX_TOTAL_POINTS,
     DEFAULT_RGB_MAP_OUTPUT_ROOT,
+    INSTANCE_GID_SLOTS_FILE,
+    INSTANCE_LABEL_FILE,
     INSTANCE_SUPPORT_FILE,
     TIMING_PATH,
 )
@@ -332,7 +334,8 @@ class RGBMapper:
 
             progress.set_postfix_str("instance labels", refresh=True)
             stage_start = time.perf_counter()
-            np.save(output_dir / "instance_labels.npy", self.instance_runtime.export_collapsed_labels())
+            np.save(output_dir / INSTANCE_GID_SLOTS_FILE, self.instance_runtime.export_point_gids())
+            np.save(output_dir / INSTANCE_LABEL_FILE, self.instance_runtime.export_collapsed_labels())
             np.save(output_dir / INSTANCE_SUPPORT_FILE, self.instance_runtime.export_support_counts())
             timings["instance_labels_sec"] = time.perf_counter() - stage_start
             progress.update()
@@ -345,7 +348,8 @@ class RGBMapper:
                 **stats,
                 "instance_supervision": "sam",
                 "textregion_supervision": "sam",
-                "instance_label_path": "instance_labels.npy",
+                "instance_gid_slots_path": INSTANCE_GID_SLOTS_FILE,
+                "instance_label_path": INSTANCE_LABEL_FILE,
                 "instance_support_path": INSTANCE_SUPPORT_FILE,
                 "clip_feature_path": CLIP_FEATURE_FILE,
                 "clip_feature_storage": "npy",

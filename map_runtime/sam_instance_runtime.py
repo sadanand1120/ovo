@@ -5,7 +5,6 @@ from typing import Any
 
 import numpy as np
 import torch
-from tqdm.auto import tqdm
 
 from map_runtime.sam_masks import SAMMaskExtractor, SAMMaskExtractorConfig
 from map_runtime.sam2_tracking import SAM2VideoTracker, SAMTrackerConfig, build_label_masks
@@ -167,6 +166,9 @@ class SAMInstanceRuntime:
     def export_collapsed_labels(self) -> np.ndarray:
         return self._collapse_point_gid_labels()
 
+    def export_point_gids(self) -> np.ndarray:
+        return np.array(self.point_gids, copy=True)
+
     def export_support_counts(self) -> np.ndarray:
         support_counts = np.zeros((int(self.next_gid),), dtype=np.int32)
         for gid, bucket in self.buckets.items():
@@ -325,19 +327,11 @@ class SAMInstanceRuntime:
         mask[valid_mask] = np.any(self.point_gids[point_ids] == int(gid), axis=1)
         return mask
 
-    def _collapse_point_gid_labels(self, *, allowed_gids: set[int] | None = None) -> np.ndarray:
+    def _collapse_point_gid_labels(self) -> np.ndarray:
         labels = np.full((self.point_gids.shape[0],), -1, dtype=np.int32)
         valid_rows = self.point_gids >= 0
         if not valid_rows.any():
             return labels
-        if allowed_gids is not None:
-            allowed_lookup = np.zeros((max(0, int(self.next_gid)),), dtype=bool)
-            for gid in allowed_gids:
-                if 0 <= int(gid) < allowed_lookup.shape[0]:
-                    allowed_lookup[int(gid)] = True
-            valid_rows = valid_rows & allowed_lookup[self.point_gids.clip(min=0)]
-            if not valid_rows.any():
-                return labels
         clipped = self.point_gids.clip(min=0)
         scores = np.where(valid_rows, self._gid_scores[clipped], -1)
         best_idx = np.argmax(scores, axis=1)
@@ -409,104 +403,6 @@ class SAMInstanceRuntime:
                 "n11": int(n11),
             }
         return gid_stats
-
-    def _resolve_optimal_metric_instance_labels(
-        self,
-        pred_to_gt_idx: np.ndarray,
-        gt_instance_labels: np.ndarray,
-        *,
-        progress_desc: str | None = None,
-    ) -> tuple[np.ndarray, dict[str, Any]]:
-        usual_collapse_labels = self._collapse_point_gid_labels()
-        pred_to_gt_idx = np.asarray(pred_to_gt_idx, dtype=np.int64)
-        gt_instance_labels = np.asarray(gt_instance_labels, dtype=np.int32)
-        pred_gt_instances = gt_instance_labels[pred_to_gt_idx]
-        gid_rows = self.point_gids
-        valid_rows = gid_rows >= 0
-        unique_gids = np.unique(gid_rows[valid_rows]) if valid_rows.any() else np.empty((0,), dtype=np.int32)
-        canonical_gid_by_gt: dict[int, int] = {}
-        canonical_rank_by_gt: dict[int, tuple[int, float, int, int, int]] = {}
-
-        gid_iter = unique_gids.tolist()
-        gid_progress = None
-        if progress_desc is not None:
-            gid_progress = tqdm(gid_iter, desc=f"{progress_desc}: canonical gids", unit="gid", leave=False, dynamic_ncols=True)
-            gid_iter = gid_progress
-        try:
-            for gid in gid_iter:
-                member_mask = np.any(gid_rows == int(gid), axis=1)
-                if not member_mask.any():
-                    continue
-                member_gt_instances = pred_gt_instances[member_mask]
-                member_gt_instances = member_gt_instances[member_gt_instances >= 0]
-                if member_gt_instances.size == 0:
-                    continue
-                gt_ids, gt_counts = np.unique(member_gt_instances, return_counts=True)
-                best_idx = int(np.argmax(gt_counts))
-                target_gt_instance = int(gt_ids[best_idx])
-                intersection = int(gt_counts[best_idx])
-                purity = float(intersection / float(member_mask.sum()))
-                bucket = self.buckets.get(int(gid))
-                support_frames = int(bucket.support_frames) if bucket is not None else 0
-                point_count = int(bucket.point_count) if bucket is not None else int(member_mask.sum())
-                rank = (intersection, purity, support_frames, point_count, -int(gid))
-                current_rank = canonical_rank_by_gt.get(target_gt_instance)
-                if current_rank is None or rank > current_rank:
-                    canonical_rank_by_gt[target_gt_instance] = rank
-                    canonical_gid_by_gt[target_gt_instance] = int(gid)
-        finally:
-            if gid_progress is not None:
-                gid_progress.close()
-
-        labels = np.full((gid_rows.shape[0],), -1, dtype=np.int32)
-        matched_canonical_points = 0
-        optimized_points = 0
-        valid_point_idx = np.flatnonzero(pred_gt_instances >= 0)
-        if valid_point_idx.size > 0 and canonical_gid_by_gt:
-            lookup_size = int(pred_gt_instances[valid_point_idx].max()) + 1
-            canonical_lookup = np.full((lookup_size,), -1, dtype=np.int32)
-            for gt_instance, canonical_gid in canonical_gid_by_gt.items():
-                canonical_lookup[int(gt_instance)] = int(canonical_gid)
-            chunk_size = 100_000
-            chunk_starts = range(0, int(valid_point_idx.size), chunk_size)
-            chunk_progress = None
-            if progress_desc is not None:
-                chunk_progress = tqdm(chunk_starts, desc=f"{progress_desc}: assign points", unit="chunk", leave=False, dynamic_ncols=True)
-                chunk_starts = chunk_progress
-            try:
-                for start in chunk_starts:
-                    idx = valid_point_idx[int(start): int(start) + chunk_size]
-                    gt_chunk = pred_gt_instances[idx]
-                    canonical_chunk = canonical_lookup[gt_chunk]
-                    has_canonical = canonical_chunk >= 0
-                    if not has_canonical.any():
-                        continue
-                    idx = idx[has_canonical]
-                    canonical_chunk = canonical_chunk[has_canonical]
-                    rows = gid_rows[idx]
-                    matches = np.any(rows == canonical_chunk[:, None], axis=1)
-                    if not matches.any():
-                        continue
-                    matched_idx = idx[matches]
-                    matched_gid = canonical_chunk[matches]
-                    labels[matched_idx] = matched_gid.astype(np.int32, copy=False)
-                    matched_canonical_points += int(matches.sum())
-                    optimized_points += int(np.count_nonzero(usual_collapse_labels[matched_idx] != matched_gid))
-            finally:
-                if chunk_progress is not None:
-                    chunk_progress.close()
-
-        diagnostics = {
-            "optimal_collapse_gt_instances": int(len(canonical_gid_by_gt)),
-            "optimal_collapse_points_matched_canonical": int(matched_canonical_points),
-            "optimal_collapse_points_overridden": int(optimized_points),
-        }
-        unique_final = np.unique(labels[labels >= 0])
-        if unique_final.size > len(canonical_gid_by_gt):
-            raise RuntimeError(
-                f"Optimal collapse produced {unique_final.size} unique labels from only {len(canonical_gid_by_gt)} canonical gids."
-            )
-        return labels, diagnostics
 
     def _fit_learned_gid_selector(
         self,
@@ -749,43 +645,6 @@ class SAMInstanceRuntime:
             "learned_pred_selected_gids": pred_selected_gids,
         }
         return diagnostics
-
-    def _resolve_metric_instance_gid_labels(
-        self,
-        *,
-        collapse_mode: str = "support",
-        pred_to_gt_idx: np.ndarray | None = None,
-        gt_instance_labels: np.ndarray | None = None,
-        learned_selected_gids: set[int] | None = None,
-        progress_desc: str | None = None,
-    ) -> tuple[np.ndarray, dict[str, Any]]:
-        collapse_mode = str(collapse_mode)
-        if collapse_mode == "support":
-            labels = self._collapse_point_gid_labels()
-            diagnostics = {}
-        elif collapse_mode == "optimal":
-            if pred_to_gt_idx is None or gt_instance_labels is None:
-                raise ValueError("Optimal collapse requires pred_to_gt_idx and gt_instance_labels.")
-            labels, diagnostics = self._resolve_optimal_metric_instance_labels(
-                pred_to_gt_idx,
-                gt_instance_labels,
-                progress_desc=progress_desc,
-            )
-        elif collapse_mode == "learned":
-            if learned_selected_gids is None:
-                raise ValueError("Learned collapse requires learned_selected_gids from a prior fit().")
-            labels = self._collapse_point_gid_labels(allowed_gids=learned_selected_gids)
-            diagnostics = {
-                "learned_pred_selected_gids": sorted(int(gid) for gid in learned_selected_gids),
-                "learned_num_pred_selected_gids": int(len(learned_selected_gids)),
-            }
-        else:
-            raise ValueError(f"Unknown collapse_mode={collapse_mode!r}. Expected one of: support, optimal, learned.")
-        diagnostics = {
-            **diagnostics,
-            "collapse_mode": collapse_mode,
-        }
-        return labels, diagnostics
 
     def _bucket_snapshot(self) -> list[dict[str, Any]]:
         buckets = sorted(

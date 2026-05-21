@@ -312,6 +312,7 @@ The output scene directory contains:
 
 - `rgb_map.ply`
 - `clip_feats.npy`
+- `instance_gid_slots.npy`
 - `instance_labels.npy`
 - `stats.json`
 - `timing.json`

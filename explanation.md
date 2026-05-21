@@ -48,10 +48,11 @@ One structural fact controls everything below:
 - a seed frame is any frame with `frame_id % 8 == 0`
 - non-seed frames only update SAM2 tracking state; they do **not** append points, do **not** update RGB, do **not** update normals, do **not** update CLIP features, and do **not** append point-level instance labels
 
-Also, the three saved point-aligned outputs use the same point ordering:
+Also, the saved point-aligned outputs use the same point ordering:
 
 - point `i` in `rgb_map.ply`
 - row `i` in `clip_feats.npy`
+- row `i` in `instance_gid_slots.npy`
 - entry `i` in `instance_labels.npy`
 
 ## (a) Geometry: world-space 3D points
@@ -405,12 +406,16 @@ The point-level instance storage is:
 
 - `self.instance_manager.point_labels[i]`
 
-This is a 1D array parallel to the point cloud:
+There are now two saved point-aligned instance representations:
 
-- `>= 0` means a global instance ID
-- `-1` means unlabeled / background / invalidated
-
-It is saved as `instance_labels.npy`.
+- `instance_gid_slots.npy`
+  - shape `(N, K)`
+  - the raw multi-instance representation
+  - row `i` stores all gid memberships for point `i`
+- `instance_labels.npy`
+  - shape `(N,)`
+  - the support-score-collapsed single-label view
+  - used only by downstream code that genuinely needs one label per point
 
 ### The two different per-frame label images
 
@@ -533,5 +538,7 @@ So point-level global instance IDs are effectively:
   - stores final world XYZ, fused RGB, fused world normals
 - `clip_feats.npy`
   - stores one dense CLIP feature per point, sampled once at point birth
+- `instance_gid_slots.npy`
+  - stores the full `K`-slot gid membership row per point
 - `instance_labels.npy`
-  - stores one global instance ID per point, assigned once at point birth, unless later invalidated to `-1`
+  - stores the support-score-collapsed single gid per point

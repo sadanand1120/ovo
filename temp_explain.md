@@ -1,6 +1,10 @@
-# Concrete Toy Example: `support` Collapse vs `optimal` Collapse, then `ap_25`
+# Concrete Toy Example: legacy pre-refactor collapse path
 
-This matches the current code path in:
+This file is now a historical note for the old `K -> 1` instance-eval path.
+
+It does **not** match the current code anymore. The current code evaluates instance AP from overlapping gid memberships with optional post-pruning (`use_postpruning_mode=None/"optimal"/"learned"`), and only uses support-score collapse where a single label per point is still genuinely needed.
+
+The text below matches the removed pre-refactor path in:
 
 - `map_runtime/sam_instance_runtime.py`
   - `_collapse_point_gid_labels`

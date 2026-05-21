@@ -254,118 +254,107 @@ Important:
 - `debugger.show(gid=...)` does not use the collapsed primary gid
 - it shows all currently visible points whose `point_gids` row contains that gid anywhere
 
-## Debugger Metrics Collapse
-`CachedSAMInstanceDebugger.get_metrics(...)` computes instance metrics from a temporary `N x 1` point-label view derived from `point_gids`.
+## Debugger Metrics Post-Pruning
+`CachedSAMInstanceDebugger.get_metrics(...)` now evaluates instance AP directly from overlapping gid memberships. It does **not** collapse `K` slots to one label for instance AP.
 
-### Support mode
-If `use_collapse_mode="support"`:
-1. Collapse every point row with `_collapse_point_gid_labels()`.
-2. Apply `min_component_size` filtering.
-3. Relabel kept gids contiguously.
+### Shared base candidate set
+For any metric call:
+1. Start from raw `point_gids`.
+2. For each gid, define its predicted instance support as all points whose row contains that gid anywhere.
+3. Score that gid with `support_frames / num_seed_frames_processed`.
+4. Drop gids whose predicted-map membership count is below `min_component_size`.
+
+That base set is the `surviving_pred_gids` diagnostic.
+
+### Default mode
+If `use_postpruning_mode=None`:
+1. Keep every surviving gid.
+2. Transfer each gid independently onto GT geometry with the same 5-NN voting rule used elsewhere:
+   - for each GT vertex, look at its `k=5` nearest predicted points
+   - a gid is positive on that GT vertex iff it appears on a majority of those `k` predicted points
+3. Build the IoU matrix between:
+   - GT instances
+   - kept predicted gids
+4. Run the normal score-ordered class-agnostic AP computation on that IoU matrix.
 
 ### Optimal mode
-If `use_collapse_mode="optimal"`:
-1. Compute the usual collapsed labels only for diagnostics.
-2. Match every predicted point to its nearest GT vertex and read that GT instance id.
-3. For each gid:
-   - collect all predicted points whose `point_gids` row contains that gid anywhere
-   - collect those points' GT instance ids
-   - set the gid's `target_gt_instance` to the majority GT instance
-   - compute:
-     - `intersection = number of member points on target_gt_instance`
-     - `purity = intersection / number of gid member points`
-4. For each GT instance, choose one canonical gid by ranking gids with:
-   1. larger `intersection`
-   2. larger `purity`
-   3. larger `support_frames`
-   4. larger `point_count`
-   5. smaller gid
-5. Build the final `N x 1` labels:
-   - start from all `-1`
-   - for each point:
-     - read its GT instance id
-     - find the canonical gid for that GT instance
-     - if that canonical gid is present anywhere in the point's `K` slots, assign that gid
-     - otherwise leave the point as `-1`
-6. Apply `min_component_size` filtering.
-7. Relabel kept gids contiguously.
+If `use_postpruning_mode="optimal"`:
+1. Build the same base surviving gid set and IoU matrix as above.
+2. If `oracle_prune_iou_th` is a float, run the exact offline oracle pruning solver from `correct_collapse.md` at that IoU threshold.
+3. If `oracle_prune_iou_th=None`, solve one joint exact post-pruning problem whose objective is the reported mean instance `ap` over `0.50:0.05:0.95`.
+4. If `oracle_prune_num_inst_perc_delta` is not `None`, constrain the selected gid count to the GT-relative window
+   `[\lceil lo * num_gt_instances \rceil, \lfloor hi * num_gt_instances \rfloor]` for tuple `(lo, hi)`.
+5. Keep only the returned oracle-selected gid subset.
+6. Run the same class-agnostic AP computation on that selected subset.
 
-Important:
-- in optimal mode there is no normal-collapse fallback in the final labels
-- points that do not contain their GT instance's canonical gid stay `-1`
+This is a **gid selection** step only. It never rewrites points to canonical gids.
 
 ### Learned mode
-If `use_collapse_mode="learned"`:
-1. First resolve the final `selected` gid supervision signal from the optimal path:
-   - run the optimal collapse
-   - apply `min_component_size`
-   - transfer those gid labels onto GT vertices with the same 5-NN voting used by the instance metrics
-   - mark a gid as `selected=True` iff it survives on GT-valid vertices after that transfer
-2. Build one feature vector per surviving gid using final-state bucket/lifecycle stats:
+If `use_postpruning_mode="learned"`:
+1. First run `debugger.fit(...)` on the final debugger state.
+2. `fit(...)` resolves the oracle-selected gid set using the same optimal post-pruning path described above.
+3. Build one feature vector per surviving gid:
    - `log_support_perc = log10(max(support_perc, 1e-6))`
    - `log_point_perc = log10(max(point_perc, 1e-6))`
    - `n00_norm`, `n01_norm`, `n10_norm`, `n11_norm`
-3. Each transition feature is normalized by that gid's lifecycle seed-frame length, i.e. the number of seed frames from its birth seed frame through the final processed seed frame.
-4. Run `debugger.fit(...)` once on that final debugger state. The fit step:
-   - builds a single-head MLP with hidden width `embed_dim`
-   - uses `num_layers` linear layers total
-   - if `num_layers=2`, the shared trunk is `Linear(6, embed_dim) -> ReLU`
-   - if `num_layers>2`, extra `Linear(embed_dim, embed_dim) -> ReLU` blocks are inserted before the final `Linear(embed_dim, 1)`
-   - trains that single output logit against the final `selected` gid labels
-   - if `loss_mode="wbce"`, it uses weighted `BCEWithLogitsLoss` with `pos_weight = (#non_selected / #selected)`
-   - if `loss_mode="focal"`, it uses focal loss with:
-     - `focal_alpha = #non_selected / (#selected + #non_selected)`
-     - user knob `focal_gamma`
+4. Normalize each transition count by that gid's lifecycle seed-frame length.
+5. Train a single-head MLP keep classifier with:
+   - hidden width `embed_dim`
+   - `num_layers` linear layers total
+   - ReLU activations
    - `Adam(lr=1e-2, weight_decay=1e-4)`
-   - uses the user-specified `embed_dim`, `num_layers`, `epochs`, `pruning_thresh`, `loss_mode`, and `focal_gamma`
-5. Convert the final keep logits to `keep_prob` with sigmoid.
-6. Threshold gids with the same `pruning_thresh` used for fit diagnostics:
-   - if `keep_prob >= pruning_thresh`, keep that gid
-   - otherwise discard that gid
-7. During `get_metrics(...)`, do not refit.
-8. Collapse each point's `K` gids with the normal support-based rule, but only over the surviving gids.
-9. If a point has no surviving gids in its `K` slots, assign `-1`.
-10. Apply `min_component_size` filtering.
-11. Relabel kept gids contiguously.
+   - `loss_mode="wbce"` or `loss_mode="focal"`
+6. Threshold `keep_prob` at `pruning_thresh` to get the learned selected gid set.
+7. During `get_metrics(...)`, do not refit. Just load the already-computed learned selected gid set and evaluate that gid subset directly with the same overlapping-instance AP path.
 
-### Collapse diagnostics
-When `use_collapse_mode="optimal"`, `get_metrics(...)` also reports:
-- `optimal_collapse_gt_instances`: number of GT instances that received a canonical gid
-- `optimal_collapse_points_matched_canonical`: number of predicted points whose row contains their GT instance's canonical gid
-- `optimal_collapse_points_overridden`: number of those points whose canonical gid differs from the usual collapse result
+### Single-label paths that still exist
+Some code still genuinely needs one label per point:
+- projected debugger panels
+- saved `instance_labels.npy`
+- semantic OVO-style instance pooling
 
-When `use_collapse_mode="learned"`, `get_metrics(...)` also reports:
-- `learned_num_gids`: number of surviving gids used for training
-- `learned_num_selected`: number of positive training gids
-- `learned_num_rejected`: number of negative training gids
-- `learned_embed_dim`: hidden width used for the MLP
-- `learned_num_layers`: number of linear layers in the shared trunk
-- `learned_epochs`: number of optimization epochs
-- `learned_pruning_thresh`: threshold used both for fit diagnostics and gid selection
-- `learned_loss_mode`: `wbce` or `focal`
-- `learned_focal_alpha`: auto-derived focal alpha used when `loss_mode="focal"`
-- `learned_focal_gamma`: focal gamma used when `loss_mode="focal"`
-- `learned_train_loss_final`: final training loss
-- `learned_train_acc_final`: final training accuracy
-- `learned_train_selected_acc_final`: training accuracy on positive gids
-- `learned_train_non_selected_acc_final`: training accuracy on negative gids
-- `learned_feature_names`: ordered input feature names
-- `learned_rows`: per-gid training rows with learned keep probabilities and predictions
-- `learned_pred_selected_gids`: gids that the fitted model kept after thresholding
+Those paths still use the support-score collapse rule described above in "Primary GID Collapse For Visualization". That collapse is no longer part of instance AP.
+
+### Post-pruning diagnostics
+`get_metrics(...)` reports:
+- `surviving_pred_gids`
+- `surviving_pred_instance_count`
+- `selected_pred_gids`
+- `selected_pred_instance_count`
+- `use_postpruning_mode`
+
+In optimal mode it also reports the oracle solver diagnostics:
+- `oracle_status`
+- `oracle_optimal`
+- `oracle_optimal_tp_count`
+- `oracle_threshold`
+- `oracle_selected_count_bounds`
+- `oracle_num_predictions`
+- `oracle_num_predictions_eligible`
+- `oracle_num_gt`
+- `oracle_num_feasible_edges`
+
+In learned mode it also reports the learned-fit summary:
+- `learned_num_gids`
+- `learned_num_selected`
+- `learned_num_rejected`
+- `learned_embed_dim`
+- `learned_num_layers`
+- `learned_epochs`
+- `learned_pruning_thresh`
+- `learned_loss_mode`
+- `learned_focal_alpha`
+- `learned_focal_gamma`
+- `learned_train_loss_final`
+- `learned_train_acc_final`
+- `learned_train_selected_acc_final`
+- `learned_train_non_selected_acc_final`
+- `learned_feature_names`
+- `learned_rows`
+- `learned_pred_selected_gids`
 
 ### Metrics video artifact
-Every `get_metrics(...)` call writes an `.mp4` under:
-- `cache_dir/debug_videos/<mode>_collapse_frame_<frame>_mincomp_<min_component_size>.mp4`
-
-Here:
-- `<mode>` is `support`, `optimal`, or `learned`, matching `use_collapse_mode`
-
-This video shows, for every frame from `0` to the current debugger frame:
-- the exact same projected predicted-point set in both panes
-- left pane: the exact point labels that were used for metrics
-- right pane: GT instance labels transferred onto those same predicted points by nearest GT point
-- rendered as a side-by-side label-map view
-- no RGB overlay
+The old single-label metrics video is no longer written for instance AP, because a one-label-per-point video is not an exact representation of overlapping predicted instances.
 
 The CLI metrics path in `get_metrics_map.py` also writes:
 - `scene_output/debug_videos/instance_labels_mincomp_<min_component_size>.mp4`
@@ -373,7 +362,9 @@ The CLI metrics path in `get_metrics_map.py` also writes:
 That CLI video uses the final RGBMapper instance labels after `min_component_size` filtering.
 Its GT pane uses GT instance labels transferred onto the same predicted points by nearest GT point.
 
-## Concrete Optimal-Collapse Example
+## Legacy Pre-Refactor Optimal-Collapse Example
+This section documents the old pointwise optimal-collapse idea that has now been removed. It is kept only as historical context.
+
 Assume:
 - GT instance `0` = object `A`
 - GT instance `1` = object `B`
